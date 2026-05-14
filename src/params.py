@@ -68,10 +68,16 @@ SESSION_PARAMS: list[Param] = [
           help="Manually paste a Daydream API key (fallback for restricted networks)."),
     Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=40,
           help="When on, connect without Daydream authentication."),
+    Param("Directpod", None, "Session", "Toggle", "session", default=True, order=45,
+          label="Direct Pod",
+          help="When on, skip the queue API and open a WebSocket directly to "
+               "the server URL. Use for local DEMON pods (default localhost:1318). "
+               "Turn OFF to use the queue (e.g. demon-public-demo at :3000 or hosted)."),
     Param("Serverurl", None, "Session", "Str", "session",
-          default="http://localhost:8000", order=50, label="Server URL",
-          help="DEMON server origin. Use the public-demo URL for hosted, "
-               "or http://localhost:PORT for a local pod."),
+          default="http://localhost:1318", order=50, label="Server URL",
+          help="DEMON server origin. For a local pod use http://localhost:1318. "
+               "For demon-public-demo use http://localhost:3000. "
+               "For hosted Daydream, use the public-demo URL."),
     Param("Apikey", None, "Session", "Str", "session", default="", order=60,
           label="API Key", secret=True,
           help="Daydream API key. Populated by Authenticate or Paste API Key."),

@@ -163,8 +163,15 @@ class DemonExt:
 
     # -------- session lifecycle ----------------------------------------------
 
-    def Connect(self, anonymous: bool | None = None) -> bool:
-        """Open a session: join queue → wait → open WS → send config + audio."""
+    def Connect(self, anonymous: bool | None = None,
+                direct: bool | None = None) -> bool:
+        """Open a session.
+
+        Two modes:
+          - Direct pod (default for localhost): skip queue, open WS straight
+            at <serverurl> with the scheme swapped to ws://.
+          - Queue: POST /api/queue/join, wait for active, open the returned wsUrl.
+        """
         with self._lock:
             if self._connected:
                 self.log("Connect: already connected")
@@ -172,12 +179,26 @@ class DemonExt:
 
             if anonymous is None:
                 anonymous = bool(self._read_par("Anonymous", True))
+            if direct is None:
+                direct = bool(self._read_par("Directpod", True))
 
-            base = self._read_par("Serverurl", "http://localhost:8000")
-            self._set_status("Joining queue...")
+            base = self._read_par("Serverurl", "http://localhost:1318")
             api_key = None if anonymous else (self._read_par("Apikey", "") or None)
             self._api_key = api_key or ""
 
+            if direct:
+                ws_url = self._http_to_ws(base)
+                self._session_id = None
+                self._ws_url = ws_url
+                self._expires_at_ms = None
+                self._extensions_used = 0
+                self._write_par("Queueposition", 0)
+                self._set_status(f"Connecting to {ws_url}...")
+                self._open_ws(ws_url)
+                return True
+
+            # Queue mode
+            self._set_status("Joining queue...")
             client = queue_mod.QueueClient(base, api_key=api_key)
             try:
                 resp = client.join()
@@ -188,14 +209,11 @@ class DemonExt:
 
             self._session_id = resp.session_id
 
-            # Poll for active state.
             poll_start = time.time()
             while resp.status == "queued":
                 self._set_status(f"Queued (position {resp.position})")
                 self._write_par("Queueposition", resp.position or 0)
-                # The actual sleep is driven by Timer CHOP poll in production;
-                # for the blocking initial Connect we use short sleeps with a cap.
-                if time.time() - poll_start > 300:  # 5 min cap
+                if time.time() - poll_start > 300:
                     self._set_status("Queue timeout")
                     return False
                 time.sleep(1.5)
@@ -221,8 +239,17 @@ class DemonExt:
             self._open_ws(self._ws_url)
             return True
 
+    @staticmethod
+    def _http_to_ws(url: str) -> str:
+        """http://h:p → ws://h:p, https://h:p → wss://h:p, otherwise verbatim."""
+        if url.startswith("http://"):
+            return "ws://" + url[len("http://"):]
+        if url.startswith("https://"):
+            return "wss://" + url[len("https://"):]
+        return url
+
     def Disconnect(self) -> None:
-        """Close WS + tell queue we're leaving."""
+        """Close WS + tell queue we're leaving (when in queue mode)."""
         with self._lock:
             if not self._connected and not self._session_id:
                 return
@@ -235,7 +262,7 @@ class DemonExt:
                 pass
 
             if self._session_id:
-                base = self._read_par("Serverurl", "http://localhost:8000")
+                base = self._read_par("Serverurl", "http://localhost:1318")
                 try:
                     queue_mod.QueueClient(base, api_key=self._api_key or None).leave(
                         self._session_id
@@ -528,7 +555,7 @@ class DemonExt:
         """Called by the 5s heartbeat Timer CHOP. Polls /api/queue/status."""
         if not self._connected or not self._session_id:
             return
-        base = self._read_par("Serverurl", "http://localhost:8000")
+        base = self._read_par("Serverurl", "http://localhost:1318")
         try:
             resp = queue_mod.QueueClient(base, api_key=self._api_key or None).status(
                 self._session_id
@@ -760,7 +787,7 @@ class DemonExt:
     def _extend_session(self) -> None:
         if not self._session_id:
             return
-        base = self._read_par("Serverurl", "http://localhost:8000")
+        base = self._read_par("Serverurl", "http://localhost:1318")
         try:
             resp = queue_mod.QueueClient(base, api_key=self._api_key or None).extend(
                 self._session_id
