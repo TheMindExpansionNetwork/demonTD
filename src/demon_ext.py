@@ -651,6 +651,57 @@ class DemonExt:
         self.log(f"sent {pcm.shape[1]} samples ({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) "
                  f"from {source_label}")
 
+    def _convert_to_wav(self, src_path: str) -> str | None:
+        """Convert any audio file to a 16-bit 48 kHz stereo WAV in a temp file.
+
+        Tries `afconvert` first (built into macOS), then `ffmpeg` (often
+        installed on Mac via brew and standard on Linux/Windows).
+
+        Returns the temp .wav path on success, or None.
+        Caller is responsible for unlink-ing the temp file.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        out = tmp.name
+
+        # macOS afconvert
+        if shutil.which("afconvert"):
+            try:
+                r = subprocess.run(
+                    ["afconvert", "-f", "WAVE", "-d", "LEI16@48000",
+                     "--channellayout", "Stereo", src_path, out],
+                    capture_output=True, timeout=120,
+                )
+                if r.returncode == 0 and os.path.getsize(out) > 44:
+                    self.log(f"_convert_to_wav: afconvert -> {os.path.basename(out)}")
+                    return out
+            except Exception as e:
+                self.log(f"_convert_to_wav: afconvert failed: {e}")
+
+        # ffmpeg
+        if shutil.which("ffmpeg"):
+            try:
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-i", src_path,
+                     "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", out],
+                    capture_output=True, timeout=120,
+                )
+                if r.returncode == 0 and os.path.getsize(out) > 44:
+                    self.log(f"_convert_to_wav: ffmpeg -> {os.path.basename(out)}")
+                    return out
+            except Exception as e:
+                self.log(f"_convert_to_wav: ffmpeg failed: {e}")
+
+        try:
+            os.unlink(out)
+        except Exception:
+            pass
+        return None
+
     def _wired_chop_file_path(self) -> str | None:
         """If an upstream CHOP (e.g. Audio File In) is wired into the COMP's
         first input, return its `par.file` value. Otherwise None.
@@ -718,13 +769,17 @@ class DemonExt:
             return None
 
     def _load_source_wav(self, path: str) -> "np.ndarray | None":
-        """Load a WAV file off disk → (2, samples) float32 at 48 kHz.
+        """Load an audio file off disk → (2, samples) float32 at 48 kHz.
 
-        Uses stdlib `wave` so there are no extra deps. Supports 16-bit PCM
-        and 32-bit float WAV. Mono is duplicated to stereo. Sample rate is
-        linearly resampled to 48 kHz if it differs.
+        Primary loader is stdlib `wave` (RIFF/WAV, 8/16/32-bit). If that
+        fails — typically because the file is MP3 / AAC / M4A / AIFF /
+        FLAC — we transparently convert it to a temp WAV via the platform
+        converter (`afconvert` on macOS, `ffmpeg` elsewhere) and reload.
 
-        Returns None if the file can't be opened or decoded.
+        Mono is duplicated to stereo. Source rate is linearly resampled
+        to 48 kHz if needed.
+
+        Returns None if the file can't be opened or decoded by any path.
         """
         if not path:
             self.log("_load_source_wav: no Source Audio File set")
@@ -742,8 +797,31 @@ class DemonExt:
                 nframes = wf.getnframes()
                 raw = wf.readframes(nframes)
         except Exception as e:
-            self.log(f"_load_source_wav: wave decode failed: {e}")
-            return None
+            # Not a WAV — try converting to WAV first.
+            self.log(f"_load_source_wav: {os.path.basename(path)} is not a WAV "
+                     f"({e}); attempting auto-conversion...")
+            converted = self._convert_to_wav(path)
+            if converted is None:
+                self.log("_load_source_wav: conversion failed; convert your "
+                         "source to a WAV manually (Audacity, QuickTime export, "
+                         "ffmpeg) and set Source Audio File.")
+                return None
+            try:
+                import wave
+                with wave.open(converted, "rb") as wf:
+                    nchannels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    framerate = wf.getframerate()
+                    nframes = wf.getnframes()
+                    raw = wf.readframes(nframes)
+            except Exception as e2:
+                self.log(f"_load_source_wav: post-conversion decode failed: {e2}")
+                return None
+            finally:
+                try:
+                    os.unlink(converted)
+                except Exception:
+                    pass
 
         # Decode raw bytes by sample width.
         try:
