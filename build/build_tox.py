@@ -775,10 +775,7 @@ def wire_audio(demon):
     out_chop = demon.op("out_chop")
 
     # Configure audio_out Script CHOP.
-    # Time Slice = ON. Audio Device Out pulls from upstream at audio block
-    # rate; only Time Slice CHOPs cook on that schedule. Each cook,
-    # scriptOp.numSamples = the block size in samples; we fill it from the
-    # ring buffer.
+    # Time Slice = ON so Audio Device Out can pull it at audio block rate.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
@@ -788,9 +785,22 @@ def wire_audio(demon):
             audio_out.par.timeslice = True
         except Exception:
             pass
+        # Pre-declare 2 channels so downstream recognizes audio_out as a
+        # valid stereo source even before its first cook. Without this,
+        # the chain may not initialize and Audio Device Out won't pull.
+        for pname, val in (
+            ("channelnames", "chan1 chan2"),
+            ("numchans", 2),
+            ("samplerate", 48000),
+        ):
+            try:
+                setattr(audio_out.par, pname, val)
+            except Exception:
+                pass
         try:
             print("[build_tox]   audio_out pars:")
-            for pn in ("timeslice", "callbacks"):
+            for pn in ("timeslice", "callbacks", "channelnames", "numchans",
+                       "samplerate"):
                 par = getattr(audio_out.par, pn, None)
                 if par is not None:
                     try:

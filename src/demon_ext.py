@@ -864,25 +864,22 @@ class DemonExt:
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
-        # 2. Send params message. Matches demon-public-demo/useParamSync.ts:
-        #    fires every TICK_MS=8ms with `playback_pos` in SECONDS (not
-        #    samples — that was our bug). Server uses absolute time for
-        #    curve sampling. Without this units fix, server thinks we've
-        #    played millions of seconds and bails.
+        # 2. Send params. Match demon-public-demo at ~125 Hz where possible
+        #    (JS uses TICK_MS=8 setInterval). Our frame_exec runs at frame
+        #    rate (~60 Hz), so effectively we send per frame ≈ every 16 ms.
+        #    Throttle floor to 8 ms to be safe; immediate on dirty changes.
         if self._connected:
             with self._lock:
                 raw = dict(self._dirty) if self._dirty else {}
                 self._dirty.clear()
             now = time.time()
             last_send = getattr(self, "_last_params_send", 0.0)
-            # Match JS rate: 8ms = 125Hz. Frame_exec runs at ~60Hz, so
-            # we end up sending at frame rate but with the right cadence
-            # for the server.
-            if (now - last_send > 0.008) or raw:
+            elapsed = now - last_send
+            if elapsed > 0.008 or raw:
                 # If cooks aren't running, advance pos by wall-clock so
                 # the server's flow control sees forward progress.
                 if last_send > 0 and self._n_cook_recv == 0:
-                    self._playback_pos += int((now - last_send) * wire.SAMPLE_RATE)
+                    self._playback_pos += int(elapsed * wire.SAMPLE_RATE)
                 playback_sec = self._playback_pos / wire.SAMPLE_RATE
                 try:
                     self._send_text(wire.encode_params(raw, playback_sec))
@@ -1535,7 +1532,13 @@ class DemonExt:
             self.log("_send_text: no WS client")
             return
         ok = wsc.send_text(payload)
-        self.log(f"_send_text: {len(payload)} chars {'ok' if ok else 'FAILED'}")
+        # Don't log every single send — at 60 Hz this floods the textport.
+        # Only log failures + sample 1 in 600 to keep visibility for debugging.
+        self._n_send_text = getattr(self, "_n_send_text", 0) + 1
+        if not ok:
+            self.log(f"_send_text: {len(payload)} chars FAILED")
+        elif self._n_send_text % 600 == 1:
+            self.log(f"_send_text #{self._n_send_text}: {len(payload)} chars ok (sampled)")
 
     def _send_bytes(self, payload: bytes) -> None:
         """Send a binary frame via the Python WS client."""
