@@ -105,10 +105,11 @@ def encode_audio_frame(pcm: np.ndarray, channels: int) -> bytes:
 def encode_config(cfg: dict[str, Any]) -> str:
     """Encode the initial SessionConfig.
 
-    Drops keys whose value is None or empty string to avoid sending noise.
-    Caller is responsible for passing only valid SessionConfig keys.
+    Drops keys whose value is None. Does NOT drop empty strings — DEMON
+    expects `fixture_name: ""` to be present and stripping it makes the
+    server close the WS immediately after our send.
     """
-    clean = {k: v for k, v in cfg.items() if v is not None and v != ""}
+    clean = {k: v for k, v in cfg.items() if v is not None}
     return json.dumps(clean, separators=(",", ":"))
 
 

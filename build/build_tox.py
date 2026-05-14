@@ -241,24 +241,45 @@ def _add_one_param(demon, page_lookup, p) -> bool:
         print(f"!! index par {p.name}: {e}")
         return False
 
+    # Apply range FIRST so clamping doesn't squash a default-being-set later.
+    # Use `min`/`max` not `normMin`/`normMax` — those are slider-display
+    # only; the actual clamp uses min/max. Setting both makes the slider
+    # and the clamp agree.
+    if p.min is not None:
+        for attr in ("min", "normMin"):
+            try:
+                setattr(p0, attr, p.min)
+            except Exception:
+                pass
+        try:
+            p0.clampMin = p.clamp_min
+        except Exception:
+            pass
+    if p.max is not None:
+        for attr in ("max", "normMax"):
+            try:
+                setattr(p0, attr, p.max)
+            except Exception:
+                pass
+        try:
+            p0.clampMax = p.clamp_max
+        except Exception:
+            pass
+    # Now defaults + initial value.
     if p.default is not None and p.type not in ("Pulse", "Header"):
         try:
             p0.default = p.default
+        except Exception:
+            for alt in ("tupletDefaultValue", "defaultValue"):
+                try:
+                    setattr(p0, alt, p.default)
+                    break
+                except Exception:
+                    continue
+        try:
             p0.val = p.default
         except Exception as e:
-            print(f"!! default on {p.name}: {e}")
-    if p.min is not None:
-        try:
-            p0.normMin = p.min
-            p0.clampMin = p.clamp_min
-        except Exception as e:
-            print(f"!! min on {p.name}: {e}")
-    if p.max is not None:
-        try:
-            p0.normMax = p.max
-            p0.clampMax = p.clamp_max
-        except Exception as e:
-            print(f"!! max on {p.name}: {e}")
+            print(f"!! val on {p.name}: {e}")
     if p.help:
         try:
             p0.help = p.help

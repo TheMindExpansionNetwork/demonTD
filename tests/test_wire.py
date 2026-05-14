@@ -41,10 +41,12 @@ def test_encode_audio_frame_stereo_passthrough():
 # -----------------------------------------------------------------------------
 # JSON encoders
 # -----------------------------------------------------------------------------
-def test_encode_config_drops_none_and_empty():
+def test_encode_config_drops_none_keeps_empty_strings():
+    # Empty strings (fixture_name: "") must survive — DEMON requires them.
+    # None values are dropped (those are missing-optional keys).
     msg = json.loads(wire.encode_config({"steps": 8, "prompt": "", "depth": None,
                                          "sde": False}))
-    assert msg == {"steps": 8, "sde": False}
+    assert msg == {"steps": 8, "prompt": "", "sde": False}
 
 
 def test_encode_params_shape():
