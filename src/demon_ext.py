@@ -147,7 +147,6 @@ try:
     oauth = _mod('oauth')
     audio_mod = _mod('audio')
     ws_client_mod = _mod('ws_client')
-    audio_sender_mod = _mod('audio_sender')
 except NameError:
     import params as P  # type: ignore
     import wire  # type: ignore
@@ -155,7 +154,6 @@ except NameError:
     import oauth  # type: ignore
     import audio as audio_mod  # type: ignore
     import ws_client as ws_client_mod  # type: ignore
-    import audio_sender as audio_sender_mod  # type: ignore
 
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
@@ -217,48 +215,6 @@ class DemonExt:
         self._expecting_initial_buffer: bool = False
 
         self.log("DemonExt initialized")
-
-
-        # Dump audio_out's full par state at runtime so we can diagnose
-        # why the audio chain isn't pulling at audio rate.
-        try:
-            ao = ownerComp.op("audio_out")
-            if ao is not None:
-                self.log("=== AUDIO_OUT PARS (all pages) ===")
-                for page in ao.pages:
-                    self.log(f"  -- page: {page.name} --")
-                    for p in page.pars:
-                        try:
-                            v = p.eval()
-                            if isinstance(v, (int, float, bool, str)) or v is None:
-                                self.log(f"    {p.name} = {v!r}")
-                        except Exception:
-                            pass
-                try:
-                    self.log(f"=== AUDIO_OUT STATE: chans={ao.numChans} "
-                             f"samples={ao.numSamples} rate={ao.rate} ===")
-                except Exception:
-                    pass
-                # Also dump out_chop (the CHOP between audio_out and the COMP output)
-                oc = ownerComp.op("out_chop")
-                if oc is not None:
-                    self.log("=== OUT_CHOP PARS (all pages) ===")
-                    for page in oc.pages:
-                        self.log(f"  -- page: {page.name} --")
-                        for p in page.pars:
-                            try:
-                                v = p.eval()
-                                if isinstance(v, (int, float, bool, str)) or v is None:
-                                    self.log(f"    {p.name} = {v!r}")
-                            except Exception:
-                                pass
-                    try:
-                        self.log(f"=== OUT_CHOP STATE: chans={oc.numChans} "
-                                 f"samples={oc.numSamples} rate={oc.rate} ===")
-                    except Exception:
-                        pass
-        except Exception as e:
-            self.log(f"par dump failed: {e}")
 
     # -------- properties (public read-only) ----------------------------------
 
@@ -386,12 +342,6 @@ class DemonExt:
             self._expires_at_ms = None
             self._dirty.clear()
             self._ring.clear()
-
-        # Stop the UDP audio sender (joins its thread).
-        try:
-            self._stop_audio_sender()
-        except Exception:
-            pass
 
         # Outside the lock: blocking I/O.
         if wsc is not None:
@@ -1002,48 +952,6 @@ class DemonExt:
         # One-shot — clear so we don't double-send on reconnects.
         self._pending_config = None
         self._pending_audio = None
-
-        # Start the UDP audio sender. Pulls blocks from the ring buffer at
-        # audio rate and pushes them to localhost:<UDP Port>. User wires
-        # an external Audio Stream In CHOP on that port.
-        self._start_audio_sender()
-
-    def _start_audio_sender(self) -> None:
-        # Stop any existing sender (reconnect path).
-        existing = getattr(self, "_audio_sender", None)
-        if existing is not None:
-            try:
-                existing.stop()
-            except Exception:
-                pass
-            self._audio_sender = None
-
-        port = int(self._read_par("Udpport", 7000) or 7000)
-        try:
-            self._audio_sender = audio_sender_mod.UdpAudioSender(
-                port=port,
-                read_block=self._ring.read,
-                sample_rate=wire.SAMPLE_RATE,
-                block_size=1024,
-                log=self.log,
-            )
-            self._audio_sender.start()
-            self.log(
-                f"audio: started UDP sender on 127.0.0.1:{port}. "
-                f"Wire Audio Stream In CHOP -> Audio Device Out to play."
-            )
-        except Exception as e:
-            self.log(f"audio sender start failed: {e}")
-            self._audio_sender = None
-
-    def _stop_audio_sender(self) -> None:
-        sender = getattr(self, "_audio_sender", None)
-        if sender is not None:
-            try:
-                sender.stop()
-            except Exception:
-                pass
-            self._audio_sender = None
 
     def _convert_to_wav(self, src_path: str) -> str | None:
         """Convert any audio file to a 16-bit 48 kHz stereo WAV in a temp file.

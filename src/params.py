@@ -73,15 +73,6 @@ SESSION_PARAMS: list[Param] = [
     Param("Status", None, "Session", "Str", "session", default="Idle",
           order=50, readonly=True,
           help="Current connection status."),
-    Param("Udpport", None, "Session", "Int", "session", default=7000,
-          min=1024, max=65535, clamp_min=True, clamp_max=True,
-          order=55, label="UDP Audio Port",
-          help="Localhost UDP port that streams the generated audio. "
-               "Wire an Audio Stream In CHOP externally: Network Address "
-               "= 127.0.0.1, Network Port = this, Format = Raw, Sample "
-               "Type = 32-bit Float, Channels = 2, Sample Rate = 48000. "
-               "Then send its output to an Audio Device Out CHOP."),
-
     Param("Hostedheader", None, "Session", "Header", "session",
           order=60, section_header=True, label="Hosted Mode (coming soon)"),
     Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=70,
