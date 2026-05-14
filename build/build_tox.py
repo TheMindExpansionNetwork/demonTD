@@ -150,104 +150,140 @@ def get_opclass_lookup():
 # Param-page generation
 # -----------------------------------------------------------------------------
 def regenerate_param_pages(demon):
-    """Drop existing custom pages and rebuild from P.PARAMS."""
+    """Drop existing custom pages and rebuild from P.PARAMS.
+
+    Wraps every per-param operation in try/except. A failure on any one
+    parameter prints a `!!` line but does NOT break the loop, so the rest
+    of the schema continues to populate.
+    """
     for page in list(demon.customPages):
-        page.destroy()
+        try:
+            page.destroy()
+        except Exception as e:
+            print(f"!! destroy page {page.name}: {e}")
 
     page_lookup = {}
     for page_name in P.PAGES:
-        page_lookup[page_name] = demon.appendCustomPage(page_name)
+        try:
+            page_lookup[page_name] = demon.appendCustomPage(page_name)
+        except Exception as e:
+            print(f"!! appendCustomPage({page_name}): {e}")
 
+    n_added = 0
+    n_failed = 0
     for p in sorted(P.PARAMS, key=lambda x: (x.page, x.order)):
-        page = page_lookup.get(p.page)
-        if page is None:
+        try:
+            ok = _add_one_param(demon, page_lookup, p)
+        except Exception as e:
+            ok = False
+            print(f"!! UNCAUGHT exception adding {p.page}/{p.name} ({p.type}): "
+                  f"{type(e).__name__}: {e}")
+        if ok:
+            n_added += 1
+        else:
+            n_failed += 1
+
+    print(f"[build_tox]   pages: added {n_added} pars, {n_failed} failed")
+
+
+def _add_one_param(demon, page_lookup, p) -> bool:
+    """Append one parameter from the schema. Returns True on success."""
+    page = page_lookup.get(p.page)
+    if page is None:
+        try:
             page = demon.appendCustomPage(p.page)
             page_lookup[p.page] = page
-
-        label = p.label or p.name
-
-        try:
-            if p.type == "Pulse":
-                par = page.appendPulse(p.name, label=label)
-            elif p.type == "Header":
-                par = page.appendHeader(p.name, label=label)
-            elif p.type == "Toggle":
-                par = page.appendToggle(p.name, label=label)
-            elif p.type == "Int":
-                par = page.appendInt(p.name, label=label)
-            elif p.type == "Float":
-                par = page.appendFloat(p.name, label=label)
-            elif p.type == "Str":
-                par = page.appendStr(p.name, label=label)
-            elif p.type == "Menu":
-                par = page.appendMenu(p.name, label=label)
-            elif p.type == "File":
-                par = page.appendFile(p.name, label=label)
-            else:
-                print(f"!! unknown par type {p.type} for {p.name}")
-                continue
         except Exception as e:
-            print(f"!! failed to append {p.type} {p.name}: {e}")
-            continue
+            print(f"!! couldn't create page {p.page}: {e}")
+            return False
 
-        # par is a ParGroup; don't bool() it. Indexing returns the underlying
-        # Par object we can set attributes on.
-        if par is None:
-            continue
+    label = p.label or p.name
+
+    par = None
+    try:
+        if p.type == "Pulse":
+            par = page.appendPulse(p.name, label=label)
+        elif p.type == "Header":
+            par = page.appendHeader(p.name, label=label)
+        elif p.type == "Toggle":
+            par = page.appendToggle(p.name, label=label)
+        elif p.type == "Int":
+            par = page.appendInt(p.name, label=label)
+        elif p.type == "Float":
+            par = page.appendFloat(p.name, label=label)
+        elif p.type == "Str":
+            par = page.appendStr(p.name, label=label)
+        elif p.type == "Menu":
+            par = page.appendMenu(p.name, label=label)
+        elif p.type == "File":
+            par = page.appendFile(p.name, label=label)
+        else:
+            print(f"!! unknown par type {p.type} for {p.name}")
+            return False
+    except Exception as e:
+        print(f"!! append {p.type} {p.page}/{p.name}: {type(e).__name__}: {e}")
+        return False
+
+    if par is None:
+        print(f"!! append returned None for {p.page}/{p.name}")
+        return False
+
+    try:
+        p0 = par[0]
+    except Exception as e:
+        print(f"!! index par {p.name}: {e}")
+        return False
+
+    if p.default is not None and p.type not in ("Pulse", "Header"):
         try:
-            p0 = par[0]
+            p0.default = p.default
+            p0.val = p.default
         except Exception as e:
-            print(f"!! failed to index par {p.name}: {e}")
-            continue
-
-        # Defaults and ranges
-        if p.default is not None and p.type not in ("Pulse", "Header"):
-            try:
-                p0.default = p.default
-                p0.val = p.default
-            except Exception:
-                pass
-        if p.min is not None:
-            try:
-                p0.normMin = p.min
-                p0.clampMin = p.clamp_min
-            except Exception:
-                pass
-        if p.max is not None:
-            try:
-                p0.normMax = p.max
-                p0.clampMax = p.clamp_max
-            except Exception:
-                pass
-        if p.help:
-            try:
-                p0.help = p.help
-            except Exception:
-                pass
-        if p.menu_names:
-            try:
-                p0.menuNames = list(p.menu_names)
-                p0.menuLabels = list(p.menu_labels or p.menu_names)
-            except Exception:
-                pass
-        if p.readonly:
-            try:
-                p0.readOnly = True
-            except Exception:
-                pass
-        # Apply enable=False to ALL pars in the group so coming-soon controls
-        # appear greyed out and aren't editable.
-        if not p.enable:
+            print(f"!! default on {p.name}: {e}")
+    if p.min is not None:
+        try:
+            p0.normMin = p.min
+            p0.clampMin = p.clamp_min
+        except Exception as e:
+            print(f"!! min on {p.name}: {e}")
+    if p.max is not None:
+        try:
+            p0.normMax = p.max
+            p0.clampMax = p.clamp_max
+        except Exception as e:
+            print(f"!! max on {p.name}: {e}")
+    if p.help:
+        try:
+            p0.help = p.help
+        except Exception:
+            pass
+    if p.menu_names:
+        try:
+            p0.menuNames = list(p.menu_names)
+            p0.menuLabels = list(p.menu_labels or p.menu_names)
+        except Exception as e:
+            print(f"!! menu on {p.name}: {e}")
+    if p.readonly:
+        try:
+            p0.readOnly = True
+        except Exception:
+            pass
+    if not p.enable:
+        try:
             for sub in par:
                 try:
                     sub.enable = False
                 except Exception:
                     pass
-        if p.multiline:
-            try:
-                p0.style = "Str"
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"!! enable=False on {p.name}: {e}")
+    if p.multiline:
+        try:
+            p0.style = "Str"
+        except Exception:
+            pass
+
+    return True
 
 
 # -----------------------------------------------------------------------------
