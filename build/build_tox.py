@@ -99,10 +99,6 @@ TOPOLOGY = [
     ("audio_out",      "scriptCHOP",    {}, (400, -200)),
     ("resample_out",   "resampleCHOP",  {}, (600, -200)),
     ("out_chop",       "outCHOP",       {}, (800, -200)),
-    # Internal Audio Device Out — opens its own device so audio plays
-    # WITHOUT requiring the user to wire anything externally. This
-    # avoids the COMP-boundary Time-Slice propagation issue.
-    ("audiodev_internal", "audiodeviceoutCHOP", {}, (600, -300)),
     ("lora_catalog",   "tableDAT",      {}, (-200, 400)),
     ("state",          "tableDAT",      {}, (-200, 300)),
 ]
@@ -156,7 +152,6 @@ def get_opclass_lookup():
         "outCHOP":             outCHOP,
         "scriptCHOP":          scriptCHOP,
         "resampleCHOP":        resampleCHOP,
-        "audiodeviceoutCHOP":  audiodeviceoutCHOP,
     }
 
 
@@ -828,34 +823,6 @@ def wire_audio(demon):
     except Exception as e:
         print(f"audio wiring out_chop: {e}")
 
-    # Wire internal Audio Device Out — opens an audio device from inside
-    # the COMP. This is what actually pulls audio_out at audio rate; the
-    # external Out CHOP path is for users who want their own routing.
-    adi = demon.op("audiodev_internal")
-    if adi is not None and audio_out is not None:
-        try:
-            for c in adi.inputConnectors:
-                if c.connections:
-                    c.disconnect()
-            adi.inputConnectors[0].connect(audio_out)
-        except Exception as e:
-            print(f"audio wiring audiodev_internal: {e}")
-        try:
-            adi.par.active = True
-        except Exception:
-            pass
-        try:
-            # Dump audiodev_internal pars for visibility
-            print("[build_tox]   audiodev_internal pars:")
-            for pn in ("active", "driver", "device", "volume", "samplerate"):
-                par = getattr(adi.par, pn, None)
-                if par is not None:
-                    try:
-                        print(f"     {pn} = {par.eval()!r}")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
     # script_send is a vestigial no-op; still hook up its callbacks so it doesn't error.
     script_send = demon.op("script_send")
