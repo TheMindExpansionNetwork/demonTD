@@ -821,23 +821,31 @@ class DemonExt:
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
-        # 2. Per-frame param send. DEMON's pipeline ticks based on incoming
-        #    `params` messages with our current playback_pos — that's how
-        #    the server knows how far behind we've played. Without continuous
-        #    updates, the server's flow control pauses generation.
-        #
-        #    Important: playback_pos must reflect what's ACTUALLY been played
-        #    (i.e. consumed by audio_out's OnCookRecv), not a wall-clock guess.
-        #    OnCookRecv increments self._playback_pos by samples actually
-        #    written to its output. Here we just snapshot and send.
+        # 2. Throttled params send. Send when:
+        #     (a) we have dirty values to push (immediate),
+        #     (b) at least 100 ms have passed AND playback_pos has advanced
+        #         (heartbeat, keeps the server's flow control happy).
+        #    Avoid the 60 Hz flood of empty raw + zero playback_pos that
+        #    can spam DEMON's recv loop.
         if self._connected:
             with self._lock:
                 raw = dict(self._dirty) if self._dirty else {}
                 self._dirty.clear()
-            try:
-                self._send_text(wire.encode_params(raw, self._playback_pos))
-            except Exception as e:
-                self.log(f"frame param send error: {e}")
+            now = time.time()
+            last_send = getattr(self, "_last_params_send", 0.0)
+            last_pos = getattr(self, "_last_sent_pos", -1)
+            should_send = False
+            if raw:
+                should_send = True
+            elif (now - last_send > 0.1) and self._playback_pos != last_pos:
+                should_send = True
+            if should_send:
+                try:
+                    self._send_text(wire.encode_params(raw, self._playback_pos))
+                    self._last_params_send = now
+                    self._last_sent_pos = self._playback_pos
+                except Exception as e:
+                    self.log(f"frame param send error: {e}")
 
         # 3. Telemetry (~every 2 s)
         if self._connected:
