@@ -1676,21 +1676,27 @@ class DemonExt:
     def OnCookRecv(self, scriptOp) -> None:
         """audio_out Script CHOP cook callback. Reads from ring buffer.
 
-        Time Slice is OFF (set by build_tox). Each cook produces a fixed
-        block of audio samples at 48 kHz; the downstream Audio Device Out
-        pulls these blocks at its own rate.
+        Time Slice is ON. TD sets scriptOp.numSamples to the audio block
+        size (samples per channel for this cook). Audio Device Out pulls
+        from us at audio rate; each cook produces exactly the requested
+        block.
         """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
         if self._n_cook_recv == 1:
             try:
-                self.log(f"OnCookRecv: FIRST cook — incoming numSamples="
+                self.log(f"OnCookRecv: FIRST cook — numSamples="
                          f"{scriptOp.numSamples} ring_avail={self._ring.available}")
             except Exception:
                 pass
 
-        # Produce a fixed block. 1024 samples @ 48 kHz = ~21 ms — small
-        # enough for low latency, big enough to not thrash.
-        n = 1024
+        # Time Slice mode: TD tells us how many samples to produce.
+        n = 0
+        try:
+            n = int(scriptOp.numSamples)
+        except Exception:
+            n = 0
+        if n <= 0:
+            n = 512  # fallback if TD hasn't set it yet
 
         avail_before = self._ring.available
         pcm = self._ring.read(n)
