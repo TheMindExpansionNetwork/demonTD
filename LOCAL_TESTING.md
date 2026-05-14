@@ -22,7 +22,7 @@ The pod's WebSocket lives at `ws://127.0.0.1:8765/`. There is **no queue API** a
 
 > **No GPU? `--ui-only`** — pass `--ui-only` to start a stub that handshakes but generates no audio. Useful for verifying connect/auth/param fanout without waiting for engines to build.
 
-## 2. Build `demon.tox`
+## 2. Build `demonTD.tox`
 
 TouchDesigner is GUI-first; there's no true headless mode. The realistic
 build workflow is:
@@ -32,14 +32,14 @@ build workflow is:
 3. On the DAT: set `File` to `~/git/demon-td/build/build_tox.py`, toggle
    `Load on Start` and `Sync to File` on. The script content loads in.
 4. Right-click the DAT → **Run Script**.
-5. Watch the Textport (`Alt+T`) for `[build_tox] wrote .../dist/demon.tox`.
+5. Watch the Textport (`Alt+T`) for `[build_tox] wrote .../dist/demonTD.tox`.
 
 The script:
 - Scaffolds `build/template.toe` on first run (commit it after).
 - Creates a Base COMP `demon` at `/project1/demon` with all internal ops.
 - File-syncs each `src/*.py` into a Text DAT inside the COMP.
 - Regenerates the custom parameter pages from `src/params.py`.
-- Saves `dist/demon.tox`.
+- Saves `dist/demonTD.tox`.
 
 Re-running is idempotent — it updates whatever drifted.
 
@@ -52,7 +52,7 @@ Re-running is idempotent — it updates whatever drifted.
 ## 3. Drag into a TD project
 
 1. Open TouchDesigner. New `.toe`.
-2. Drag `dist/demon.tox` from Finder into the network — a Base COMP named `demon1` appears.
+2. Drag `dist/demonTD.tox` from Finder into the network — a Base COMP named `demon1` appears.
 3. Click the COMP, open the **Session** parameter page.
 
 ## 4. Connect

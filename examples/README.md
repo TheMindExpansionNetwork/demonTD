@@ -29,4 +29,4 @@ Each TD param can be CHOP-exported in the standard way; the param-execute DAT in
 
 ---
 
-These `.toe` files are generated alongside the `.tox` on first build by the headless build script. Until then, you can construct them by hand: drag `dist/demon.tox` into a fresh `.toe`, wire as shown above.
+These `.toe` files are generated alongside the `.tox` on first build by the headless build script. Until then, you can construct them by hand: drag `dist/demonTD.tox` into a fresh `.toe`, wire as shown above.

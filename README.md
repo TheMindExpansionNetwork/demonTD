@@ -19,8 +19,8 @@ Drop a single `.tox` into any TouchDesigner project, point it at a DEMON server 
 
 ## Quick start
 
-1. Download `demon.tox` from the latest [GitHub release](#releases), or [build it yourself](#building).
-2. Drag `demon.tox` into a fresh `.toe`.
+1. Download `demonTD.tox` from the latest [GitHub release](#releases), or [build it yourself](#building).
+2. Drag `demonTD.tox` into a fresh `.toe`.
 3. Open the COMP's parameter pages. On the **Session** page:
    - Set `Server URL` (default `http://localhost:8000` for a local DEMON pod).
    - Leave `Anonymous` ON for local pods, or pulse `Authenticate` to sign in with Daydream.
@@ -111,7 +111,7 @@ SwapSource(chop=None, tags=None, key=None, time_signature=None, fixture=None)
                                             Resample → [ CHOP output ]
 ```
 
-- **One COMP = one session.** Spin up multiple `demon.tox` copies for parallel sessions.
+- **One COMP = one session.** Spin up multiple `demonTD.tox` copies for parallel sessions.
 - **Continuous param fanout**: parameter changes coalesce into a single `{type:"params", raw:{...}}` message every 8 ms (matching DEMON's tick). A frantic slider drag becomes ≤ 125 Hz of dispatch, not 60×.
 - **Discrete messages** (Send Prompt, Enable LoRA, Swap Source, …) bypass the tick — sent immediately.
 - **Audio out is non-blocking.** WS slices land in a ring buffer; the Script CHOP reads from it on cook. Underrun returns silence — the TD cook thread never blocks on I/O.
@@ -130,15 +130,15 @@ demon-td/
   vendor/zstandard/          # bundled wheels per platform (placeholder)
     darwin-arm64/ darwin-x64/ win-amd64/
   build/
-    build_tox.py             # headless TD: regenerate demon.tox from src/
+    build_tox.py             # headless TD: regenerate demonTD.tox from src/
     template.toe             # base scaffold (generated on first build)
   examples/
-    minimal.toe              # demo project referencing demon.tox
+    minimal.toe              # demo project referencing demonTD.tox
   tests/
     test_wire.py             test_params.py
     test_queue_client.py     test_audio.py
     test_oauth.py
-  dist/                      # gitignored; demon.tox lives here after build
+  dist/                      # gitignored; demonTD.tox lives here after build
   pyproject.toml             # dev deps only — runtime is all stdlib + bundled
   README.md
 ```
@@ -162,7 +162,7 @@ The script:
 2. Ensures every internal op exists with correct wiring.
 3. File-syncs each `src/*.py` into a corresponding Text DAT.
 4. Regenerates the COMP's custom parameter pages from `src/params.py`.
-5. Saves `dist/demon.tox` and exits.
+5. Saves `dist/demonTD.tox` and exits.
 
 The schema in `src/params.py` is the single source of truth — adding a param is a one-line edit there plus, if it needs custom routing, one new branch in `DemonExt.OnParChange`.
 

@@ -1,5 +1,5 @@
 """
-TD build script — generates dist/demon.tox from the schema in
+TD build script — generates dist/demonTD.tox from the schema in
 src/params.py and the Python source in src/.
 
 How to run
@@ -21,7 +21,7 @@ What it does
 3. Adds file-synced Text DATs for each src/*.py.
 4. Generates the COMP's custom parameter pages from params.PARAMS.
 5. Sets the COMP's Extension to point at the demon_ext Text DAT.
-6. Saves the COMP as dist/demon.tox and exits.
+6. Saves the COMP as dist/demonTD.tox and exits.
 
 This script is idempotent — re-running it on a previously built .toe just
 updates whatever has drifted.
@@ -631,7 +631,7 @@ def main():
     print("[build_tox] wiring extension...")
     wire_extension(demon)
 
-    out_path = os.path.join(DIST_DIR, "demon.tox")
+    out_path = os.path.join(DIST_DIR, "demonTD.tox")
     print(f"[build_tox] saving {out_path}")
     demon.save(out_path)
 
