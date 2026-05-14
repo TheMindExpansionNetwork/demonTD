@@ -181,6 +181,8 @@ def regenerate_param_pages(demon):
                 par = page.appendStr(p.name, label=label)
             elif p.type == "Menu":
                 par = page.appendMenu(p.name, label=label)
+            elif p.type == "File":
+                par = page.appendFile(p.name, label=label)
             else:
                 print(f"!! unknown par type {p.type} for {p.name}")
                 continue
@@ -233,9 +235,17 @@ def regenerate_param_pages(demon):
                 p0.readOnly = True
             except Exception:
                 pass
+        # Apply enable=False to ALL pars in the group so coming-soon controls
+        # appear greyed out and aren't editable.
+        if not p.enable:
+            for sub in par:
+                try:
+                    sub.enable = False
+                except Exception:
+                    pass
         if p.multiline:
             try:
-                p0.style = "Str"  # multiline edit is a TD-side widget choice
+                p0.style = "Str"
             except Exception:
                 pass
 
@@ -487,29 +497,47 @@ def onCook(scriptOp):
 # Audio wiring
 # -----------------------------------------------------------------------------
 def wire_audio(demon):
-    """Connect Audio CHOP I/O ports through resample → script chops."""
-    audio_in = demon.op("audio_in")
-    resample_in = demon.op("resample_in")
-    script_send = demon.op("script_send")
+    """Wire the audio-OUT chain (audio_out Script CHOP → resample → Out CHOP).
+
+    NOTE: This release does NOT stream audio IN from a CHOP. The source track
+    is uploaded once from the Source Audio File par at Connect time. The
+    audio_in / resample_in / script_send ops still exist for back-compat
+    with the saved .tox topology but are NOT connected to anything;
+    script_send.onCook is a no-op.
+    """
     audio_out = demon.op("audio_out")
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
 
-    try:
-        if resample_in is not None:
-            resample_in.par.method = "Linear"
-            resample_in.par.rate = 48000
-        if resample_out is not None:
-            resample_out.par.method = "Linear"
-            resample_out.par.rate = 48000
-    except Exception:
-        pass
+    # Configure audio_out Script CHOP for audio-rate, time-sliced output.
+    if audio_out is not None:
+        try:
+            audio_out.par.callbacks = "callbacks"
+        except Exception:
+            pass
+        # Time Slice on — TD pulls a block per audio cycle from downstream.
+        for parname in ("timeslice", "timeslicemode"):
+            try:
+                setattr(audio_out.par, parname, True)
+                break
+            except Exception:
+                pass
+        # 2-channel default; the cook callback will set the actual sample count.
+        try:
+            audio_out.par.channelnames = "chan1 chan2"
+        except Exception:
+            pass
 
+    if resample_out is not None:
+        try:
+            resample_out.par.method = "Linear"
+            # Output the project's audio rate; 0 = use upstream rate.
+            resample_out.par.rate = 0
+        except Exception:
+            pass
+
+    # Connect: audio_out → resample_out → out_chop
     try:
-        if audio_in is not None and resample_in is not None:
-            resample_in.inputConnectors[0].connect(audio_in)
-        if resample_in is not None and script_send is not None:
-            script_send.inputConnectors[0].connect(resample_in)
         if audio_out is not None and resample_out is not None:
             resample_out.inputConnectors[0].connect(audio_out)
         if resample_out is not None and out_chop is not None:
@@ -517,15 +545,13 @@ def wire_audio(demon):
     except Exception as e:
         print(f"audio wiring: {e}")
 
-    # Both Script CHOPs share the same callbacks DAT. The DAT's onCook(scriptOp)
-    # dispatches by scriptOp.name to the right method on DemonExt.
-    try:
-        if script_send is not None:
+    # script_send is a vestigial no-op; still hook up its callbacks so it doesn't error.
+    script_send = demon.op("script_send")
+    if script_send is not None:
+        try:
             script_send.par.callbacks = "callbacks"
-        if audio_out is not None:
-            audio_out.par.callbacks = "callbacks"
-    except Exception:
-        pass
+        except Exception:
+            pass
 
 
 # -----------------------------------------------------------------------------

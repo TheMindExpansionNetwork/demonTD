@@ -1,4 +1,4 @@
-"""
+﻿"""
 Declarative parameter schema for the DEMON TouchDesigner operator.
 
 This is the SOURCE OF TRUTH. The build script (build/build_tox.py)
@@ -35,7 +35,7 @@ class Param:
     name: str                       # TD par name (PascalCase preferred for visibility)
     wire_name: str | None           # The key sent on the wire (None for local/UI-only)
     page: str                       # TD parameter page label
-    type: str                       # "Float" | "Int" | "Toggle" | "Str" | "Menu" | "Pulse" | "Header"
+    type: str                       # "Float" | "Int" | "Toggle" | "Str" | "Menu" | "Pulse" | "Header" | "File"
     category: str                   # "init" | "continuous" | "session" | "discrete"
     default: Any = None
     min: float | None = None
@@ -49,6 +49,7 @@ class Param:
     multiline: bool = False
     secret: bool = False            # hide value in .tox serialization (for API keys)
     readonly: bool = False
+    enable: bool = True             # False = par appears greyed-out / non-editable
     section_header: bool = False    # this is a Header par
     order: int = 0
 
@@ -61,37 +62,40 @@ SESSION_PARAMS: list[Param] = [
           help="Open a session against the configured server."),
     Param("Disconnect", None, "Session", "Pulse", "session", order=20,
           help="Close the active WebSocket session."),
-    Param("Authenticate", None, "Session", "Pulse", "session", order=30,
-          help="Start Daydream OAuth flow (browser popup)."),
-    Param("Pasteapikey", None, "Session", "Pulse", "session", order=35,
-          label="Paste API Key",
-          help="Manually paste a Daydream API key (fallback for restricted networks)."),
-    Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=40,
-          help="When on, connect without Daydream authentication."),
-    Param("Directpod", None, "Session", "Toggle", "session", default=True, order=45,
-          label="Direct Pod",
-          help="When on, skip the queue API and open a WebSocket directly to "
-               "the server URL. Use for local DEMON pods (default localhost:1318). "
-               "Turn OFF to use the queue (e.g. demon-public-demo at :3000 or hosted)."),
     Param("Serverurl", None, "Session", "Str", "session",
-          default="http://localhost:1318", order=50, label="Server URL",
-          help="DEMON server origin. For a local pod use http://localhost:1318. "
-               "For demon-public-demo use http://localhost:3000. "
-               "For hosted Daydream, use the public-demo URL."),
-    Param("Apikey", None, "Session", "Str", "session", default="", order=60,
-          label="API Key", secret=True,
-          help="Daydream API key. Populated by Authenticate or Paste API Key."),
+          default="http://localhost:1318", order=30, label="Server URL",
+          help="DEMON pod origin. Default http://localhost:1318 is the port "
+               "DEMON's demos.realtime_motion_graph_web uses."),
+    Param("Sourcefile", None, "Session", "File", "session",
+          default="", order=40, label="Source Audio File",
+          help="WAV file to send as the source/reference audio on Connect. "
+               "DEMON conditions its generation on this input. REQUIRED."),
     Param("Status", None, "Session", "Str", "session", default="Idle",
-          order=70, readonly=True,
+          order=50, readonly=True,
           help="Current connection status."),
+
+    Param("Hostedheader", None, "Session", "Header", "session",
+          order=60, section_header=True, label="Hosted Mode (coming soon)"),
+    Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=70,
+          enable=False,
+          help="Hosted Daydream mode is coming soon. Local pod is the only "
+               "supported path in this release."),
+    Param("Directpod", None, "Session", "Toggle", "session", default=True, order=75,
+          label="Direct Pod", enable=False,
+          help="Direct pod mode is locked on. Hosted/queue mode is coming soon."),
+    Param("Authenticate", None, "Session", "Pulse", "session", order=80,
+          label="Authenticate (coming soon)", enable=False,
+          help="Daydream OAuth. Disabled in this release."),
+    Param("Pasteapikey", None, "Session", "Pulse", "session", order=85,
+          label="Paste API Key (coming soon)", enable=False),
+    Param("Apikey", None, "Session", "Str", "session", default="", order=90,
+          label="API Key", secret=True, enable=False),
     Param("Queueposition", None, "Session", "Int", "session", default=0,
-          order=80, readonly=True, label="Queue Position",
-          help="1-based position in the queue. 0 when active or idle."),
+          order=95, readonly=True, enable=False, label="Queue Position"),
     Param("Expiresin", None, "Session", "Float", "session", default=0.0,
-          order=90, readonly=True, label="Expires In",
-          help="Seconds remaining on the current session."),
-    Param("Stillplaying", None, "Session", "Pulse", "session", order=100,
-          label="Still Playing", help="Extend the current session (appears near expiry)."),
+          order=100, readonly=True, enable=False, label="Expires In"),
+    Param("Stillplaying", None, "Session", "Pulse", "session", order=105,
+          label="Still Playing (coming soon)", enable=False),
 ]
 
 

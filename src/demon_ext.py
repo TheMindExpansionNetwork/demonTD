@@ -1,4 +1,4 @@
-"""
+﻿"""
 DemonExt — the TouchDesigner extension class for the DEMON operator.
 
 This module is loaded inside TD as the Extension of a Base COMP. It owns
@@ -290,43 +290,9 @@ class DemonExt:
     # -------- auth -----------------------------------------------------------
 
     def Authenticate(self) -> None:
-        """Kick off Daydream OAuth.
-
-        1. Pick a free port and start the local Web Server DAT (if present).
-        2. Open the browser to the Daydream sign-in URL.
-        3. The Web Server DAT's onHTTPRequest callback in this COMP routes the
-           OAuth callback to OnAuthCallback(), which validates state and
-           exchanges the token.
-
-        If no Web Server DAT is wired (older builds), this prints instructions
-        and the user falls back to Paste API Key.
-        """
-        with self._lock:
-            try:
-                self._oauth_port = oauth.find_free_port()
-                self._oauth_state = oauth.generate_state()
-            except oauth.OAuthError as e:
-                self.log(f"OAuth setup failed: {e}")
-                self._set_status("Auth setup failed")
-                return
-
-            server = self._oauth_server()
-            if server is not None:
-                try:
-                    server.par.port = self._oauth_port
-                    server.par.active = True
-                except Exception as e:
-                    self.log(f"Could not start oauth_server: {e}")
-                    self._set_status("Auth: paste API key manually")
-                    return
-
-            url = oauth.build_signin_url(self._oauth_port, self._oauth_state)
-            self.log(f"Opening browser: {url}")
-            opened = oauth.open_browser(url)
-            if not opened:
-                self._set_status("Browser unavailable; paste API key manually")
-            else:
-                self._set_status("Waiting for browser sign-in...")
+        """Daydream OAuth — coming soon. This release supports local pod only."""
+        self._set_status("Hosted mode coming soon — use a local pod for now")
+        self.log("Authenticate(): hosted/Daydream auth is disabled in this release.")
 
     def OnAuthCallback(self, query_string: str) -> tuple[int, str, str]:
         """Called by the Web Server DAT's onHTTPRequest handler with the
@@ -626,17 +592,95 @@ class DemonExt:
         # Snapshot init params for revert-on-mid-session-edit
         self._last_init_values = self._collect_init_params()
 
-        # Send config + a 1s silent priming buffer (server expects audio before 'ready').
+        # Send config
         cfg = self._build_session_config()
         self._send_text(wire.encode_config(cfg))
 
-        prime = np.zeros((2, wire.SAMPLE_RATE), dtype=np.float32)
-        self._send_bytes(wire.encode_audio_frame(prime, channels=2))
+        # Send source audio frame (REQUIRED). Loaded from the Source File par.
+        source_path = self._read_par("Sourcefile", "") or ""
+        pcm = self._load_source_wav(source_path)
+        if pcm is None:
+            self._set_status("Pick a Source Audio File (.wav) and reconnect")
+            try:
+                ws.par.active = False
+            except Exception:
+                pass
+            return
 
-        # Mark connected once the WS reports open. TD's onConnect is hooked in the
-        # callbacks DAT; for now we optimistically flip the flag here.
+        self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+
         self._connected = True
         self._set_status("Connected")
+        self.log(f"sent {pcm.shape[1]} samples ({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) "
+                 f"from {os.path.basename(source_path)}")
+
+    def _load_source_wav(self, path: str) -> "np.ndarray | None":
+        """Load a WAV file off disk → (2, samples) float32 at 48 kHz.
+
+        Uses stdlib `wave` so there are no extra deps. Supports 16-bit PCM
+        and 32-bit float WAV. Mono is duplicated to stereo. Sample rate is
+        linearly resampled to 48 kHz if it differs.
+
+        Returns None if the file can't be opened or decoded.
+        """
+        if not path:
+            self.log("_load_source_wav: no Source Audio File set")
+            return None
+        if not os.path.exists(path):
+            self.log(f"_load_source_wav: file not found: {path}")
+            return None
+
+        try:
+            import wave
+            with wave.open(path, "rb") as wf:
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+                raw = wf.readframes(nframes)
+        except Exception as e:
+            self.log(f"_load_source_wav: wave decode failed: {e}")
+            return None
+
+        # Decode raw bytes by sample width.
+        try:
+            if sampwidth == 2:
+                pcm_i16 = np.frombuffer(raw, dtype=np.int16)
+                pcm = pcm_i16.astype(np.float32) / 32768.0
+            elif sampwidth == 3:
+                # 24-bit packed — uncommon path.
+                self.log("_load_source_wav: 24-bit WAV not supported; convert to 16-bit or 32-bit float")
+                return None
+            elif sampwidth == 4:
+                # Either int32 or float32. wave doesn't tell us; assume float32.
+                pcm = np.frombuffer(raw, dtype=np.float32).copy()
+            elif sampwidth == 1:
+                pcm_u8 = np.frombuffer(raw, dtype=np.uint8)
+                pcm = (pcm_u8.astype(np.float32) - 128.0) / 128.0
+            else:
+                self.log(f"_load_source_wav: unsupported sample width: {sampwidth}")
+                return None
+        except Exception as e:
+            self.log(f"_load_source_wav: decode failed: {e}")
+            return None
+
+        # De-interleave to (channels, samples)
+        if nchannels > 1:
+            try:
+                pcm = pcm.reshape(-1, nchannels).T
+            except Exception as e:
+                self.log(f"_load_source_wav: de-interleave failed: {e}")
+                return None
+        else:
+            pcm = pcm.reshape(1, -1)
+
+        # Resample to 48 kHz if needed
+        if framerate != wire.SAMPLE_RATE:
+            pcm = audio_mod.linear_resample(pcm, framerate, wire.SAMPLE_RATE)
+
+        # Force stereo (mono → duplicated L→R; >2 channels → first two)
+        pcm = audio_mod.to_stereo(pcm)
+        return pcm.astype(np.float32, copy=False)
 
     def _build_session_config(self) -> dict[str, Any]:
         cfg: dict[str, Any] = {}
@@ -944,48 +988,53 @@ class DemonExt:
     # These are called from the script_send / audio_out Script CHOPs.
 
     def OnCookSend(self, scriptOp) -> None:
-        """script_send Script CHOP cook callback.
+        """script_send Script CHOP cook — no-op.
 
-        Pulls samples from `resample_in` and ships them as a binary frame.
-        Output CHOP has zero channels — it's purely a side-effect cook.
+        This release does NOT stream live audio into DEMON. The source track
+        is loaded once from the Source Audio File par at Connect time. This
+        Script CHOP exists only because the .tox topology still includes it;
+        we output a single silent sample so it cooks without errors.
         """
-        if not self._connected:
-            scriptOp.numSamples = 1
-            scriptOp.appendChan("dummy")
-            return
-
-        src = self.ownerComp.op("resample_in")
-        if src is None or src.numChans == 0:
-            scriptOp.numSamples = 1
-            scriptOp.appendChan("dummy")
-            return
-
-        try:
-            n = src.numSamples
-            ch = min(2, src.numChans)
-            pcm = np.empty((ch, n), dtype=np.float32)
-            for i in range(ch):
-                pcm[i] = np.fromiter(src[i].vals, dtype=np.float32, count=n)
-            pcm = audio_mod.to_stereo(pcm)
-            self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
-        except Exception as e:
-            self.log(f"OnCookSend error: {e}")
-        finally:
-            scriptOp.numSamples = 1
-            scriptOp.appendChan("dummy")
+        scriptOp.clear()
+        scriptOp.numSamples = 1
+        scriptOp.appendChan("dummy")
 
     def OnCookRecv(self, scriptOp) -> None:
-        """audio_out Script CHOP cook callback. Reads from ring buffer."""
-        # Pull a chunk equal to the project's cook block at 48k.
-        try:
-            target_samples = max(64, int(scriptOp.par.length or 512))
-        except Exception:
-            target_samples = 512
+        """audio_out Script CHOP cook callback. Reads from ring buffer.
 
-        pcm = self._ring.read(target_samples)  # (2, target_samples)
+        Time Slice mode is ON on this CHOP, so TD calls onCook once per
+        audio time-slice and tells us how many samples to emit. We pop
+        that many from the ring buffer (zero-padded on underrun) and
+        write them as a stereo CHOP at 48 kHz.
+        """
+        # `me.time.frame` doesn't directly tell us block size; the Script CHOP
+        # passes its desired numSamples via scriptOp.numSamples when timeslice
+        # is on. Fall back to 512 if it's zero or not yet set.
+        n = 0
+        try:
+            n = int(scriptOp.numSamples)
+        except Exception:
+            n = 0
+        if n <= 0:
+            # Project audio block heuristic — read from project.audio if present,
+            # otherwise default. The exact value doesn't matter for correctness;
+            # any drift gets absorbed by the ring buffer.
+            try:
+                n = int(project.audioBlock)  # type: ignore[name-defined]  # noqa: F821
+            except Exception:
+                n = 512
+        n = max(1, n)
+
+        pcm = self._ring.read(n)  # (2, n) float32, zero-padded on underrun
+
         scriptOp.clear()
-        scriptOp.numSamples = target_samples
-        scriptOp.rate = wire.SAMPLE_RATE
-        for i, ch_name in enumerate(("chan1", "chan2")):
-            ch = scriptOp.appendChan(ch_name)
-            ch.vals = pcm[i].tolist()
+        try:
+            scriptOp.rate = wire.SAMPLE_RATE
+        except Exception:
+            pass
+        scriptOp.numSamples = n
+        try:
+            scriptOp.appendChan("chan1").vals = pcm[0].tolist()
+            scriptOp.appendChan("chan2").vals = pcm[1].tolist()
+        except Exception as e:
+            self.log(f"OnCookRecv write failed: {e}")
