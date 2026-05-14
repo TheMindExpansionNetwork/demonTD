@@ -1274,7 +1274,18 @@ class DemonExt:
     # -------- LoRA catalog ---------------------------------------------------
 
     def _apply_lora_catalog(self, catalog: list[dict]) -> None:
-        """Update Table DAT + dynamic per-LoRA params on the Prompt+LoRA page."""
+        """Update Table DAT + dynamic per-LoRA params on the Prompt+LoRA page.
+
+        The server echoes lora_catalog on every state change (e.g. when we
+        send enable_lora). Skip redundant work if the catalog shape hasn't
+        changed — otherwise we churn the UI 100x/second and starve the
+        receive thread.
+        """
+        sig = tuple(sorted(e.get("id", "") for e in catalog))
+        if sig == getattr(self, "_lora_catalog_sig", None):
+            return
+        self._lora_catalog_sig = sig
+
         table = self.ownerComp.op("lora_catalog")
         if table is not None:
             try:
@@ -1358,19 +1369,23 @@ class DemonExt:
             self.log(f"LoRA page: added {n_added} pars for "
                      f"{len(catalog)} LoRAs")
 
-            # If any default-on LoRAs were just added (or already enabled),
-            # tell the server to load them now via the discrete enable_lora
-            # message. This means newcomers actually HEAR a LoRA after
-            # Connect without having to toggle anything.
-            for entry in catalog:
-                lid = entry.get("id", "")
-                if lid in DEFAULT_ON:
-                    strength = float(entry.get("strength", 1.0))
-                    try:
-                        self._send_text(wire.encode_enable_lora(lid, strength))
-                        self.log(f"auto-enabled LoRA {lid} (strength {strength})")
-                    except Exception as e:
-                        self.log(f"auto-enable {lid} failed: {e}")
+            # Auto-enable default-on LoRAs ONCE per session. The server
+            # echoes a new lora_catalog every time we send enable_lora,
+            # which re-triggers this handler — so a naive re-enable loops
+            # forever, blocking the recv thread and starving audio slices.
+            if not getattr(self, "_auto_enable_done", False):
+                self._auto_enable_done = True
+                for entry in catalog:
+                    lid = entry.get("id", "")
+                    if lid in DEFAULT_ON:
+                        # Server-reported strength may be 0 before the LoRA
+                        # is loaded — always send 1.0 for default-on LoRAs.
+                        strength = 1.0
+                        try:
+                            self._send_text(wire.encode_enable_lora(lid, strength))
+                            self.log(f"auto-enabled LoRA {lid} (strength {strength})")
+                        except Exception as e:
+                            self.log(f"auto-enable {lid} failed: {e}")
         except Exception as e:
             self.log(f"LoRA page update failed: {type(e).__name__}: {e}")
 
