@@ -820,6 +820,14 @@ def wire_audio(demon):
             except Exception:
                 pass
             out_chop.inputConnectors[0].connect(audio_out)
+            # CRITICAL: out_chop must ALSO be Time Slice. If it's not, the
+            # audio-rate pull from downstream (audiodevout1) collapses to
+            # frame rate (numSamples=1) — verified via par dump.
+            try:
+                out_chop.par.timeslice = True
+                print("[build_tox]   out_chop.timeslice = True")
+            except Exception as e:
+                print(f"!! out_chop.timeslice set failed: {e}")
     except Exception as e:
         print(f"audio wiring: {e}")
 
