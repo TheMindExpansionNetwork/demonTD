@@ -575,10 +575,18 @@ def onTimer(timerOp, segment):
         ext.OnHeartbeat()
 
 def onReceiveText(dat, rowIndex, message):
+    try:
+        print(f"[ws onReceiveText] len={len(message) if message else 0}: {message[:200] if message else ''!r}")
+    except Exception:
+        pass
     _ext().OnReceive(dat, rowIndex=rowIndex, message=message)
 
 def onReceiveBinary(dat, contents):
-    _ext().OnReceive(dat, bytes=contents)
+    try:
+        print(f"[ws onReceiveBinary] len={len(contents) if contents else 0}")
+    except Exception:
+        pass
+    _ext().OnReceive(dat, contents=contents)
 
 def onConnect(dat):
     pass

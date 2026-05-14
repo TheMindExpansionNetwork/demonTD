@@ -553,18 +553,25 @@ class DemonExt:
             self.Disconnect()
 
     def OnReceive(self, dat, rowIndex=None, message=None,
-                  bytes=None, peer=None) -> None:
+                  contents=None, peer=None) -> None:
         """WebSocket DAT callback for incoming messages.
 
-        TD passes either `message` (str) or `bytes` (bytes) depending on frame type.
+        TD's onReceiveText passes a string in `message`. onReceiveBinary
+        passes raw bytes in `contents`. (Older versions passed it as `bytes`
+        — see callbacks DAT shim.)
+
+        We log every entry so we can diagnose if/why the server's `ready`
+        message doesn't arrive.
         """
         try:
-            if isinstance(bytes, (bytes, bytearray)) and bytes:
-                self._on_binary(bytes)
+            self.log(f"OnReceive: message={'<text len=' + str(len(message)) + '>' if isinstance(message, str) else None} "
+                     f"contents={'<binary len=' + str(len(contents)) + '>' if isinstance(contents, (bytes, bytearray)) else None}")
+            if isinstance(contents, (bytes, bytearray)) and len(contents) > 0:
+                self._on_binary(contents)
             elif isinstance(message, str) and message:
                 self._on_text(message)
         except Exception as e:
-            self.log(f"OnReceive error: {e}")
+            self.log(f"OnReceive error: {type(e).__name__}: {e}")
 
     def OnHTTPRequest(self, request_uri: str) -> tuple[int, str, str]:
         """Called by oauth_server (Web Server DAT) onHTTPRequest hook.
