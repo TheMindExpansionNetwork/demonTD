@@ -822,21 +822,22 @@ class DemonExt:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
         # 2. Per-frame param send. DEMON's pipeline ticks based on incoming
-        #    `params` messages and our advancing playback_pos. Without these
-        #    the server runs once and waits. JS client sends at audio rate;
-        #    we send at frame rate (~60 Hz) which is plenty.
+        #    `params` messages with our current playback_pos — that's how
+        #    the server knows how far behind we've played. Without continuous
+        #    updates, the server's flow control pauses generation.
+        #
+        #    Important: playback_pos must reflect what's ACTUALLY been played
+        #    (i.e. consumed by audio_out's OnCookRecv), not a wall-clock guess.
+        #    OnCookRecv increments self._playback_pos by samples actually
+        #    written to its output. Here we just snapshot and send.
         if self._connected:
             with self._lock:
                 raw = dict(self._dirty) if self._dirty else {}
                 self._dirty.clear()
-            # Always send — even if raw is empty, the playback_pos advance is
-            # what keeps the server's pipeline progressing.
             try:
                 self._send_text(wire.encode_params(raw, self._playback_pos))
             except Exception as e:
                 self.log(f"frame param send error: {e}")
-            # Advance playback_pos by ~1 frame's worth of audio.
-            self._playback_pos += int(wire.SAMPLE_RATE / 60)
 
         # 3. Telemetry (~every 2 s)
         if self._connected:
@@ -880,8 +881,13 @@ class DemonExt:
         audio = getattr(self, "_pending_audio", None)
         if cfg is None or audio is None:
             return
+        # Reset session-state counters at the start of every successful flush.
+        self._playback_pos = 0
+        self._n_binary_frames = 0
+        self._n_cook_recv = 0
+        self._auto_enable_done = False
+        self._lora_catalog_sig = None
         self.log("_flush_pending: sending config + audio")
-        # Dump the exact config JSON so we can compare against the JS client.
         try:
             self.log(f"_flush_pending: config = {cfg}")
         except Exception:
@@ -1617,12 +1623,20 @@ class DemonExt:
         scriptOp.appendChan("dummy")
 
     def OnCookRecv(self, scriptOp) -> None:
-        """audio_out Script CHOP cook callback. Reads from ring buffer."""
+        """audio_out Script CHOP cook callback. Reads from ring buffer.
+
+        Each cook:
+          1. Pop `n` samples from the ring (zero-padded on underrun).
+          2. Advance self._playback_pos by `n` so subsequent params
+             messages tell the server how much we've actually played.
+          3. Diagnose silence: if the read came back all-zero, the ring
+             was empty (server hasn't sent enough slices).
+        """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
-        # Log first cook so we know audio_out is actually being pulled.
         if self._n_cook_recv == 1:
             try:
-                self.log(f"OnCookRecv: FIRST cook — numSamples={scriptOp.numSamples}")
+                self.log(f"OnCookRecv: FIRST cook — numSamples={scriptOp.numSamples} "
+                         f"ring_avail={self._ring.available}")
             except Exception:
                 pass
 
@@ -1638,7 +1652,23 @@ class DemonExt:
                 n = 512
         n = max(1, n)
 
+        avail_before = self._ring.available
         pcm = self._ring.read(n)
+
+        # Track samples consumed for accurate playback_pos in params messages.
+        self._playback_pos += n
+
+        # Diagnose every Nth cook: did we get real audio, or silence?
+        if self._n_cook_recv % 600 == 0:
+            try:
+                peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
+                self.log(
+                    f"OnCookRecv #{self._n_cook_recv}: n={n} "
+                    f"ring_before={avail_before} ring_after={self._ring.available} "
+                    f"peak={peak:.4f} (silence if 0)"
+                )
+            except Exception:
+                pass
 
         scriptOp.clear()
         try:
