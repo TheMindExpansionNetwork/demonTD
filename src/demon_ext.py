@@ -626,12 +626,11 @@ class DemonExt:
         """Open the WS DAT against ws_url.
 
         TD's WebSocket DAT splits the target into `netaddress` (host only,
-        no scheme, no port, no path) and `port` (separate par). It does NOT
-        accept a full URL in netaddress.  There is no openConnection() /
-        close() method — only par.active = True/False.
+        no scheme, no port, no path) and `port` (separate par). There is
+        no openConnection() / close() — only par.active = True/False.
 
-        TD path component? The DAT has no `path` par, so we assume the
-        endpoint is at the host:port root (which matches DEMON's pod).
+        We schedule the active-toggle on a short delay so TD has a chance
+        to apply netaddress/port writes before reconnecting.
         """
         ws = self._ws()
         if ws is None:
@@ -644,28 +643,41 @@ class DemonExt:
             return
         self.log(f"_open_ws: target={ws_url}  →  host={host!r} port={port}")
 
-        # Stop any prior connection
+        # Phase 1: deactivate (synchronous, fast).
         try:
             ws.par.active = False
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"_open_ws: deactivate failed: {e}")
 
+        # Phase 2: rewrite address.
         try:
             ws.par.netaddress = host
-            ws.par.port = port
         except Exception as e:
-            self.log(f"_open_ws: set netaddress/port failed: {e}")
+            self.log(f"_open_ws: set netaddress failed: {e}")
             self._set_status(f"WS setup failed: {e}")
             return
-
-        # Trigger the (re)connect
         try:
-            ws.par.active = True
-            self.log("_open_ws: par.active = True (waiting for onConnect)")
+            ws.par.port = port
         except Exception as e:
-            self.log(f"_open_ws: par.active=True failed: {e}")
-            self._set_status(f"WS open failed: {e}")
-            return
+            self.log(f"_open_ws: set port failed: {e}")
+            # netaddress might also encode port in some TD versions; carry on
+
+        # Phase 3: defer the activate so TD processes the par writes first.
+        # `run` schedules a Python string for execution on the main thread
+        # after `delayFrames` frames (1 frame ~= 16ms at 60fps).
+        try:
+            run("op('ws1').par.active = True",  # type: ignore[name-defined]  # noqa: F821
+                fromOP=self.ownerComp, delayFrames=2)
+            self.log("_open_ws: scheduled par.active = True (delayFrames=2)")
+        except Exception as e:
+            # Fallback: immediate activate
+            self.log(f"_open_ws: deferred run failed, activating immediately: {e}")
+            try:
+                ws.par.active = True
+            except Exception as e2:
+                self.log(f"_open_ws: par.active=True failed: {e2}")
+                self._set_status(f"WS open failed: {e2}")
+                return
 
     @staticmethod
     def _parse_ws_url(url: str) -> tuple[str | None, int]:
