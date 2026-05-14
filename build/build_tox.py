@@ -424,6 +424,13 @@ def main():
     project.quit(force=True)
 
 
-# When run via `TouchDesigner -python build_tox.py`, TD calls __main__ for us.
-if __name__ == "__main__" or me is not None:  # type: ignore[name-defined]
+# Entry: always run when executed inside TD.
+# Inside TD this file is usually loaded into a Text DAT and run via the DAT's
+# `Run Script` action. We don't gate on __name__ because TD doesn't set it
+# to "__main__" in that path.
+try:
     main()
+except Exception as exc:
+    print(f"[build_tox] FAILED: {exc}")
+    import traceback
+    traceback.print_exc()

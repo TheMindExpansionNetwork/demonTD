@@ -24,17 +24,30 @@ The pod's WebSocket lives at `ws://127.0.0.1:8765/`. There is **no queue API** a
 
 ## 2. Build `demon.tox`
 
-From this repo. The build script runs headlessly under TouchDesigner.
+TouchDesigner is GUI-first; there's no true headless mode. The realistic
+build workflow is:
 
-```bash
-cd ~/git/demon-td
-/Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner \
-    -python build/build_tox.py
-```
+1. Open TouchDesigner. **File → New** for a blank project.
+2. Drop a **Text DAT** in the network. Name it `build`.
+3. On the DAT: set `File` to `~/git/demon-td/build/build_tox.py`, toggle
+   `Load on Start` and `Sync to File` on. The script content loads in.
+4. Right-click the DAT → **Run Script**.
+5. Watch the Textport (`Alt+T`) for `[build_tox] wrote .../dist/demon.tox`.
 
-Output: `dist/demon.tox` (~few MB including vendored zstandard wheels).
+The script:
+- Scaffolds `build/template.toe` on first run (commit it after).
+- Creates a Base COMP `demon` at `/project1/demon` with all internal ops.
+- File-syncs each `src/*.py` into a Text DAT inside the COMP.
+- Regenerates the custom parameter pages from `src/params.py`.
+- Saves `dist/demon.tox`.
 
-The script also creates `build/template.toe` on first run — that's the scaffold it edits in place. Commit it after the first build.
+Re-running is idempotent — it updates whatever drifted.
+
+> **Heads-up**: `build_tox.py` was written from the wire-protocol spec and
+> unit-tested outside TD. The first time you run it, expect 1–2 TD-version-
+> specific tweaks (e.g. an op-class name or par-creation API quirk). Fixes
+> belong in `build/build_tox.py`. Open a PR — most TD versions just need
+> one or two lines changed.
 
 ## 3. Drag into a TD project
 
