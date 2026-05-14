@@ -166,27 +166,37 @@ def regenerate_param_pages(demon):
 
         label = p.label or p.name
 
-        if p.type == "Pulse":
-            par = page.appendPulse(p.name, label=label)
-        elif p.type == "Header":
-            par = page.appendHeader(p.name, label=label)
-        elif p.type == "Toggle":
-            par = page.appendToggle(p.name, label=label)
-        elif p.type == "Int":
-            par = page.appendInt(p.name, label=label)
-        elif p.type == "Float":
-            par = page.appendFloat(p.name, label=label)
-        elif p.type == "Str":
-            par = page.appendStr(p.name, label=label)
-        elif p.type == "Menu":
-            par = page.appendMenu(p.name, label=label)
-        else:
-            print(f"!! unknown par type {p.type} for {p.name}")
+        try:
+            if p.type == "Pulse":
+                par = page.appendPulse(p.name, label=label)
+            elif p.type == "Header":
+                par = page.appendHeader(p.name, label=label)
+            elif p.type == "Toggle":
+                par = page.appendToggle(p.name, label=label)
+            elif p.type == "Int":
+                par = page.appendInt(p.name, label=label)
+            elif p.type == "Float":
+                par = page.appendFloat(p.name, label=label)
+            elif p.type == "Str":
+                par = page.appendStr(p.name, label=label)
+            elif p.type == "Menu":
+                par = page.appendMenu(p.name, label=label)
+            else:
+                print(f"!! unknown par type {p.type} for {p.name}")
+                continue
+        except Exception as e:
+            print(f"!! failed to append {p.type} {p.name}: {e}")
             continue
 
-        if not par:
+        # par is a ParGroup; don't bool() it. Indexing returns the underlying
+        # Par object we can set attributes on.
+        if par is None:
             continue
-        p0 = par[0]
+        try:
+            p0 = par[0]
+        except Exception as e:
+            print(f"!! failed to index par {p.name}: {e}")
+            continue
 
         # Defaults and ranges
         if p.default is not None and p.type not in ("Pulse", "Header"):
