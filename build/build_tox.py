@@ -820,6 +820,14 @@ def wire_audio(demon):
                 out_chop.par.timeslice = True
             except Exception:
                 pass
+            # Also point out_chop's `selectchop` at audio_out. In some TD
+            # versions, Out CHOPs use Select mode for propagation (especially
+            # for audio-rate signals across COMP boundaries) rather than
+            # wired-input mode.
+            try:
+                out_chop.par.selectchop = "audio_out"
+            except Exception:
+                pass
     except Exception as e:
         print(f"audio wiring out_chop: {e}")
 
