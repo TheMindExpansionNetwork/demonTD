@@ -791,15 +791,13 @@ class DemonExt:
         self._inbound.put(("close", (code, reason)))
 
     def _drain_inbound(self) -> None:
-        """Main-thread drain of WS events. Called from OnTick (Timer CHOP)."""
-        # Limit how many we process per tick so a slice flood can't stall
-        # the cook for seconds. The queue persists, leftovers next tick.
+        """Main-thread drain of WS events. Called by frame_exec every frame."""
         max_per_tick = 64
         for _ in range(max_per_tick):
             try:
                 kind, payload = self._inbound.get_nowait()
             except queue.Empty:
-                return
+                break
             try:
                 if kind == "open":
                     self.log("[ws_client] open — flushing config + audio")
@@ -816,6 +814,22 @@ class DemonExt:
                     self._set_status(f"Disconnected ({reason or 'closed'})")
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
+
+        # Periodic telemetry (~every 2s). Now driven by frame_exec, not OnTick,
+        # since the Timer CHOP isn't reliably firing in TD 2025.
+        if self._connected:
+            now = time.time()
+            last = getattr(self, "_last_telem_log", 0.0)
+            if now - last > 2.0:
+                self._last_telem_log = now
+                buffered = self._ring.available
+                buf_s = buffered / wire.SAMPLE_RATE
+                n_bin = getattr(self, "_n_binary_frames", 0)
+                n_cook = getattr(self, "_n_cook_recv", 0)
+                self.log(
+                    f"telemetry: buffered={buffered} ({buf_s:.2f}s)  "
+                    f"binary_frames_recv={n_bin}  audio_out_cooks={n_cook}"
+                )
 
     @staticmethod
     def _parse_ws_url(url: str) -> tuple[str | None, int]:
@@ -1234,6 +1248,9 @@ class DemonExt:
             self.log(f"unknown server message: {kind}")
 
     def _on_binary(self, buf: bytes) -> None:
+        # Counter for telemetry
+        self._n_binary_frames = getattr(self, "_n_binary_frames", 0) + 1
+
         # The first binary frame after `ready` (or `swap_ready`) is the
         # raw float16 initial buffer — interleaved PCM, no 23-byte slice
         # header. Subsequent frames are slices.
@@ -1578,32 +1595,28 @@ class DemonExt:
         scriptOp.appendChan("dummy")
 
     def OnCookRecv(self, scriptOp) -> None:
-        """audio_out Script CHOP cook callback. Reads from ring buffer.
+        """audio_out Script CHOP cook callback. Reads from ring buffer."""
+        self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
+        # Log first cook so we know audio_out is actually being pulled.
+        if self._n_cook_recv == 1:
+            try:
+                self.log(f"OnCookRecv: FIRST cook — numSamples={scriptOp.numSamples}")
+            except Exception:
+                pass
 
-        Time Slice mode is ON on this CHOP, so TD calls onCook once per
-        audio time-slice and tells us how many samples to emit. We pop
-        that many from the ring buffer (zero-padded on underrun) and
-        write them as a stereo CHOP at 48 kHz.
-        """
-        # `me.time.frame` doesn't directly tell us block size; the Script CHOP
-        # passes its desired numSamples via scriptOp.numSamples when timeslice
-        # is on. Fall back to 512 if it's zero or not yet set.
         n = 0
         try:
             n = int(scriptOp.numSamples)
         except Exception:
             n = 0
         if n <= 0:
-            # Project audio block heuristic — read from project.audio if present,
-            # otherwise default. The exact value doesn't matter for correctness;
-            # any drift gets absorbed by the ring buffer.
             try:
                 n = int(project.audioBlock)  # type: ignore[name-defined]  # noqa: F821
             except Exception:
                 n = 512
         n = max(1, n)
 
-        pcm = self._ring.read(n)  # (2, n) float32, zero-padded on underrun
+        pcm = self._ring.read(n)
 
         scriptOp.clear()
         try:
