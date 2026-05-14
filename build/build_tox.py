@@ -75,8 +75,7 @@ if not os.path.isdir(SRC_DIR):
 # params.py / wire.py / etc. TD's Python keeps sys.modules across script
 # runs, so without this we'd use a stale Param dataclass and AttributeError
 # on any newly-added field.
-for _modname in ("params", "wire", "queue_client", "oauth", "audio", "ws_client",
-                 "audio_sender"):
+for _modname in ("params", "wire", "queue_client", "oauth", "audio", "ws_client"):
     sys.modules.pop(_modname, None)
 
 import params as P  # noqa: E402  pylint: disable=wrong-import-position
@@ -97,6 +96,14 @@ TOPOLOGY = [
     ("audio_in",       "inCHOP",        {}, (-800, -200)),
     ("resample_in",    "resampleCHOP",  {}, (-600, -200)),
     ("script_send",    "scriptCHOP",    {}, (-400, -200)),
+    # audio_clock is a Time-Slice'd Constant CHOP wired as the upstream input
+    # to audio_out. A source-only Script CHOP (no inputs) does NOT cook at
+    # audio rate in TD 2025 even with Time Slice = True; it falls back to
+    # frame rate (numSamples=1). Giving it a time-sliced input forces the
+    # cook rate to track audio block cadence. The Constant CHOP outputs
+    # silence (constant 0) — audio_out's Python callback ignores the input
+    # data and writes its own PCM from the ring buffer.
+    ("audio_clock",    "constantCHOP",  {}, (200, -200)),
     ("audio_out",      "scriptCHOP",    {}, (400, -200)),
     ("resample_out",   "resampleCHOP",  {}, (600, -200)),
     ("out_chop",       "outCHOP",       {}, (800, -200)),
@@ -153,6 +160,7 @@ def get_opclass_lookup():
         "outCHOP":             outCHOP,
         "scriptCHOP":          scriptCHOP,
         "resampleCHOP":        resampleCHOP,
+        "constantCHOP":        constantCHOP,
     }
 
 
@@ -321,7 +329,7 @@ def _add_one_param(demon, page_lookup, p) -> bool:
 # DAT sync
 # -----------------------------------------------------------------------------
 SRC_FILES = ["params.py", "wire.py", "queue_client.py", "oauth.py", "audio.py",
-             "ws_client.py", "audio_sender.py", "demon_ext.py"]
+             "ws_client.py", "demon_ext.py"]
 
 
 def sync_text_dats(demon):
@@ -772,8 +780,27 @@ def wire_audio(demon):
     script_send.onCook is a no-op.
     """
     audio_out = demon.op("audio_out")
+    audio_clock = demon.op("audio_clock")
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
+
+    # Configure audio_clock (Constant CHOP, Time Slice = ON).
+    # This is a silent audio-rate "metronome" wired as audio_out's input
+    # so that audio_out (a source-only Script CHOP) cooks at audio block
+    # rate instead of frame rate. The actual sample values don't matter —
+    # only its time-slice cadence does.
+    if audio_clock is not None:
+        try:
+            audio_clock.par.timeslice = True
+        except Exception as e:
+            print(f"!! audio_clock.timeslice: {e}")
+        # Give it a single named channel with value 0. Time-Slice Constant
+        # CHOP will emit (numSamples,) zeros at audio-rate cadence.
+        try:
+            audio_clock.par.name0 = "clk"
+            audio_clock.par.value0 = 0.0
+        except Exception as e:
+            print(f"!! audio_clock channel setup: {e}")
 
     # Configure audio_out Script CHOP.
     # Time Slice = ON so Audio Device Out can pull it at audio block rate.
@@ -787,6 +814,17 @@ def wire_audio(demon):
             audio_out.par.timeslice = True
         except Exception:
             pass
+        # Wire audio_clock as audio_out's input. The Python OnCookRecv
+        # callback ignores the input data — it only needs the upstream
+        # time-slice cadence to be cooked at audio rate.
+        if audio_clock is not None:
+            try:
+                for c in audio_out.inputConnectors:
+                    if c.connections:
+                        c.disconnect()
+                audio_out.inputConnectors[0].connect(audio_clock)
+            except Exception as e:
+                print(f"!! audio_clock -> audio_out wire: {e}")
         # Dump ALL pars so we can see exactly what TD 2025 exposes.
         try:
             print("[build_tox]   audio_out — ALL pars:")
