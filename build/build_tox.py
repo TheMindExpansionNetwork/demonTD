@@ -475,24 +475,31 @@ def wire_callbacks(demon):
     if ws is not None:
         try:
             ws.par.callbacks = "callbacks"
-        except Exception:
-            pass
-        # Send JSON as text and audio frames as binary. The Format par on
-        # the WS DAT controls OUTGOING default; we send binary explicitly
-        # via sendBinary() so 'auto' (text default) is what we want.
-        # Try several known values across TD versions.
-        for val in ("auto", "Auto", 2, "text", "Text", 0):
-            try:
-                ws.par.format = val
-                break
-            except Exception:
-                continue
-        for parname in ("receivebinary", "binarymessages"):
-            try:
-                setattr(ws.par, parname, True)
-                break
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"!! ws.par.callbacks: {e}")
+
+        # Don't fight TD on format/binary settings — defaults route both text
+        # and binary to their respective onReceive callbacks. Setting Format
+        # explicitly was causing issues. Just dump what's available so we
+        # know.
+        try:
+            print("[build_tox]   ws1 pars:")
+            for p in ws.customPars:
+                try:
+                    print(f"     custom: {p.name} = {p.eval()!r}")
+                except Exception:
+                    pass
+            for pname in ("active", "netaddress", "format", "callbacks",
+                          "autoreconnect", "reconnectdelay", "receivebinary",
+                          "binarymessages", "receiveasbinary"):
+                par = getattr(ws.par, pname, None)
+                if par is not None:
+                    try:
+                        print(f"     {pname} = {par.eval()!r}")
+                    except Exception:
+                        print(f"     {pname} (uneval)")
+        except Exception as e:
+            print(f"!! ws par dump: {e}")
 
     for name in ("tick8ms", "heartbeat"):
         t = demon.op(name)
@@ -589,10 +596,16 @@ def onReceiveBinary(dat, contents):
     _ext().OnReceive(dat, contents=contents)
 
 def onConnect(dat):
-    pass
+    try:
+        print(f"[ws onConnect] {dat.name} netaddress={dat.par.netaddress.eval()}")
+    except Exception:
+        pass
 
 def onDisconnect(dat):
-    pass
+    try:
+        print(f"[ws onDisconnect] {dat.name}")
+    except Exception:
+        pass
 
 def onHTTPRequest(webServerDAT, request, response):
     uri = request.get("uri", "")
