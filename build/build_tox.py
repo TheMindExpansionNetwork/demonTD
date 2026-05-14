@@ -600,6 +600,10 @@ def onConnect(dat):
         print(f"[ws onConnect] {dat.name} netaddress={dat.par.netaddress.eval()}")
     except Exception:
         pass
+    try:
+        _ext().OnWsConnect(dat)
+    except Exception as e:
+        print(f"[ws onConnect] OnWsConnect failed: {e}")
 
 def onDisconnect(dat):
     try:

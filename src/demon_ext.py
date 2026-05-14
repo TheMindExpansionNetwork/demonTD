@@ -627,72 +627,152 @@ class DemonExt:
         if ws is None:
             self._set_status("WebSocket DAT 'ws1' not found")
             return
+
+        # Close any stale connection. TD 2025 prefers explicit methods on
+        # the DAT; older builds expose only par.active. We probe both.
+        self.log(f"_open_ws: target={ws_url}")
+        for op_name in ("close", "disconnect"):
+            fn = getattr(ws, op_name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    self.log(f"_open_ws: called ws.{op_name}()")
+                    break
+                except Exception as e:
+                    self.log(f"_open_ws: ws.{op_name}() failed: {e}")
         try:
             ws.par.active = False
+        except Exception:
+            pass
+
+        # Set destination, then open.
+        try:
             ws.par.netaddress = ws_url
-            ws.par.active = True
         except Exception as e:
-            self.log(f"Failed to open WS: {e}")
+            self.log(f"_open_ws: set netaddress failed: {e}")
             self._set_status(f"WS open failed: {e}")
             return
+
+        opened = False
+        for op_name in ("openConnection", "open", "connect"):
+            fn = getattr(ws, op_name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    self.log(f"_open_ws: called ws.{op_name}()")
+                    opened = True
+                    break
+                except Exception as e:
+                    self.log(f"_open_ws: ws.{op_name}() failed: {e}")
+        if not opened:
+            try:
+                ws.par.active = True
+                self.log("_open_ws: set par.active = True")
+            except Exception as e:
+                self.log(f"_open_ws: par.active=True failed: {e}")
+                self._set_status(f"WS open failed: {e}")
+                return
+
+        # Probe state after a brief settle. TD may not have actually opened
+        # the socket yet — log whatever introspection is available.
+        try:
+            for attr_name in ("connected", "isOpen", "isConnected", "ready",
+                              "readyState", "state"):
+                val = getattr(ws, attr_name, None)
+                if val is not None and not callable(val):
+                    self.log(f"_open_ws: ws.{attr_name} = {val!r}")
+            try:
+                peers = getattr(ws, "peers", None)
+                if peers is not None and not callable(peers):
+                    self.log(f"_open_ws: ws.peers = {peers!r}")
+            except Exception:
+                pass
+            try:
+                if hasattr(ws, "errors") and ws.errors:
+                    self.log(f"_open_ws: ws.errors = {ws.errors!r}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # Snapshot init params for revert-on-mid-session-edit
         self._last_init_values = self._collect_init_params()
 
-        # Send config
+        # Resolve the source audio NOW (so we know it's valid) and stash it
+        # along with the config. We fire both only when OnWsConnect arrives.
         cfg = self._build_session_config()
-        self._send_text(wire.encode_config(cfg))
-
-        # Resolve the source audio. THREE paths, in order:
-        #   1. `Source Audio File` par — explicit file path.
-        #   2. Upstream wired CHOP's .par.file — if an Audio File In CHOP is
-        #      plugged into the COMP, read the WHOLE file it references.
-        #   3. Snapshot of audio_in's current samples — last resort, may be
-        #      too short (audio cook block is ~30 ms).
-        source_path = self._read_par("Sourcefile", "") or ""
-        pcm = None
-        source_label = ""
-
-        if source_path:
-            pcm = self._load_source_wav(source_path)
-            if pcm is not None:
-                source_label = os.path.basename(source_path)
-
-        if pcm is None:
-            wired_path = self._wired_chop_file_path()
-            if wired_path:
-                pcm = self._load_source_wav(wired_path)
-                if pcm is not None:
-                    source_label = f"wired CHOP file: {os.path.basename(wired_path)}"
-
-        if pcm is None:
-            pcm = self._snapshot_input_chop()
-            if pcm is not None:
-                source_label = "wired CHOP snapshot"
-                if pcm.shape[1] < wire.SAMPLE_RATE:
-                    self.log(
-                        f"WARNING: source audio is only "
-                        f"{pcm.shape[1] / wire.SAMPLE_RATE:.2f}s — "
-                        f"DEMON needs >=1s. Set Source Audio File for a "
-                        f"full-track read."
-                    )
-
+        pcm = self._resolve_source_pcm()
+        source_label = "(unknown)"
         if pcm is None:
             self._set_status(
                 "Set Source Audio File or wire an Audio File In CHOP, then reconnect"
             )
+            for op_name in ("close", "disconnect"):
+                fn = getattr(ws, op_name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
             try:
                 ws.par.active = False
             except Exception:
                 pass
             return
 
-        self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+        # Cheap label heuristic — what did we end up using?
+        sf = self._read_par("Sourcefile", "")
+        if sf:
+            source_label = os.path.basename(sf)
+        else:
+            wired = self._wired_chop_file_path()
+            if wired:
+                source_label = f"wired CHOP file: {os.path.basename(wired)}"
+            else:
+                source_label = "wired CHOP snapshot"
 
+        self._pending_config = wire.encode_config(cfg)
+        self._pending_audio = wire.encode_audio_frame(pcm, channels=2)
+        self._pending_source_label = source_label
+        self._pending_audio_samples = pcm.shape[1]
+
+        # If TD already reports the WS as open right now, send immediately
+        # (some TD versions never fire onConnect for fast-completing connects).
+        try:
+            already_open = getattr(ws, "connected", None) is True
+        except Exception:
+            already_open = False
+        if already_open:
+            self.log("_open_ws: WS already reports connected; flushing pending now")
+            self._flush_pending()
+
+    def OnWsConnect(self, dat) -> None:
+        """Called by the callbacks DAT's onConnect. We held back the config
+        + source-audio frames until the socket was actually open."""
+        try:
+            self.log(f"OnWsConnect: ws connected ({dat.par.netaddress.eval()})")
+        except Exception:
+            self.log("OnWsConnect: ws connected")
+        self._flush_pending()
+
+    def _flush_pending(self) -> None:
+        cfg = getattr(self, "_pending_config", None)
+        audio = getattr(self, "_pending_audio", None)
+        if cfg is None or audio is None:
+            return
+        self.log("_flush_pending: sending config + audio")
+        self._send_text(cfg)
+        self._send_bytes(audio)
         self._connected = True
         self._set_status("Connected")
-        self.log(f"sent {pcm.shape[1]} samples ({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) "
-                 f"from {source_label}")
+        self.log(
+            f"sent {self._pending_audio_samples} samples "
+            f"({self._pending_audio_samples / wire.SAMPLE_RATE:.2f}s) "
+            f"from {self._pending_source_label}"
+        )
+        # One-shot — clear so we don't double-send on reconnects.
+        self._pending_config = None
+        self._pending_audio = None
 
     def _convert_to_wav(self, src_path: str) -> str | None:
         """Convert any audio file to a 16-bit 48 kHz stereo WAV in a temp file.
@@ -1135,43 +1215,65 @@ class DemonExt:
     def _send_text(self, payload: str) -> None:
         ws = self._ws()
         if ws is None:
+            self.log("_send_text: no ws DAT")
             return
+        # Probe state — useful for diagnosing "sent but server got nothing"
         try:
-            ws.sendText(payload)
-        except Exception as e:
-            self.log(f"sendText failed: {e}")
+            connected = getattr(ws, "connected", None)
+            if connected is False:
+                self.log(f"_send_text: WS not connected (ws.connected={connected!r}); "
+                         f"send anyway")
+        except Exception:
+            pass
+        for method_name in ("sendText", "send"):
+            method = getattr(ws, method_name, None)
+            if method is None:
+                continue
+            try:
+                method(payload)
+                self.log(f"_send_text: ws.{method_name}({len(payload)} chars) ok")
+                return
+            except Exception as e:
+                self.log(f"_send_text: ws.{method_name} failed: {e}")
+        self.log("no working text-send method on WebSocket DAT")
 
     def _send_bytes(self, payload: bytes) -> None:
         """Send a binary frame on the WebSocket DAT.
 
-        TD versions differ on the method name:
+        TD versions differ on the method name across releases:
           - TD 2023+ : ws.sendBinary(bytes)
           - older    : ws.sendBytes(bytes)
           - some     : ws.send(bytes, asBinary=True)
-
-        We try them in order. Bail with a log on full failure rather than
-        raising, so the caller can keep going (e.g. mark connected).
         """
         ws = self._ws()
         if ws is None:
+            self.log("_send_bytes: no ws DAT")
             return
+        try:
+            connected = getattr(ws, "connected", None)
+            if connected is False:
+                self.log(f"_send_bytes: WS not connected (ws.connected={connected!r}); "
+                         f"send anyway")
+        except Exception:
+            pass
         for method_name in ("sendBinary", "sendBytes"):
             method = getattr(ws, method_name, None)
             if method is None:
                 continue
             try:
                 method(payload)
+                self.log(f"_send_bytes: ws.{method_name}({len(payload)} B) ok")
                 return
             except Exception as e:
-                self.log(f"{method_name} failed: {e}")
-        # Last resort: send(...) with asBinary
+                self.log(f"_send_bytes: ws.{method_name} failed: {e}")
         send = getattr(ws, "send", None)
         if send is not None:
             try:
                 send(payload, asBinary=True)
+                self.log(f"_send_bytes: ws.send(binary, {len(payload)} B) ok")
                 return
             except Exception as e:
-                self.log(f"send(binary) failed: {e}")
+                self.log(f"_send_bytes: ws.send(binary) failed: {e}")
         self.log("no working binary-send method on WebSocket DAT")
 
     def _snapshot_audio(self, chop) -> np.ndarray | None:
