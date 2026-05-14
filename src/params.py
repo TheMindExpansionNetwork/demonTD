@@ -321,16 +321,31 @@ CURVE_PARAMS: list[Param] = [
 # Page 7: Sources
 # -----------------------------------------------------------------------------
 SOURCES_PARAMS: list[Param] = [
-    Param("Swapsource", None, "Sources", "Pulse", "discrete", order=10,
+    # ---------- Swap (replace the source track mid-session) ----------
+    Param("Swapheader", None, "Sources", "Header", "session",
+          order=5, section_header=True, label="Swap Source Track"),
+    Param("Swapsourcefile", None, "Sources", "File", "session", default="",
+          order=10, label="Swap Source File",
+          help="WAV/MP3/M4A. If set, Swap Source uploads this file. "
+               "Otherwise it uses the wired CHOP input."),
+    Param("Swapsource", None, "Sources", "Pulse", "discrete", order=15,
           label="Swap Source",
-          help="Send the current CHOP input as a new source track. "
-               "Uses Swap Tags / Swap Key if set."),
+          help="Swap to a new source track. Uses Swap Source File if set, "
+               "else the wired CHOP input. Honors Swap Tags."),
     Param("Swaptags", None, "Sources", "Str", "session", default="", order=20,
           label="Swap Tags", multiline=True,
-          help="Optional tags override for Swap Source."),
-    Param("Settimbresource", None, "Sources", "Pulse", "discrete", order=30,
+          help="Optional prompt tags override for Swap Source."),
+
+    # ---------- Timbre reference ----------
+    Param("Timbreheader", None, "Sources", "Header", "session",
+          order=25, section_header=True, label="Timbre Reference"),
+    Param("Timbresourcefile", None, "Sources", "File", "session", default="",
+          order=30, label="Timbre Source File",
+          help="WAV/MP3/M4A used as a timbre reference. If empty, the wired "
+               "CHOP input is snapshotted instead."),
+    Param("Settimbresource", None, "Sources", "Pulse", "discrete", order=35,
           label="Set Timbre Source",
-          help="Upload the current CHOP input as a timbre reference."),
+          help="Upload the Timbre Source File (or wired CHOP) as a timbre reference."),
     Param("Cleartimbresource", None, "Sources", "Pulse", "discrete", order=40,
           label="Clear Timbre Source"),
     Param("Timbrefixture", None, "Sources", "Str", "session", default="", order=50,
@@ -338,9 +353,17 @@ SOURCES_PARAMS: list[Param] = [
           help="Name of a server-side fixture to use as timbre reference."),
     Param("Settimbrefixture", None, "Sources", "Pulse", "discrete", order=55,
           label="Apply Timbre Fixture"),
-    Param("Setstructuresource", None, "Sources", "Pulse", "discrete", order=60,
+
+    # ---------- Structure reference ----------
+    Param("Structureheader", None, "Sources", "Header", "session",
+          order=58, section_header=True, label="Structure Reference"),
+    Param("Structuresourcefile", None, "Sources", "File", "session", default="",
+          order=60, label="Structure Source File",
+          help="WAV/MP3/M4A used as a structure reference. If empty, the wired "
+               "CHOP input is snapshotted instead."),
+    Param("Setstructuresource", None, "Sources", "Pulse", "discrete", order=65,
           label="Set Structure Source",
-          help="Upload the current CHOP input as a structure reference."),
+          help="Upload the Structure Source File (or wired CHOP) as a structure reference."),
     Param("Clearstructuresource", None, "Sources", "Pulse", "discrete", order=70,
           label="Clear Structure Source"),
     Param("Structurefixture", None, "Sources", "Str", "session", default="",

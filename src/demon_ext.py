@@ -411,14 +411,28 @@ class DemonExt:
     def SetTimbreStrength(self, value: float) -> None:
         self._send_text(wire.encode_set_timbre_strength(float(value)))
 
-    def SetTimbreSource(self, chop: Any = None, name: str = "td_input") -> None:
-        """Upload the current CHOP input (or a referenced CHOP op) as timbre."""
-        pcm = self._snapshot_audio(chop)
+    def SetTimbreSource(self, chop: Any = None, name: str = "td_timbre",
+                        file_path: str | None = None) -> None:
+        """Upload audio as a timbre reference.
+
+        Resolution order (matching the main Connect source):
+          1. `file_path` arg if provided
+          2. Timbre Source File par (if set)
+          3. Wired CHOP input's .par.file (if upstream is an Audio File In)
+          4. Snapshot of audio_in samples (last resort)
+        """
+        pcm = self._resolve_source_pcm(
+            file_par_name="Timbresourcefile",
+            file_path=file_path,
+            chop_arg=chop,
+        )
         if pcm is None:
-            self.log("SetTimbreSource: no audio input")
+            self.log("SetTimbreSource: no audio available")
             return
         self._send_text(wire.encode_set_timbre_source(name))
         self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+        self.log(f"timbre source sent: {pcm.shape[1]} samples "
+                 f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s)")
 
     def SetTimbreFixture(self, name: str | None = None) -> None:
         n = name if name is not None else (self._read_par("Timbrefixture", "") or "")
@@ -430,16 +444,28 @@ class DemonExt:
         self._send_text(wire.encode_clear_timbre_source())
 
     def SetStructureSource(self, chop: Any = None, fixture: str | None = None,
-                           name: str = "td_input") -> None:
+                           name: str = "td_structure",
+                           file_path: str | None = None) -> None:
+        """Upload audio (or a fixture name) as a structure reference.
+
+        Resolution: explicit fixture → file_path arg → Structure Source File
+        par → wired CHOP file → CHOP snapshot.
+        """
         if fixture:
             self._send_text(wire.encode_set_structure_fixture(fixture))
             return
-        pcm = self._snapshot_audio(chop)
+        pcm = self._resolve_source_pcm(
+            file_par_name="Structuresourcefile",
+            file_path=file_path,
+            chop_arg=chop,
+        )
         if pcm is None:
-            self.log("SetStructureSource: no audio input")
+            self.log("SetStructureSource: no audio available")
             return
         self._send_text(wire.encode_set_structure_source(name))
         self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+        self.log(f"structure source sent: {pcm.shape[1]} samples "
+                 f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s)")
 
     def SetStructureFixture(self, name: str | None = None) -> None:
         n = name if name is not None else (self._read_par("Structurefixture", "") or "")
@@ -453,7 +479,10 @@ class DemonExt:
     def SwapSource(self, chop: Any = None, tags: str | None = None,
                    key: str | None = None,
                    time_signature: str | None = None,
-                   fixture: str | None = None) -> None:
+                   fixture: str | None = None,
+                   file_path: str | None = None) -> None:
+        """Replace the current source track. Resolution: fixture → file_path
+        arg → Swap Source File par → wired CHOP file → CHOP snapshot."""
         tags = tags if tags is not None else (self._read_par("Swaptags", "") or None)
         key = key if key is not None else (self._read_par("Key", "auto") or "auto")
         time_signature = (time_signature if time_signature is not None
@@ -464,10 +493,17 @@ class DemonExt:
             fixture_name=fixture,
         )
         self._send_text(header)
-        if not fixture:
-            pcm = self._snapshot_audio(chop)
-            if pcm is not None:
-                self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+        if fixture:
+            return
+        pcm = self._resolve_source_pcm(
+            file_par_name="Swapsourcefile",
+            file_path=file_path,
+            chop_arg=chop,
+        )
+        if pcm is not None:
+            self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+            self.log(f"swap source sent: {pcm.shape[1]} samples "
+                     f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s)")
 
     # -------- TD callbacks ---------------------------------------------------
 
@@ -716,6 +752,42 @@ class DemonExt:
         except Exception:
             pass
         return None
+
+    def _resolve_source_pcm(self,
+                            file_par_name: str | None = None,
+                            file_path: str | None = None,
+                            chop_arg: Any = None) -> "np.ndarray | None":
+        """Shared source-audio resolution used by Connect, Swap, Timbre, Structure.
+
+        Order of preference:
+          1. explicit file_path arg
+          2. file path from `file_par_name` (e.g. 'Timbresourcefile')
+          3. wired CHOP input's .par.file (if upstream is an Audio File In)
+          4. snapshot of audio_in samples (last resort, may be too short)
+        """
+        # 1. explicit arg
+        if file_path:
+            pcm = self._load_source_wav(file_path)
+            if pcm is not None:
+                return pcm
+
+        # 2. par-driven file path
+        if file_par_name:
+            par_path = self._read_par(file_par_name, "") or ""
+            if par_path:
+                pcm = self._load_source_wav(par_path)
+                if pcm is not None:
+                    return pcm
+
+        # 3. wired CHOP's file
+        wired = self._wired_chop_file_path()
+        if wired:
+            pcm = self._load_source_wav(wired)
+            if pcm is not None:
+                return pcm
+
+        # 4. snapshot
+        return self._snapshot_input_chop()
 
     def _wired_chop_file_path(self) -> str | None:
         """If an upstream CHOP (e.g. Audio File In) is wired into the COMP's
