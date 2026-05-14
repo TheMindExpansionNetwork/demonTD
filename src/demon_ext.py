@@ -732,6 +732,11 @@ class DemonExt:
         if cfg is None or audio is None:
             return
         self.log("_flush_pending: sending config + audio")
+        # Dump the exact config JSON so we can compare against the JS client.
+        try:
+            self.log(f"_flush_pending: config = {cfg}")
+        except Exception:
+            pass
         self._send_text(cfg)
         self._send_bytes(audio)
         self._connected = True
@@ -1012,14 +1017,31 @@ class DemonExt:
         return pcm.astype(np.float32, copy=False)
 
     def _build_session_config(self) -> dict[str, Any]:
-        cfg: dict[str, Any] = {}
-        for p in P.PARAMS:
-            if p.category == "init" and p.wire_name:
-                cfg[p.wire_name] = self._read_par(p.name, p.default)
-        cfg["enabled_loras"] = self._enabled_loras()
-        cfg["lora_strengths"] = self._lora_strengths()
-        # Politely request raw slices if the server supports it.
-        cfg.setdefault("compression", "none")
+        """Build the SessionConfig JSON to send right after WS open.
+
+        Matches demon-public-demo's useStartSession.ts buildConfig() exactly,
+        in the same field order. Sends all 13 fields every time (the JS
+        client does too); the server type allows extras but we don't add
+        any to minimize chance of a strict-parser rejection.
+        """
+        def init_val(td_name: str, default: Any) -> Any:
+            return self._read_par(td_name, default)
+
+        cfg: dict[str, Any] = {
+            "sde":          bool(init_val("Sde", False)),
+            "lora":         bool(init_val("Lora", True)),
+            "depth":        int(init_val("Depth", 4)),
+            "vae_window":   float(init_val("Vaewindow", 3.0)),
+            "crop":         float(init_val("Crop", 0.0)),
+            "steps":        int(init_val("Steps", 8)),
+            "fast_vae":     bool(init_val("Fastvae", True)),
+            "walk_window":  bool(init_val("Walkwindow", False)),
+            "walk_window_s": float(init_val("Walkwindows", 60.0)),
+            "enabled_loras": self._enabled_loras(),
+            "prompt":       str(init_val("Initprompt", "instrumental music")),
+            "lora_strengths": self._lora_strengths(),
+            "fixture_name": str(init_val("Fixturename", "")),
+        }
         return cfg
 
     def _enabled_loras(self) -> list[str]:

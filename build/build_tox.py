@@ -605,8 +605,15 @@ def onConnect(dat):
         print(f"[ws onConnect] OnWsConnect failed: {e}")
 
 def onDisconnect(dat):
+    # TD WebSocket DAT exposes the last close code/reason on the DAT.
+    # Surface anything available so we can diagnose server-side kicks.
+    info_bits = []
+    for attr in ("closeCode", "closeReason", "lastError", "errors"):
+        v = getattr(dat, attr, None)
+        if v is not None and not callable(v):
+            info_bits.append(f"{attr}={v!r}")
     try:
-        print(f"[ws onDisconnect] {dat.name}")
+        print(f"[ws onDisconnect] {dat.name} " + (" ".join(info_bits) or ""))
     except Exception:
         pass
 
