@@ -107,6 +107,14 @@ TOPOLOGY = [
     ("audio_out",      "scriptCHOP",    {}, (400, -200)),
     ("resample_out",   "resampleCHOP",  {}, (600, -200)),
     ("out_chop",       "outCHOP",       {}, (800, -200)),
+    # Internal Audio Device Out. NECESSARY because Time Slice pull does not
+    # propagate reliably across Base COMP boundaries in TD 2025 — without an
+    # audio consumer INSIDE the COMP, audio_out cooks at frame rate (1
+    # sample/cook = silence). This op sits beside out_chop, pulling audio_out
+    # at audio rate from the inside. The COMP's out_chop output port still
+    # exists and still carries the signal — users can wire their own external
+    # audiodevout1 for routing/monitoring and both will work.
+    ("audiodevout",    "audiodeviceoutCHOP", {}, (600, -350)),
     ("lora_catalog",   "tableDAT",      {}, (-200, 400)),
     ("state",          "tableDAT",      {}, (-200, 300)),
 ]
@@ -161,6 +169,7 @@ def get_opclass_lookup():
         "scriptCHOP":          scriptCHOP,
         "resampleCHOP":        resampleCHOP,
         "constantCHOP":        constantCHOP,
+        "audiodeviceoutCHOP":  audiodeviceoutCHOP,
     }
 
 
@@ -783,6 +792,7 @@ def wire_audio(demon):
     audio_clock = demon.op("audio_clock")
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
+    audiodevout = demon.op("audiodevout")
 
     # Configure audio_clock (Constant CHOP, Time Slice = ON).
     # This is a silent audio-rate "metronome" wired as audio_out's input
@@ -825,17 +835,33 @@ def wire_audio(demon):
                 audio_out.inputConnectors[0].connect(audio_clock)
             except Exception as e:
                 print(f"!! audio_clock -> audio_out wire: {e}")
-        # Dump ALL pars so we can see exactly what TD 2025 exposes.
+
+    # Wire audio_out -> audiodevout (the internal Audio Device Out CHOP).
+    # This is the consumer that actually pulls at audio rate from inside
+    # the COMP boundary, where Time Slice propagation works. Without this
+    # internal consumer, audio_out cooks at frame rate (1 sample/cook) and
+    # produces silence even if an external audiodevout1 is wired to the
+    # COMP's output port — Time Slice doesn't reliably propagate across
+    # Base COMP boundaries in TD 2025.
+    if audiodevout is not None and audio_out is not None:
         try:
-            print("[build_tox]   audio_out — ALL pars:")
-            for p in audio_out.pars():
-                try:
-                    print(f"     {p.name} = {p.eval()!r}  (style={p.style}, "
-                          f"mode={p.mode.name if hasattr(p.mode, 'name') else p.mode!r})")
-                except Exception as e:
-                    print(f"     {p.name} (read failed: {e})")
+            for c in audiodevout.inputConnectors:
+                if c.connections:
+                    c.disconnect()
+            audiodevout.inputConnectors[0].connect(audio_out)
         except Exception as e:
-            print(f"     dump failed: {e}")
+            print(f"!! audio_out -> audiodevout wire: {e}")
+        # Active = On so it pulls; Cook Every Frame ensures it pulls
+        # continuously even when nothing else is asking.
+        for pname, pval in (("active", True),
+                            ("cookeveryframe", True),
+                            ("timeslice", True),
+                            # Stay quiet on startup if device is missing.
+                            ("errorifmissing", False)):
+            try:
+                setattr(audiodevout.par, pname, pval)
+            except Exception:
+                pass
 
     # Connect audio_out → out_chop DIRECTLY.
     # resample_out remains in the topology for back-compat but is
