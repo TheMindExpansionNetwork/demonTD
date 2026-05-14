@@ -216,6 +216,27 @@ class DemonExt:
 
         self.log("DemonExt initialized")
 
+        # Dump audio_out's full par state at runtime so we can diagnose
+        # why the audio chain isn't pulling at audio rate.
+        try:
+            ao = ownerComp.op("audio_out")
+            if ao is not None:
+                self.log("=== AUDIO_OUT PARS ===")
+                for p in ao.pars():
+                    try:
+                        v = p.eval()
+                        if isinstance(v, (int, float, bool, str)) or v is None:
+                            self.log(f"  {p.name} = {v!r}")
+                    except Exception:
+                        pass
+                try:
+                    self.log(f"=== AUDIO_OUT STATE: chans={ao.numChans} "
+                             f"samples={ao.numSamples} rate={ao.rate} ===")
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log(f"audio_out par dump failed: {e}")
+
     # -------- properties (public read-only) ----------------------------------
 
     @property
