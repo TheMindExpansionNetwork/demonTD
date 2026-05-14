@@ -521,19 +521,49 @@ def wire_callbacks(demon):
         except Exception as e:
             print(f"!! ws par dump: {e}")
 
+    # Timer CHOPs. CRITICAL: 'cycle' alone doesn't start them — must also
+    # toggle 'play' on (and pulse 'init'+'start' to be safe).
+    # The 8ms timer was too short anyway (below TD's typical cook rate);
+    # use 50ms which is plenty fast for queue draining and param fanout.
     for name in ("tick8ms", "heartbeat"):
         t = demon.op(name)
-        if t is not None:
+        if t is None:
+            continue
+        try:
+            t.par.callbacks = "callbacks"
+        except Exception:
+            pass
+        if name == "tick8ms":
+            interval = 0.05  # 50 ms
+        else:
+            interval = 5.0
+        # Try every plausible par name across TD versions.
+        for pname, val in (("length", interval), ("cycle", True), ("play", True)):
             try:
-                t.par.callbacks = "callbacks"
-                if name == "tick8ms":
-                    t.par.length = 0.008
-                    t.par.cycle = True
-                else:
-                    t.par.length = 5.0
-                    t.par.cycle = True
+                setattr(t.par, pname, val)
+            except Exception as e:
+                print(f"!! {name}.par.{pname}: {e}")
+        # Pulse init and start if available (forces the timer to begin).
+        for pulse_name in ("initialize", "init", "start"):
+            try:
+                p = getattr(t.par, pulse_name, None)
+                if p is not None:
+                    p.pulse()
             except Exception:
                 pass
+        # Dump par state so we can diagnose if it still doesn't run.
+        try:
+            print(f"[build_tox]   {name} pars:")
+            for pname in ("length", "lengthunit", "cycle", "play", "active",
+                          "callbacks", "timervalue"):
+                par = getattr(t.par, pname, None)
+                if par is not None:
+                    try:
+                        print(f"     {pname} = {par.eval()!r}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     ws_server = demon.op("oauth_server")
     if ws_server is not None:
