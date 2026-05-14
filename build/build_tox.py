@@ -521,10 +521,7 @@ def wire_callbacks(demon):
         except Exception as e:
             print(f"!! ws par dump: {e}")
 
-    # Timer CHOPs. CRITICAL: 'cycle' alone doesn't start them — must also
-    # toggle 'play' on (and pulse 'init'+'start' to be safe).
-    # The 8ms timer was too short anyway (below TD's typical cook rate);
-    # use 50ms which is plenty fast for queue draining and param fanout.
+    # Timer CHOPs. Conservative: only set well-known pars, no pulses.
     for name in ("tick8ms", "heartbeat"):
         t = demon.op(name)
         if t is None:
@@ -537,25 +534,22 @@ def wire_callbacks(demon):
             interval = 0.05  # 50 ms
         else:
             interval = 5.0
-        # Try every plausible par name across TD versions.
-        for pname, val in (("length", interval), ("cycle", True), ("play", True)):
-            try:
-                setattr(t.par, pname, val)
-            except Exception as e:
-                print(f"!! {name}.par.{pname}: {e}")
-        # Pulse init and start if available (forces the timer to begin).
-        for pulse_name in ("initialize", "init", "start"):
-            try:
-                p = getattr(t.par, pulse_name, None)
-                if p is not None:
-                    p.pulse()
-            except Exception:
-                pass
-        # Dump par state so we can diagnose if it still doesn't run.
+        try:
+            t.par.length = interval
+        except Exception:
+            pass
+        try:
+            t.par.cycle = True
+        except Exception:
+            pass
+        try:
+            t.par.play = True
+        except Exception:
+            pass
+        # Diagnostic dump.
         try:
             print(f"[build_tox]   {name} pars:")
-            for pname in ("length", "lengthunit", "cycle", "play", "active",
-                          "callbacks", "timervalue"):
+            for pname in ("length", "cycle", "play", "callbacks"):
                 par = getattr(t.par, pname, None)
                 if par is not None:
                     try:
@@ -705,43 +699,19 @@ def wire_audio(demon):
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
 
-    # Configure audio_out Script CHOP for audio-rate, time-sliced output.
+    # Configure audio_out Script CHOP. Conservative.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
         except Exception:
             pass
-        # Time Slice on — TD pulls a block per audio cycle from downstream.
-        # Try each known par name variant.
-        timeslice_set = False
-        for parname in ("timeslice", "timeslicemode", "Timeslice"):
-            try:
-                setattr(audio_out.par, parname, True)
-                timeslice_set = True
-                break
-            except Exception:
-                continue
-        if not timeslice_set:
-            print("[build_tox] !! could not enable Time Slice on audio_out")
-        # Force the Script CHOP to cook at audio rate.
-        for pname, val in (
-            ("rate", 48000),
-            ("samplerate", 48000),
-            ("ext", "Sample"),  # tell it samples are time-based
-        ):
-            try:
-                setattr(audio_out.par, pname, val)
-            except Exception:
-                pass
-        # 2-channel default.
         try:
-            audio_out.par.channelnames = "chan1 chan2"
+            audio_out.par.timeslice = True
         except Exception:
             pass
-        # Dump par state for diagnosis
         try:
             print("[build_tox]   audio_out pars:")
-            for pn in ("timeslice", "rate", "ext", "channelnames", "callbacks"):
+            for pn in ("timeslice", "callbacks"):
                 par = getattr(audio_out.par, pn, None)
                 if par is not None:
                     try:

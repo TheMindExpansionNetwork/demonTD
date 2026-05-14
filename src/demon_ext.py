@@ -766,39 +766,10 @@ class DemonExt:
             )
             self._wsc.connect()
             self.log(f"_open_ws: WSClient.connect() scheduled (thread starting)")
-
-            # Belt-and-suspenders: schedule a drain even if the Timer CHOP
-            # isn't firing for some reason. run() executes on the main TD
-            # thread, so it's safe to touch ops from there.
-            self._schedule_drain_loop()
         except Exception as e:
             self.log(f"_open_ws: WSClient construct/connect failed: {e}")
             self._set_status(f"WS open failed: {e}")
             self._wsc = None
-
-    def _schedule_drain_loop(self) -> None:
-        """Kick off a self-rescheduling drain via run(). Insurance against
-        tick8ms not firing. Re-arms itself while the WS is alive."""
-        try:
-            run("args[0]._drain_and_rearm()",  # type: ignore[name-defined]  # noqa: F821
-                self, delayFrames=1, fromOP=self.ownerComp)
-        except Exception as e:
-            self.log(f"_schedule_drain_loop: run() unavailable: {e}")
-
-    def _drain_and_rearm(self) -> None:
-        """Drain inbound queue from main thread, then re-arm via run()."""
-        try:
-            self._drain_inbound()
-        except Exception as e:
-            self.log(f"_drain_and_rearm: {e}")
-        # Re-arm while the client exists. ~1 frame = 16 ms at 60 fps,
-        # plenty fast for our messaging needs.
-        if self._wsc is not None:
-            try:
-                run("args[0]._drain_and_rearm()",  # type: ignore[name-defined]  # noqa: F821
-                    self, delayFrames=1, fromOP=self.ownerComp)
-            except Exception:
-                pass
 
     # --- WSClient callbacks (background recv thread) -------------------------
     #
