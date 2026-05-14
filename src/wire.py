@@ -113,10 +113,15 @@ def encode_config(cfg: dict[str, Any]) -> str:
     return json.dumps(clean, separators=(",", ":"))
 
 
-def encode_params(raw: dict[str, Any], playback_pos: int) -> str:
-    """Continuous params message — sent on the 8ms tick."""
+def encode_params(raw: dict[str, Any], playback_pos: float) -> str:
+    """Continuous params message — sent on the 8ms tick.
+
+    `playback_pos` is in SECONDS (matching demon-public-demo's
+    useParamSync.ts which passes `session.player.positionSec`). The
+    server uses it for absolute-time curve sampling.
+    """
     return json.dumps(
-        {"type": "params", "raw": raw, "playback_pos": int(playback_pos)},
+        {"type": "params", "raw": raw, "playback_pos": float(playback_pos)},
         separators=(",", ":"),
     )
 

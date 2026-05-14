@@ -50,9 +50,11 @@ def test_encode_config_drops_none_keeps_empty_strings():
 
 
 def test_encode_params_shape():
-    msg = json.loads(wire.encode_params({"denoise": 0.5, "seed": 0.1}, 48000))
+    # playback_pos is in SECONDS, matching demon-public-demo's
+    # useParamSync (player.positionSec). Server uses absolute time.
+    msg = json.loads(wire.encode_params({"denoise": 0.5, "seed": 0.1}, 24.0))
     assert msg == {"type": "params", "raw": {"denoise": 0.5, "seed": 0.1},
-                   "playback_pos": 48000}
+                   "playback_pos": 24.0}
 
 
 def test_encode_prompt_omits_auto():

@@ -476,7 +476,8 @@ class DemonExt:
         if not wire_name:
             self.log(f"SetParam: unknown param {name}")
             return
-        self._send_text(wire.encode_params({wire_name: value}, self._playback_pos))
+        playback_sec = self._playback_pos / wire.SAMPLE_RATE
+        self._send_text(wire.encode_params({wire_name: value}, playback_sec))
 
     def SetParams(self, d: dict[str, Any]) -> None:
         """Batch send a dict of param values (mixed TD-names and wire-names)."""
@@ -486,7 +487,8 @@ class DemonExt:
             if wn:
                 raw[wn] = v
         if raw:
-            self._send_text(wire.encode_params(raw, self._playback_pos))
+            playback_sec = self._playback_pos / wire.SAMPLE_RATE
+            self._send_text(wire.encode_params(raw, playback_sec))
 
     # -------- discrete messages ---------------------------------------------
 
@@ -862,30 +864,28 @@ class DemonExt:
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
-        # 2. Throttled params send. Server uses our `playback_pos` updates
-        #    as flow-control signal — without them, the pipeline pauses.
-        #    Send a heartbeat every 200 ms UNCONDITIONALLY (even if cooks
-        #    haven't advanced playback_pos), plus immediate sends on dirty
-        #    changes. This breaks the cook/heartbeat deadlock.
+        # 2. Send params message. Matches demon-public-demo/useParamSync.ts:
+        #    fires every TICK_MS=8ms with `playback_pos` in SECONDS (not
+        #    samples — that was our bug). Server uses absolute time for
+        #    curve sampling. Without this units fix, server thinks we've
+        #    played millions of seconds and bails.
         if self._connected:
             with self._lock:
                 raw = dict(self._dirty) if self._dirty else {}
                 self._dirty.clear()
             now = time.time()
             last_send = getattr(self, "_last_params_send", 0.0)
-            should_send = False
-            if raw:
-                should_send = True
-            elif now - last_send > 0.2:
-                # Even if OnCookRecv isn't firing, advance playback_pos by
-                # wall-clock so the server doesn't think we're stuck.
-                wall_advance = int((now - last_send) * wire.SAMPLE_RATE)
-                if last_send > 0:
-                    self._playback_pos += wall_advance
-                should_send = True
-            if should_send:
+            # Match JS rate: 8ms = 125Hz. Frame_exec runs at ~60Hz, so
+            # we end up sending at frame rate but with the right cadence
+            # for the server.
+            if (now - last_send > 0.008) or raw:
+                # If cooks aren't running, advance pos by wall-clock so
+                # the server's flow control sees forward progress.
+                if last_send > 0 and self._n_cook_recv == 0:
+                    self._playback_pos += int((now - last_send) * wire.SAMPLE_RATE)
+                playback_sec = self._playback_pos / wire.SAMPLE_RATE
                 try:
-                    self._send_text(wire.encode_params(raw, self._playback_pos))
+                    self._send_text(wire.encode_params(raw, playback_sec))
                     self._last_params_send = now
                 except Exception as e:
                     self.log(f"frame param send error: {e}")
