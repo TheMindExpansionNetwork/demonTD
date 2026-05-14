@@ -84,15 +84,24 @@ except Exception:
 
 import numpy as np
 
-# When this file lives inside a TD Text DAT (file-synced), TD makes the COMP's
-# folder importable. When running tests outside TD, src/ is on sys.path.
+# Sibling-module imports. Two environments:
+#
+#   1. TD: this file is the text of a Text DAT named `demon_ext` inside a
+#      Base COMP. Sibling DATs (params, wire, etc.) are imported via the
+#      TD-global `mod()` function — there is no real Python package.
+#
+#   2. Outside TD (unit tests): everything lives in src/ on sys.path, so
+#      regular `import params` works.
+#
+# We pick the right one by checking whether `mod` is defined as a global.
 try:
-    from . import params as P
-    from . import wire
-    from . import queue_client as queue_mod
-    from . import oauth
-    from . import audio as audio_mod
-except ImportError:
+    _mod = mod  # type: ignore[name-defined]  # noqa: F821
+    P = _mod('params')
+    wire = _mod('wire')
+    queue_mod = _mod('queue_client')
+    oauth = _mod('oauth')
+    audio_mod = _mod('audio')
+except NameError:
     import params as P  # type: ignore
     import wire  # type: ignore
     import queue_client as queue_mod  # type: ignore
