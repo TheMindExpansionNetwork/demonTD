@@ -250,10 +250,14 @@ SRC_FILES = ["params.py", "wire.py", "queue_client.py", "oauth.py", "audio.py",
 def sync_text_dats(demon):
     """Ensure each src/*.py has a corresponding Text DAT.
 
-    For the build (this script), we use absolute paths to the .py files —
-    that way the build works regardless of where the host .toe is saved.
-    The .tox we export keeps the synced text inline; users dropping the
-    .tox into their own project don't need src/ at all.
+    Two things happen per file:
+      1. We READ THE FILE DIRECTLY and set dat.text — this guarantees
+         the content is in the DAT immediately, so `op('demon_ext').module`
+         resolves on the same frame the extension is wired.
+      2. We set par.file + syncfile so the DAT round-trips to disk for
+         hot-reload during development. (When the .tox is exported, the
+         text travels inline; users dropping the .tox into a fresh project
+         don't need src/ on disk.)
     """
     for fname in SRC_FILES:
         dat_name = fname.replace(".py", "")
@@ -262,24 +266,40 @@ def sync_text_dats(demon):
             dat = demon.create(textDAT, dat_name)
         abs_path = os.path.join(SRC_DIR, fname)
         try:
+            with open(abs_path, "r", encoding="utf-8") as fh:
+                dat.text = fh.read()
+        except Exception as e:
+            print(f"!! could not read {abs_path}: {e}")
+            continue
+        try:
             dat.par.file = abs_path
             dat.par.syncfile = True
             dat.par.loadonstart = True
-            # Force a read so the text is in the DAT right now.
-            try:
-                dat.par.loadonstartpulse.pulse()
-            except Exception:
-                pass
         except Exception as e:
-            print(f"!! sync {fname}: {e}")
+            print(f"!! sync flags on {fname}: {e}")
 
 
 def wire_extension(demon):
-    """Point the COMP's extension at the demon_ext Text DAT."""
+    """Point the COMP's extension at the demon_ext Text DAT.
+
+    For the .module property to resolve, the DAT must contain valid Python
+    AT THE TIME the extension expression is evaluated. sync_text_dats() now
+    writes the text directly, so by the time we get here the DAT is ready.
+    """
     try:
+        # Reinit any previous extension first to avoid stale-NoneType.
+        try:
+            demon.par.extension1 = ""
+        except Exception:
+            pass
         demon.par.extname1 = "DemonExt"
         demon.par.extension1 = "op('demon_ext').module.DemonExt(me)"
         demon.par.promoteextension1 = True
+        # Force the extension to re-resolve on this frame.
+        try:
+            demon.par.reinitextensions.pulse()
+        except Exception:
+            pass
     except Exception as e:
         print(f"!! extension wire failed: {e}")
 
