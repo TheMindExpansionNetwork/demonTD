@@ -628,20 +628,28 @@ def wire_audio(demon):
         except Exception:
             pass
 
+    # Connect audio_out → out_chop DIRECTLY.
+    # resample_out remains in the topology for back-compat but is
+    # disconnected — Audio Device Out handles its own resampling.
     if resample_out is not None:
         try:
-            resample_out.par.method = "Linear"
-            # Output the project's audio rate; 0 = use upstream rate.
-            resample_out.par.rate = 0
+            # Detach any input it might have from a previous build run.
+            for c in resample_out.inputConnectors:
+                if c.connections:
+                    c.disconnect()
         except Exception:
             pass
 
-    # Connect: audio_out → resample_out → out_chop
     try:
-        if audio_out is not None and resample_out is not None:
-            resample_out.inputConnectors[0].connect(audio_out)
-        if resample_out is not None and out_chop is not None:
-            out_chop.inputConnectors[0].connect(resample_out)
+        if audio_out is not None and out_chop is not None:
+            # Clear out_chop's existing connections first to avoid stale wiring.
+            try:
+                for c in out_chop.inputConnectors:
+                    if c.connections:
+                        c.disconnect()
+            except Exception:
+                pass
+            out_chop.inputConnectors[0].connect(audio_out)
     except Exception as e:
         print(f"audio wiring: {e}")
 
