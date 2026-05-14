@@ -1175,12 +1175,27 @@ class DemonExt:
         }
         return cfg
 
+    @staticmethod
+    def _lora_par_safe(lid: str) -> str:
+        """Sanitize a LoRA id into a TD-legal par-name suffix.
+
+        TD rules: custom par name must begin uppercase, then lowercase
+        letters and digits only (no underscores), and a 'sequence parameter'
+        cannot end with a digit. We strip non-alphanumerics, lowercase,
+        and append 'x' if trailing-digit.
+        """
+        safe = "".join(c for c in lid if c.isalnum()).lower()
+        if safe and safe[-1].isdigit():
+            safe += "x"
+        return safe or "unnamed"
+
     def _enabled_loras(self) -> list[str]:
-        """Read which LoRAs are currently enabled (toggle pars are named
-        like 'Lora_enable_<id>' once the catalog is loaded)."""
+        """Read which LoRAs are currently enabled. Toggle pars use the
+        sanitized name (e.g. 'Loraenablebach' for id='bach')."""
         out: list[str] = []
         for lora_id in self._lora_ids:
-            par = self._par_by_name(f"Lora_enable_{lora_id}")
+            safe = self._lora_par_safe(lora_id)
+            par = self._par_by_name(f"Loraenable{safe}")
             if par and par.eval():
                 out.append(lora_id)
         return out
@@ -1188,7 +1203,8 @@ class DemonExt:
     def _lora_strengths(self) -> dict[str, float]:
         out: dict[str, float] = {}
         for lora_id in self._lora_ids:
-            par = self._par_by_name(f"Lora_str_{lora_id}")
+            safe = self._lora_par_safe(lora_id)
+            par = self._par_by_name(f"Lorastr{safe}")
             if par:
                 out[lora_id] = float(par.eval())
         return out
@@ -1296,33 +1312,55 @@ class DemonExt:
             self._lora_ids = ids
 
         # Dynamically add Toggle + Float par per LoRA on the Prompt+LoRA page.
+        # Par names must be TD-legal: start uppercase, only lowercase/digits
+        # afterwards, no underscores, no trailing digit. Use _lora_par_safe.
         try:
             page = self._page_by_name("Prompt+LoRA")
             if page is None:
+                self.log("LoRA page: 'Prompt+LoRA' not found")
                 return
             existing = {p.name for p in page.pars}
+            n_added = 0
             for entry in catalog:
                 lid = entry.get("id", "")
                 if not lid:
                     continue
-                toggle_name = f"Lora_enable_{lid}"
-                strength_name = f"Lora_str_{lid}"
+                safe = self._lora_par_safe(lid)
+                toggle_name = f"Loraenable{safe}"
+                strength_name = f"Lorastr{safe}"
                 if toggle_name not in existing:
-                    tp = page.appendToggle(toggle_name,
-                                           label=f"{entry.get('name', lid)} (on)")
-                    if tp:
-                        tp[0].default = False
+                    try:
+                        tp = page.appendToggle(
+                            toggle_name,
+                            label=f"{entry.get('name', lid)} on"
+                        )
+                        if tp:
+                            tp[0].default = False
+                        n_added += 1
+                    except Exception as e:
+                        self.log(f"LoRA toggle {toggle_name} failed: {e}")
                 if strength_name not in existing:
-                    sp = page.appendFloat(strength_name,
-                                          label=f"{entry.get('name', lid)} strength")
-                    if sp:
-                        sp[0].normMin = 0.0
-                        sp[0].normMax = 1.8
-                        sp[0].default = entry.get("strength", 1.0)
-                        sp[0].clampMin = True
-                        sp[0].clampMax = True
+                    try:
+                        sp = page.appendFloat(
+                            strength_name,
+                            label=f"{entry.get('name', lid)} strength"
+                        )
+                        if sp:
+                            sp[0].normMin = 0.0
+                            sp[0].normMax = 1.8
+                            try:
+                                sp[0].default = float(entry.get("strength", 1.0))
+                            except Exception:
+                                pass
+                            sp[0].clampMin = True
+                            sp[0].clampMax = True
+                        n_added += 1
+                    except Exception as e:
+                        self.log(f"LoRA float {strength_name} failed: {e}")
+            self.log(f"LoRA page: added {n_added} pars for "
+                     f"{len(catalog)} LoRAs")
         except Exception as e:
-            self.log(f"LoRA page update failed: {e}")
+            self.log(f"LoRA page update failed: {type(e).__name__}: {e}")
 
     # -------- Pulse handlers -------------------------------------------------
 
