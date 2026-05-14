@@ -71,6 +71,13 @@ if not os.path.isdir(SRC_DIR):
         f"  par points at <repo>/build/build_tox.py (not a copy elsewhere)."
     )
 
+# Invalidate cached modules so re-running the build picks up edits to
+# params.py / wire.py / etc. TD's Python keeps sys.modules across script
+# runs, so without this we'd use a stale Param dataclass and AttributeError
+# on any newly-added field.
+for _modname in ("params", "wire", "queue_client", "oauth", "audio"):
+    sys.modules.pop(_modname, None)
+
 import params as P  # noqa: E402  pylint: disable=wrong-import-position
 
 

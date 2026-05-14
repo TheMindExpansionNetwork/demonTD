@@ -919,13 +919,37 @@ class DemonExt:
             self.log(f"sendText failed: {e}")
 
     def _send_bytes(self, payload: bytes) -> None:
+        """Send a binary frame on the WebSocket DAT.
+
+        TD versions differ on the method name:
+          - TD 2023+ : ws.sendBinary(bytes)
+          - older    : ws.sendBytes(bytes)
+          - some     : ws.send(bytes, asBinary=True)
+
+        We try them in order. Bail with a log on full failure rather than
+        raising, so the caller can keep going (e.g. mark connected).
+        """
         ws = self._ws()
         if ws is None:
             return
-        try:
-            ws.sendBytes(payload)
-        except Exception as e:
-            self.log(f"sendBytes failed: {e}")
+        for method_name in ("sendBinary", "sendBytes"):
+            method = getattr(ws, method_name, None)
+            if method is None:
+                continue
+            try:
+                method(payload)
+                return
+            except Exception as e:
+                self.log(f"{method_name} failed: {e}")
+        # Last resort: send(...) with asBinary
+        send = getattr(ws, "send", None)
+        if send is not None:
+            try:
+                send(payload, asBinary=True)
+                return
+            except Exception as e:
+                self.log(f"send(binary) failed: {e}")
+        self.log("no working binary-send method on WebSocket DAT")
 
     def _snapshot_audio(self, chop) -> np.ndarray | None:
         """Grab the current samples from a CHOP (param-reference, op-path, or
