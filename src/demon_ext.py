@@ -791,7 +791,13 @@ class DemonExt:
         self._inbound.put(("close", (code, reason)))
 
     def _drain_inbound(self) -> None:
-        """Main-thread drain of WS events. Called by frame_exec every frame."""
+        """Main-thread per-frame work. Called by frame_exec every frame:
+           1. Drain WS recv-thread events into TD-safe handlers.
+           2. Send a params message every frame to keep DEMON's pipeline
+              generating (server pauses without continuous param flow).
+           3. Periodic telemetry log.
+        """
+        # 1. Drain inbound queue
         max_per_tick = 64
         for _ in range(max_per_tick):
             try:
@@ -815,8 +821,24 @@ class DemonExt:
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
-        # Periodic telemetry (~every 2s). Now driven by frame_exec, not OnTick,
-        # since the Timer CHOP isn't reliably firing in TD 2025.
+        # 2. Per-frame param send. DEMON's pipeline ticks based on incoming
+        #    `params` messages and our advancing playback_pos. Without these
+        #    the server runs once and waits. JS client sends at audio rate;
+        #    we send at frame rate (~60 Hz) which is plenty.
+        if self._connected:
+            with self._lock:
+                raw = dict(self._dirty) if self._dirty else {}
+                self._dirty.clear()
+            # Always send — even if raw is empty, the playback_pos advance is
+            # what keeps the server's pipeline progressing.
+            try:
+                self._send_text(wire.encode_params(raw, self._playback_pos))
+            except Exception as e:
+                self.log(f"frame param send error: {e}")
+            # Advance playback_pos by ~1 frame's worth of audio.
+            self._playback_pos += int(wire.SAMPLE_RATE / 60)
+
+        # 3. Telemetry (~every 2 s)
         if self._connected:
             now = time.time()
             last = getattr(self, "_last_telem_log", 0.0)
