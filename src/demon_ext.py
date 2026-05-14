@@ -216,6 +216,26 @@ class DemonExt:
 
         self.log("DemonExt initialized")
 
+        # Dump project-level audio engine config — if these aren't set,
+        # nothing pulls audio_out at audio rate no matter what we do.
+        try:
+            self.log("=== PROJECT AUDIO ENGINE ===")
+            for pn in ("realtime", "audioblocksize", "audioblock",
+                       "audiosamplerate", "audiorate", "fps", "rate",
+                       "cookrate"):
+                try:
+                    par = getattr(project.par, pn, None)  # type: ignore[name-defined]  # noqa: F821
+                    if par is not None:
+                        self.log(f"  project.par.{pn} = {par.eval()!r}")
+                except Exception:
+                    pass
+            try:
+                self.log(f"  project.cookRate = {project.cookRate!r}")  # type: ignore[name-defined]  # noqa: F821
+            except Exception:
+                pass
+        except Exception as e:
+            self.log(f"project audio dump failed: {e}")
+
         # Dump audio_out's full par state at runtime so we can diagnose
         # why the audio chain isn't pulling at audio rate.
         try:
