@@ -56,45 +56,67 @@ def _prepend_vendor_paths() -> None:
         else:
             zstd_plat = None
 
-        # Discover the vendor/ directory relative to this file or the COMP's
-        # externaltox path. `me` and `project` are TD globals.
-        base = ""
+        # Discover vendor/. Try several candidate base paths in order:
+        #   1. Path that THIS DAT is file-synced from (most reliable)
+        #   2. The COMP's externaltox load location
+        #   3. The TD project folder
+        #   4. cwd
+        candidates: list[str] = []
         try:
-            comp = me.owner  # type: ignore[name-defined]  # noqa: F821
-            base = comp.par.externaltox.eval() or ""
+            # `me` is the Text DAT this code is compiled into.
+            dat_file = me.par.file.eval()  # type: ignore[name-defined]  # noqa: F821
+            if dat_file:
+                # demon_ext.py lives at <repo>/src/demon_ext.py — vendor is at <repo>/vendor.
+                candidates.append(os.path.abspath(
+                    os.path.join(os.path.dirname(dat_file), os.pardir, "vendor")))
         except Exception:
             pass
-        if not base:
-            try:
-                base = project.folder  # type: ignore[name-defined]  # noqa: F821
-            except Exception:
-                base = os.getcwd()
+        try:
+            comp = me.owner  # type: ignore[name-defined]  # noqa: F821
+            extox = comp.par.externaltox.eval() or ""
+            if extox:
+                base = os.path.dirname(extox) if extox.endswith(".tox") else extox
+                candidates.append(os.path.join(base, "vendor"))
+                candidates.append(os.path.join(os.path.dirname(base), "vendor"))
+        except Exception:
+            pass
+        try:
+            pf = project.folder  # type: ignore[name-defined]  # noqa: F821
+            if pf:
+                for n in range(4):
+                    p = pf
+                    for _ in range(n):
+                        p = os.path.dirname(p)
+                    candidates.append(os.path.join(p, "vendor"))
+        except Exception:
+            pass
+        candidates.append(os.path.join(os.getcwd(), "vendor"))
 
-        repo_root = os.path.dirname(base) if base.endswith(".tox") else base
-        # Look up the tree for vendor/. Repos check out at e.g. ~/git/demon-td/
-        # but a TD project elsewhere needs us to find the bundled vendor.
-        for candidate in (
-            os.path.join(repo_root, "vendor"),
-            os.path.join(os.path.dirname(repo_root), "vendor"),
-            os.path.join(os.path.dirname(os.path.dirname(repo_root)), "vendor"),
-        ):
-            if os.path.isdir(candidate):
-                vendor_root = candidate
+        vendor_root = None
+        for c in candidates:
+            if c and os.path.isdir(c):
+                vendor_root = c
                 break
-        else:
-            return  # no vendor/ found; fall back to user-installed libs
+
+        if not vendor_root:
+            print(f"[demon_ext] WARNING: vendor/ not found. Tried: {candidates}")
+            return
+
+        print(f"[demon_ext] vendor at {vendor_root}")
 
         # zstandard (platform-specific)
         if zstd_plat:
             zstd_dir = os.path.join(vendor_root, "zstandard", zstd_plat)
             if os.path.isdir(zstd_dir) and zstd_dir not in sys.path:
                 sys.path.insert(0, zstd_dir)
+                print(f"[demon_ext]   + {zstd_dir}")
         # websocket-client (pure-Python)
         wsc_dir = os.path.join(vendor_root, "websocket-client")
         if os.path.isdir(wsc_dir) and wsc_dir not in sys.path:
             sys.path.insert(0, wsc_dir)
-    except Exception:
-        pass
+            print(f"[demon_ext]   + {wsc_dir}")
+    except Exception as e:
+        print(f"[demon_ext] _prepend_vendor_paths failed: {e}")
 
 _prepend_vendor_paths()
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Background-thread WebSocket client backed by the `websocket-client` library.
 
 Why this exists
