@@ -776,6 +776,7 @@ def wire_audio(demon):
 
     # Configure audio_out Script CHOP.
     # Time Slice = ON so Audio Device Out can pull it at audio block rate.
+    # NO pre-declared channels — those were locking it into frame-rate mode.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
@@ -785,30 +786,17 @@ def wire_audio(demon):
             audio_out.par.timeslice = True
         except Exception:
             pass
-        # Pre-declare 2 channels so downstream recognizes audio_out as a
-        # valid stereo source even before its first cook. Without this,
-        # the chain may not initialize and Audio Device Out won't pull.
-        for pname, val in (
-            ("channelnames", "chan1 chan2"),
-            ("numchans", 2),
-            ("samplerate", 48000),
-        ):
-            try:
-                setattr(audio_out.par, pname, val)
-            except Exception:
-                pass
+        # Dump ALL pars so we can see exactly what TD 2025 exposes.
         try:
-            print("[build_tox]   audio_out pars:")
-            for pn in ("timeslice", "callbacks", "channelnames", "numchans",
-                       "samplerate"):
-                par = getattr(audio_out.par, pn, None)
-                if par is not None:
-                    try:
-                        print(f"     {pn} = {par.eval()!r}")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            print("[build_tox]   audio_out — ALL pars:")
+            for p in audio_out.pars():
+                try:
+                    print(f"     {p.name} = {p.eval()!r}  (style={p.style}, "
+                          f"mode={p.mode.name if hasattr(p.mode, 'name') else p.mode!r})")
+                except Exception as e:
+                    print(f"     {p.name} (read failed: {e})")
+        except Exception as e:
+            print(f"     dump failed: {e}")
 
     # Connect audio_out → out_chop DIRECTLY.
     # resample_out remains in the topology for back-compat but is
