@@ -109,6 +109,10 @@ except NameError:
     import audio as audio_mod  # type: ignore
 
 
+# Hard upper bound on source-audio duration. DEMON rejects longer.
+MAX_SOURCE_SECONDS = 240
+
+
 # -----------------------------------------------------------------------------
 # DemonExt
 # -----------------------------------------------------------------------------
@@ -703,7 +707,12 @@ class DemonExt:
                 src_rate = wire.SAMPLE_RATE
             if src_rate != wire.SAMPLE_RATE:
                 pcm = audio_mod.linear_resample(pcm, src_rate, wire.SAMPLE_RATE)
-            return audio_mod.to_stereo(pcm).astype(np.float32, copy=False)
+            pcm = audio_mod.to_stereo(pcm)
+            # Cap to DEMON's max in case the snapshot is huge.
+            max_samples = MAX_SOURCE_SECONDS * wire.SAMPLE_RATE
+            if pcm.shape[1] > max_samples:
+                pcm = pcm[:, :max_samples]
+            return pcm.astype(np.float32, copy=False)
         except Exception as e:
             self.log(f"_snapshot_input_chop failed: {e}")
             return None
@@ -774,6 +783,16 @@ class DemonExt:
 
         # Force stereo (mono → duplicated L→R; >2 channels → first two)
         pcm = audio_mod.to_stereo(pcm)
+
+        # Cap to DEMON's max source duration (240 s). Server rejects longer.
+        max_samples = MAX_SOURCE_SECONDS * wire.SAMPLE_RATE
+        if pcm.shape[1] > max_samples:
+            self.log(
+                f"WARNING: source is {pcm.shape[1] / wire.SAMPLE_RATE:.1f}s; "
+                f"trimming to {MAX_SOURCE_SECONDS}s (DEMON max)."
+            )
+            pcm = pcm[:, :max_samples]
+
         return pcm.astype(np.float32, copy=False)
 
     def _build_session_config(self) -> dict[str, Any]:
