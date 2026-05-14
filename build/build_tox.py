@@ -1,14 +1,16 @@
 """
-Headless TD build script — generates dist/demon.tox from the schema in
+TD build script — generates dist/demon.tox from the schema in
 src/params.py and the Python source in src/.
 
-Usage (macOS):
-  /Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner -python \\
-      /path/to/demon-td/build/build_tox.py
+How to run
+----------
+TouchDesigner is GUI-first, so this runs from inside TD:
 
-Usage (Windows):
-  "C:\\Program Files\\Derivative\\TouchDesigner\\bin\\TouchDesigner.exe" -python \\
-      C:\\path\\to\\demon-td\\build\\build_tox.py
+  1. Open TouchDesigner.
+  2. Drop a Text DAT in the network.
+  3. Set its File par to <repo>/build/build_tox.py and turn on `Sync to File`.
+  4. Right-click the DAT → Run Script.
+  5. Watch Alt+T (Textport) for `[build_tox] wrote ...`.
 
 What it does
 ------------
@@ -33,14 +35,41 @@ updates whatever has drifted.
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# Resolve repo paths. Inside TD, this file runs from a Text DAT and __file__
+# is unreliable, so prefer me.par.file (set on the DAT pointing at this .py)
+# and fall back to __file__ when running outside TD.
+def _resolve_here() -> str:
+    try:
+        path = me.par.file.eval()  # type: ignore[name-defined]  # noqa: F821
+        if path:
+            return os.path.dirname(os.path.abspath(path))
+    except Exception:
+        pass
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+HERE = _resolve_here()
 REPO_ROOT = os.path.dirname(HERE)
 SRC_DIR = os.path.join(REPO_ROOT, "src")
 DIST_DIR = os.path.join(REPO_ROOT, "dist")
 TEMPLATE_TOE = os.path.join(HERE, "template.toe")
 
+print(f"[build_tox] HERE={HERE}")
+print(f"[build_tox] SRC_DIR={SRC_DIR}")
+print(f"[build_tox] DIST_DIR={DIST_DIR}")
+
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+
+if not os.path.isdir(SRC_DIR):
+    raise SystemExit(
+        f"[build_tox] src/ not found at {SRC_DIR}.\n"
+        f"  The build script must live in <repo>/build/ alongside src/.\n"
+        f"  If you're running it from a Text DAT, make sure the DAT's 'File'\n"
+        f"  par points at <repo>/build/build_tox.py (not a copy elsewhere)."
+    )
 
 import params as P  # noqa: E402  pylint: disable=wrong-import-position
 
