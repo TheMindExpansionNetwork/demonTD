@@ -248,16 +248,28 @@ SRC_FILES = ["params.py", "wire.py", "queue_client.py", "oauth.py", "audio.py",
 
 
 def sync_text_dats(demon):
-    """Ensure each src/*.py has a corresponding Text DAT, file-synced."""
+    """Ensure each src/*.py has a corresponding Text DAT.
+
+    For the build (this script), we use absolute paths to the .py files —
+    that way the build works regardless of where the host .toe is saved.
+    The .tox we export keeps the synced text inline; users dropping the
+    .tox into their own project don't need src/ at all.
+    """
     for fname in SRC_FILES:
         dat_name = fname.replace(".py", "")
         dat = demon.op(dat_name)
         if dat is None:
             dat = demon.create(textDAT, dat_name)
+        abs_path = os.path.join(SRC_DIR, fname)
         try:
-            dat.par.file = f"../src/{fname}"
+            dat.par.file = abs_path
             dat.par.syncfile = True
             dat.par.loadonstart = True
+            # Force a read so the text is in the DAT right now.
+            try:
+                dat.par.loadonstartpulse.pulse()
+            except Exception:
+                pass
         except Exception as e:
             print(f"!! sync {fname}: {e}")
 
@@ -433,34 +445,49 @@ def wire_audio(demon):
 # Main
 # -----------------------------------------------------------------------------
 def main():
+    """Build the demon COMP into the currently-open TD project.
+
+    This function is NON-DESTRUCTIVE:
+      - Never closes / saves / quits the host TD project.
+      - Only creates the `demon` COMP and its children.
+      - Saves out the .tox file to dist/.
+      - Leaves TD running with the COMP visible so the user can inspect.
+
+    Safe to re-run; ops are upserted, not duplicated.
+    """
     global OPCLASS_LOOKUP
     OPCLASS_LOOKUP = get_opclass_lookup()
 
     os.makedirs(DIST_DIR, exist_ok=True)
 
-    # Load template if present
-    if os.path.exists(TEMPLATE_TOE):
-        project.load(TEMPLATE_TOE)
-
+    print("[build_tox] creating demon COMP...")
     demon = ensure_demon_comp()
+    print(f"[build_tox]   COMP at {demon.path}")
+
+    print("[build_tox] ensuring internal ops...")
     ensure_internal_ops(demon)
+
+    print("[build_tox] syncing source DATs...")
     sync_text_dats(demon)
+
+    print("[build_tox] wiring callbacks...")
     wire_callbacks(demon)
+
+    print("[build_tox] wiring audio...")
     wire_audio(demon)
+
+    print("[build_tox] regenerating parameter pages...")
     regenerate_param_pages(demon)
+
+    print("[build_tox] wiring extension...")
     wire_extension(demon)
 
     out_path = os.path.join(DIST_DIR, "demon.tox")
+    print(f"[build_tox] saving {out_path}")
     demon.save(out_path)
-    print(f"wrote {out_path}")
 
-    # If we started from scratch, save the template too.
-    if not os.path.exists(TEMPLATE_TOE):
-        project.save(TEMPLATE_TOE)
-        print(f"wrote {TEMPLATE_TOE}")
-
-    # Exit TD cleanly.
-    project.quit(force=True)
+    print(f"[build_tox] DONE — wrote {out_path}")
+    print(f"[build_tox] Inspect /project1/demon, or drag {out_path} into a fresh .toe.")
 
 
 # Entry: always run when executed inside TD.
