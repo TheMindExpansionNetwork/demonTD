@@ -475,10 +475,24 @@ def wire_callbacks(demon):
     if ws is not None:
         try:
             ws.par.callbacks = "callbacks"
-            ws.par.format = 1  # binary+text auto
-            ws.par.receivebinary = True
         except Exception:
             pass
+        # Send JSON as text and audio frames as binary. The Format par on
+        # the WS DAT controls OUTGOING default; we send binary explicitly
+        # via sendBinary() so 'auto' (text default) is what we want.
+        # Try several known values across TD versions.
+        for val in ("auto", "Auto", 2, "text", "Text", 0):
+            try:
+                ws.par.format = val
+                break
+            except Exception:
+                continue
+        for parname in ("receivebinary", "binarymessages"):
+            try:
+                setattr(ws.par, parname, True)
+                break
+            except Exception:
+                pass
 
     for name in ("tick8ms", "heartbeat"):
         t = demon.op(name)

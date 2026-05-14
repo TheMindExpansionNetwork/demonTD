@@ -596,24 +596,39 @@ class DemonExt:
         cfg = self._build_session_config()
         self._send_text(wire.encode_config(cfg))
 
-        # Send source audio frame (REQUIRED). Loaded from the Source File par.
-        # Resolve the source audio. Two paths, in order:
+        # Resolve the source audio. THREE paths, in order:
         #   1. `Source Audio File` par — explicit file path.
-        #   2. Wired-in CHOP — if an Audio File In (or any CHOP with samples)
-        #      is plugged into demon's input port, snapshot its current
-        #      buffer. This is a one-shot read at Connect, not a continuous
-        #      stream.
+        #   2. Upstream wired CHOP's .par.file — if an Audio File In CHOP is
+        #      plugged into the COMP, read the WHOLE file it references.
+        #   3. Snapshot of audio_in's current samples — last resort, may be
+        #      too short (audio cook block is ~30 ms).
         source_path = self._read_par("Sourcefile", "") or ""
         pcm = None
         source_label = ""
+
         if source_path:
             pcm = self._load_source_wav(source_path)
-            source_label = os.path.basename(source_path)
+            if pcm is not None:
+                source_label = os.path.basename(source_path)
+
+        if pcm is None:
+            wired_path = self._wired_chop_file_path()
+            if wired_path:
+                pcm = self._load_source_wav(wired_path)
+                if pcm is not None:
+                    source_label = f"wired CHOP file: {os.path.basename(wired_path)}"
 
         if pcm is None:
             pcm = self._snapshot_input_chop()
             if pcm is not None:
-                source_label = "wired CHOP input"
+                source_label = "wired CHOP snapshot"
+                if pcm.shape[1] < wire.SAMPLE_RATE:
+                    self.log(
+                        f"WARNING: source audio is only "
+                        f"{pcm.shape[1] / wire.SAMPLE_RATE:.2f}s — "
+                        f"DEMON needs >=1s. Set Source Audio File for a "
+                        f"full-track read."
+                    )
 
         if pcm is None:
             self._set_status(
@@ -631,6 +646,30 @@ class DemonExt:
         self._set_status("Connected")
         self.log(f"sent {pcm.shape[1]} samples ({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) "
                  f"from {source_label}")
+
+    def _wired_chop_file_path(self) -> str | None:
+        """If an upstream CHOP (e.g. Audio File In) is wired into the COMP's
+        first input, return its `par.file` value. Otherwise None.
+
+        TD's Audio File In CHOP exposes a `file` par with the WAV path.
+        """
+        try:
+            upstream_ops = self.ownerComp.inputs or []
+        except Exception:
+            return None
+        for up in upstream_ops:
+            if up is None:
+                continue
+            try:
+                file_par = getattr(up.par, "file", None)
+                if file_par is None:
+                    continue
+                path = file_par.eval()
+                if path:
+                    return path
+            except Exception:
+                continue
+        return None
 
     def _snapshot_input_chop(self) -> "np.ndarray | None":
         """Snapshot the COMP's wired CHOP input as (2, samples) float32 at 48k.
