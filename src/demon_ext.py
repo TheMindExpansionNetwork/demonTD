@@ -668,17 +668,25 @@ class DemonExt:
         tmp.close()
         out = tmp.name
 
-        # macOS afconvert
+        # macOS afconvert.
+        # IMPORTANT: do NOT pass --channellayout. It makes afconvert write
+        # WAVE_FORMAT_EXTENSIBLE (format code 65534), which Python's stdlib
+        # `wave` module rejects with 'unknown format: 65534'. Plain
+        # LEI16@48000 produces vanilla PCM WAV (format 1).
         if shutil.which("afconvert"):
             try:
                 r = subprocess.run(
                     ["afconvert", "-f", "WAVE", "-d", "LEI16@48000",
-                     "--channellayout", "Stereo", src_path, out],
+                     src_path, out],
                     capture_output=True, timeout=120,
                 )
                 if r.returncode == 0 and os.path.getsize(out) > 44:
                     self.log(f"_convert_to_wav: afconvert -> {os.path.basename(out)}")
                     return out
+                else:
+                    err = (r.stderr or b"").decode("utf-8", "replace").strip()
+                    if err:
+                        self.log(f"_convert_to_wav: afconvert rc={r.returncode}: {err[:200]}")
             except Exception as e:
                 self.log(f"_convert_to_wav: afconvert failed: {e}")
 
