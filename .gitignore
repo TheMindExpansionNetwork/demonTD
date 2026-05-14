@@ -1,0 +1,26 @@
+# Built artifact
+dist/*.tox
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# TD scratch
+*.toe.tmp
+backups/
+.local/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log

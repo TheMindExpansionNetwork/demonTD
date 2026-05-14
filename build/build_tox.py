@@ -1,0 +1,429 @@
+"""
+Headless TD build script — generates dist/demon.tox from the schema in
+src/params.py and the Python source in src/.
+
+Usage (macOS):
+  /Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner -python \\
+      /path/to/demon-td/build/build_tox.py
+
+Usage (Windows):
+  "C:\\Program Files\\Derivative\\TouchDesigner\\bin\\TouchDesigner.exe" -python \\
+      C:\\path\\to\\demon-td\\build\\build_tox.py
+
+What it does
+------------
+1. Loads build/template.toe (an empty .toe with a single Base COMP `demon`).
+   If no template exists yet, scaffolds one from scratch.
+2. Ensures every internal operator listed in TOPOLOGY exists with correct
+   wiring, callbacks, and parameter bindings.
+3. Adds file-synced Text DATs for each src/*.py.
+4. Generates the COMP's custom parameter pages from params.PARAMS.
+5. Sets the COMP's Extension to point at the demon_ext Text DAT.
+6. Saves the COMP as dist/demon.tox and exits.
+
+This script is idempotent — re-running it on a previously built .toe just
+updates whatever has drifted.
+"""
+
+# NOTE: When this script runs, TD has injected the standard globals:
+#   project, op, ops, parent, me, tdu, ui, root, etc.
+#
+# We import sys.path bootstrap to load our own modules.
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(HERE)
+SRC_DIR = os.path.join(REPO_ROOT, "src")
+DIST_DIR = os.path.join(REPO_ROOT, "dist")
+TEMPLATE_TOE = os.path.join(HERE, "template.toe")
+
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+import params as P  # noqa: E402  pylint: disable=wrong-import-position
+
+
+# -----------------------------------------------------------------------------
+# Internal topology — operators inside the Base COMP `demon`
+# -----------------------------------------------------------------------------
+TOPOLOGY = [
+    # (op_name, OPClass-string, init params dict, position tuple)
+    ("extension1",     "textDAT",       {}, (-600, 400)),
+    ("ws1",            "websocketDAT",  {}, (-600, 200)),
+    ("oauth_server",   "webserverDAT",  {}, (-600, 100)),
+    ("param_exec1",    "parameterexecuteDAT", {}, (-600, 0)),
+    ("tick8ms",        "timerCHOP",     {}, (-400, 0)),
+    ("heartbeat",      "timerCHOP",     {}, (-400, -100)),
+    ("audio_in",       "inCHOP",        {}, (-800, -200)),
+    ("resample_in",    "resampleCHOP",  {}, (-600, -200)),
+    ("script_send",    "scriptCHOP",    {}, (-400, -200)),
+    ("audio_out",      "scriptCHOP",    {}, (400, -200)),
+    ("resample_out",   "resampleCHOP",  {}, (600, -200)),
+    ("out_chop",       "outCHOP",       {}, (800, -200)),
+    ("lora_catalog",   "tableDAT",      {}, (-200, 400)),
+    ("state",          "tableDAT",      {}, (-200, 300)),
+]
+
+
+def ensure_demon_comp():
+    """Return the Base COMP `demon` at /project1/demon, creating if needed."""
+    root_comp = op("/project1") if op("/project1") else root
+    demon = root_comp.op("demon")
+    if demon is None:
+        demon = root_comp.create(baseCOMP, "demon")
+    return demon
+
+
+def ensure_internal_ops(demon):
+    for name, optype_str, init_pars, pos in TOPOLOGY:
+        existing = demon.op(name)
+        if existing is None:
+            try:
+                cls = OPCLASS_LOOKUP[optype_str]
+            except KeyError:
+                print(f"!! unknown OP class {optype_str}; skipping {name}")
+                continue
+            o = demon.create(cls, name)
+        else:
+            o = existing
+        try:
+            o.nodeX, o.nodeY = pos
+        except Exception:
+            pass
+        for pname, pval in init_pars.items():
+            try:
+                setattr(o.par, pname, pval)
+            except Exception:
+                pass
+    return demon
+
+
+# We declare OPCLASS_LOOKUP after TD globals are present.
+def get_opclass_lookup():
+    return {
+        "baseCOMP":            baseCOMP,
+        "textDAT":             textDAT,
+        "tableDAT":            tableDAT,
+        "websocketDAT":        websocketDAT,
+        "webserverDAT":        webserverDAT,
+        "parameterexecuteDAT": parameterexecuteDAT,
+        "timerCHOP":           timerCHOP,
+        "inCHOP":              inCHOP,
+        "outCHOP":             outCHOP,
+        "scriptCHOP":          scriptCHOP,
+        "resampleCHOP":        resampleCHOP,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Param-page generation
+# -----------------------------------------------------------------------------
+def regenerate_param_pages(demon):
+    """Drop existing custom pages and rebuild from P.PARAMS."""
+    for page in list(demon.customPages):
+        page.destroy()
+
+    page_lookup = {}
+    for page_name in P.PAGES:
+        page_lookup[page_name] = demon.appendCustomPage(page_name)
+
+    for p in sorted(P.PARAMS, key=lambda x: (x.page, x.order)):
+        page = page_lookup.get(p.page)
+        if page is None:
+            page = demon.appendCustomPage(p.page)
+            page_lookup[p.page] = page
+
+        label = p.label or p.name
+
+        if p.type == "Pulse":
+            par = page.appendPulse(p.name, label=label)
+        elif p.type == "Header":
+            par = page.appendHeader(p.name, label=label)
+        elif p.type == "Toggle":
+            par = page.appendToggle(p.name, label=label)
+        elif p.type == "Int":
+            par = page.appendInt(p.name, label=label)
+        elif p.type == "Float":
+            par = page.appendFloat(p.name, label=label)
+        elif p.type == "Str":
+            par = page.appendStr(p.name, label=label)
+        elif p.type == "Menu":
+            par = page.appendMenu(p.name, label=label)
+        else:
+            print(f"!! unknown par type {p.type} for {p.name}")
+            continue
+
+        if not par:
+            continue
+        p0 = par[0]
+
+        # Defaults and ranges
+        if p.default is not None and p.type not in ("Pulse", "Header"):
+            try:
+                p0.default = p.default
+                p0.val = p.default
+            except Exception:
+                pass
+        if p.min is not None:
+            try:
+                p0.normMin = p.min
+                p0.clampMin = p.clamp_min
+            except Exception:
+                pass
+        if p.max is not None:
+            try:
+                p0.normMax = p.max
+                p0.clampMax = p.clamp_max
+            except Exception:
+                pass
+        if p.help:
+            try:
+                p0.help = p.help
+            except Exception:
+                pass
+        if p.menu_names:
+            try:
+                p0.menuNames = list(p.menu_names)
+                p0.menuLabels = list(p.menu_labels or p.menu_names)
+            except Exception:
+                pass
+        if p.readonly:
+            try:
+                p0.readOnly = True
+            except Exception:
+                pass
+        if p.multiline:
+            try:
+                p0.style = "Str"  # multiline edit is a TD-side widget choice
+            except Exception:
+                pass
+
+
+# -----------------------------------------------------------------------------
+# DAT sync
+# -----------------------------------------------------------------------------
+SRC_FILES = ["params.py", "wire.py", "queue_client.py", "oauth.py", "audio.py",
+             "demon_ext.py"]
+
+
+def sync_text_dats(demon):
+    """Ensure each src/*.py has a corresponding Text DAT, file-synced."""
+    for fname in SRC_FILES:
+        dat_name = fname.replace(".py", "")
+        dat = demon.op(dat_name)
+        if dat is None:
+            dat = demon.create(textDAT, dat_name)
+        try:
+            dat.par.file = f"../src/{fname}"
+            dat.par.syncfile = True
+            dat.par.loadonstart = True
+        except Exception as e:
+            print(f"!! sync {fname}: {e}")
+
+
+def wire_extension(demon):
+    """Point the COMP's extension at the demon_ext Text DAT."""
+    try:
+        demon.par.extname1 = "DemonExt"
+        demon.par.extension1 = "op('demon_ext').module.DemonExt(me)"
+        demon.par.promoteextension1 = True
+    except Exception as e:
+        print(f"!! extension wire failed: {e}")
+
+
+def wire_callbacks(demon):
+    """Set up parexec/timer/ws callbacks via a single callbacks Text DAT."""
+    cb = demon.op("callbacks")
+    if cb is None:
+        cb = demon.create(textDAT, "callbacks")
+        cb.nodeX, cb.nodeY = -400, 400
+    cb.text = CALLBACKS_PY
+
+    # parameter execute DAT -> callbacks
+    pe = demon.op("param_exec1")
+    if pe is not None:
+        try:
+            pe.par.op = "."
+            pe.par.dat = "callbacks"
+            pe.par.valuechange = True
+            pe.par.pulse = True
+        except Exception:
+            pass
+
+    ws = demon.op("ws1")
+    if ws is not None:
+        try:
+            ws.par.callbacks = "callbacks"
+            ws.par.format = 1  # binary+text auto
+            ws.par.receivebinary = True
+        except Exception:
+            pass
+
+    for name in ("tick8ms", "heartbeat"):
+        t = demon.op(name)
+        if t is not None:
+            try:
+                t.par.callbacks = "callbacks"
+                if name == "tick8ms":
+                    t.par.length = 0.008
+                    t.par.cycle = True
+                else:
+                    t.par.length = 5.0
+                    t.par.cycle = True
+            except Exception:
+                pass
+
+    ws_server = demon.op("oauth_server")
+    if ws_server is not None:
+        try:
+            ws_server.par.callbacks = "callbacks"
+            ws_server.par.active = False  # only on during Auth
+        except Exception:
+            pass
+
+    for name in ("script_send", "audio_out"):
+        s = demon.op(name)
+        if s is not None:
+            try:
+                s.par.callbacks = "callbacks"
+            except Exception:
+                pass
+
+
+CALLBACKS_PY = '''# auto-generated by build_tox.py
+# Routes TD callbacks into the DemonExt extension.
+
+def onValueChange(par, prev):
+    me.parent().ext.DemonExt.OnParChange(par)
+
+def onPulse(par):
+    me.parent().ext.DemonExt.OnParChange(par)
+
+def onTimer(timerOp, segment):
+    name = timerOp.name
+    if name == "tick8ms":
+        me.parent().ext.DemonExt.OnTick()
+    elif name == "heartbeat":
+        me.parent().ext.DemonExt.OnHeartbeat()
+
+def onReceiveText(dat, rowIndex, message):
+    me.parent().ext.DemonExt.OnReceive(dat, rowIndex=rowIndex, message=message)
+
+def onReceiveBinary(dat, contents):
+    me.parent().ext.DemonExt.OnReceive(dat, bytes=contents)
+
+def onConnect(dat):
+    pass
+
+def onDisconnect(dat):
+    pass
+
+def onHTTPRequest(webServerDAT, request, response):
+    uri = request.get("uri", "")
+    status, ctype, body = me.parent().ext.DemonExt.OnHTTPRequest(uri)
+    response["statusCode"] = status
+    response["statusReason"] = "OK" if status == 200 else "Error"
+    response["data"] = body
+    response["content-type"] = ctype
+    return response
+
+def cookSend(scriptOp):
+    me.parent().ext.DemonExt.OnCookSend(scriptOp)
+
+def cookRecv(scriptOp):
+    me.parent().ext.DemonExt.OnCookRecv(scriptOp)
+'''
+
+
+# -----------------------------------------------------------------------------
+# Audio wiring
+# -----------------------------------------------------------------------------
+def wire_audio(demon):
+    """Connect Audio CHOP I/O ports through resample → script chops."""
+    audio_in = demon.op("audio_in")
+    resample_in = demon.op("resample_in")
+    script_send = demon.op("script_send")
+    audio_out = demon.op("audio_out")
+    resample_out = demon.op("resample_out")
+    out_chop = demon.op("out_chop")
+
+    try:
+        if resample_in is not None:
+            resample_in.par.method = "Linear"
+            resample_in.par.rate = 48000
+        if resample_out is not None:
+            resample_out.par.method = "Linear"
+            resample_out.par.rate = 48000
+    except Exception:
+        pass
+
+    try:
+        if audio_in is not None and resample_in is not None:
+            resample_in.inputConnectors[0].connect(audio_in)
+        if resample_in is not None and script_send is not None:
+            script_send.inputConnectors[0].connect(resample_in)
+        if audio_out is not None and resample_out is not None:
+            resample_out.inputConnectors[0].connect(audio_out)
+        if resample_out is not None and out_chop is not None:
+            out_chop.inputConnectors[0].connect(resample_out)
+    except Exception as e:
+        print(f"audio wiring: {e}")
+
+    # script_send needs a "cookSend" callback hook; script_recv needs "cookRecv".
+    try:
+        if script_send is not None:
+            script_send.par.callbacks = "callbacks"
+            # If the DAT has a function selector par:
+            try:
+                script_send.par.func = "cookSend"
+            except Exception:
+                pass
+        if audio_out is not None:
+            audio_out.par.callbacks = "callbacks"
+            try:
+                audio_out.par.func = "cookRecv"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main():
+    global OPCLASS_LOOKUP
+    OPCLASS_LOOKUP = get_opclass_lookup()
+
+    os.makedirs(DIST_DIR, exist_ok=True)
+
+    # Load template if present
+    if os.path.exists(TEMPLATE_TOE):
+        project.load(TEMPLATE_TOE)
+
+    demon = ensure_demon_comp()
+    ensure_internal_ops(demon)
+    sync_text_dats(demon)
+    wire_callbacks(demon)
+    wire_audio(demon)
+    regenerate_param_pages(demon)
+    wire_extension(demon)
+
+    out_path = os.path.join(DIST_DIR, "demon.tox")
+    demon.save(out_path)
+    print(f"wrote {out_path}")
+
+    # If we started from scratch, save the template too.
+    if not os.path.exists(TEMPLATE_TOE):
+        project.save(TEMPLATE_TOE)
+        print(f"wrote {TEMPLATE_TOE}")
+
+    # Exit TD cleanly.
+    project.quit(force=True)
+
+
+# When run via `TouchDesigner -python build_tox.py`, TD calls __main__ for us.
+if __name__ == "__main__" or me is not None:  # type: ignore[name-defined]
+    main()

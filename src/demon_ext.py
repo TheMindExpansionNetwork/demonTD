@@ -1,0 +1,955 @@
+"""
+DemonExt — the TouchDesigner extension class for the DEMON operator.
+
+This module is loaded inside TD as the Extension of a Base COMP. It owns
+session state, drives the WebSocket DAT, fans parameter changes out at the
+8ms tick, and exposes a clean public API (PascalCase methods) for other TD
+networks to call.
+
+Internal operators expected inside the COMP
+-------------------------------------------
+- ws1            : WebSocket DAT (Receive Binary on)
+- http_queue     : Web Client DAT (queue API calls; we mostly use src/queue.py
+                   for HTTP, so http_queue is optional/legacy)
+- oauth_server   : Web Server DAT (OAuth callback listener; started on demand)
+- param_exec1    : Parameter Execute DAT pointing at this COMP's custom pages
+- tick8ms        : Timer CHOP, segment 0.008s, cycles infinite
+- heartbeat      : Timer CHOP, segment 5s, cycles infinite
+- audio_in       : In CHOP (the COMP's CHOP input port)
+- resample_in    : Resample CHOP, target 48000 Hz
+- script_send    : Script CHOP (encodes input audio + sends on WS)
+- audio_out      : Script CHOP feeding the COMP's CHOP output port
+- resample_out   : Resample CHOP (48k -> project rate)
+- lora_catalog   : Table DAT (server-provided LoRA list)
+- state          : Table DAT (session state for UI binding)
+
+Threading
+---------
+TD calls extension methods from the cook thread. WebSocket DAT callbacks fire
+on its own thread (we keep that work minimal — parse + write to ring buffer).
+Access to mutable state (self._dirty, self._connected, ring buffer) is
+protected by locks where needed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import time
+from typing import Any
+
+# --- vendored dependency: zstandard --------------------------------------------
+# Bundled wheels live in <comp folder>/vendor/zstandard/<platform>/
+# We prepend the matching platform directory to sys.path before import.
+def _prepend_vendor_path() -> None:
+    try:
+        import platform
+        sysname = platform.system().lower()
+        machine = platform.machine().lower()
+        if sysname == "darwin":
+            plat = "darwin-arm64" if "arm" in machine else "darwin-x64"
+        elif sysname == "windows":
+            plat = "win-amd64"
+        else:
+            return  # other OSes: best-effort, user must install zstandard
+
+        # `me` is injected by TD; outside TD this import block is no-op.
+        try:
+            comp = me.owner  # type: ignore[name-defined]  # noqa: F821
+            base = comp.par.externaltox.eval() or ""
+        except Exception:
+            base = ""
+        if not base:
+            # Fall back to project folder.
+            try:
+                base = project.folder  # type: ignore[name-defined]  # noqa: F821
+            except Exception:
+                base = os.getcwd()
+        vendor = os.path.join(os.path.dirname(base) if base.endswith(".tox") else base,
+                              "vendor", "zstandard", plat)
+        if os.path.isdir(vendor) and vendor not in sys.path:
+            sys.path.insert(0, vendor)
+    except Exception:
+        pass
+
+_prepend_vendor_path()
+
+try:
+    import zstandard as zstd
+    _ZSTD_DEC = zstd.ZstdDecompressor()
+except Exception:
+    _ZSTD_DEC = None
+
+import numpy as np
+
+# When this file lives inside a TD Text DAT (file-synced), TD makes the COMP's
+# folder importable. When running tests outside TD, src/ is on sys.path.
+try:
+    from . import params as P
+    from . import wire
+    from . import queue_client as queue_mod
+    from . import oauth
+    from . import audio as audio_mod
+except ImportError:
+    import params as P  # type: ignore
+    import wire  # type: ignore
+    import queue_client as queue_mod  # type: ignore
+    import oauth  # type: ignore
+    import audio as audio_mod  # type: ignore
+
+
+# -----------------------------------------------------------------------------
+# DemonExt
+# -----------------------------------------------------------------------------
+class DemonExt:
+    """The brain of the DEMON operator.
+
+    All public methods are PascalCase (TD convention). Internal state and
+    callbacks are snake_case.
+    """
+
+    # -------- lifecycle ------------------------------------------------------
+
+    def __init__(self, ownerComp):
+        self.ownerComp = ownerComp
+        self._lock = threading.RLock()
+
+        # Session state
+        self._connected: bool = False
+        self._session_id: str | None = None
+        self._ws_url: str | None = None
+        self._expires_at_ms: int | None = None
+        self._extensions_used: int = 0
+        self._playback_pos: int = 0  # samples
+
+        # Auth
+        self._api_key: str = ""
+        self._oauth_state: str | None = None
+        self._oauth_port: int | None = None
+
+        # Param fanout
+        self._dirty: dict[str, Any] = {}
+        self._last_init_values: dict[str, Any] = {}
+
+        # LoRA catalog (mirrors the Table DAT)
+        self._lora_ids: list[str] = []
+
+        # Audio buffers
+        self._ring = audio_mod.RingBuffer(channels=2,
+                                          max_samples=wire.SAMPLE_RATE * 30)
+        self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
+
+        self.log("DemonExt initialized")
+
+    # -------- properties (public read-only) ----------------------------------
+
+    @property
+    def IsConnected(self) -> bool:
+        return self._connected
+
+    @property
+    def Status(self) -> dict:
+        with self._lock:
+            return {
+                "connected": self._connected,
+                "session_id": self._session_id,
+                "queue_position": self._read_par("Queueposition", 0),
+                "expires_in": self._read_par("Expiresin", 0.0),
+                "extensions_used": self._extensions_used,
+                "buffered_samples": self._ring.available,
+            }
+
+    # -------- session lifecycle ----------------------------------------------
+
+    def Connect(self, anonymous: bool | None = None) -> bool:
+        """Open a session: join queue → wait → open WS → send config + audio."""
+        with self._lock:
+            if self._connected:
+                self.log("Connect: already connected")
+                return True
+
+            if anonymous is None:
+                anonymous = bool(self._read_par("Anonymous", True))
+
+            base = self._read_par("Serverurl", "http://localhost:8000")
+            self._set_status("Joining queue...")
+            api_key = None if anonymous else (self._read_par("Apikey", "") or None)
+            self._api_key = api_key or ""
+
+            client = queue_mod.QueueClient(base, api_key=api_key)
+            try:
+                resp = client.join()
+            except queue_mod.QueueError as e:
+                self._set_status(f"Join failed: {e}")
+                self.log(f"Connect error: {e}")
+                return False
+
+            self._session_id = resp.session_id
+
+            # Poll for active state.
+            poll_start = time.time()
+            while resp.status == "queued":
+                self._set_status(f"Queued (position {resp.position})")
+                self._write_par("Queueposition", resp.position or 0)
+                # The actual sleep is driven by Timer CHOP poll in production;
+                # for the blocking initial Connect we use short sleeps with a cap.
+                if time.time() - poll_start > 300:  # 5 min cap
+                    self._set_status("Queue timeout")
+                    return False
+                time.sleep(1.5)
+                try:
+                    resp = client.status(self._session_id or "")
+                except queue_mod.QueueError as e:
+                    self._set_status(f"Status poll failed: {e}")
+                    return False
+
+            if resp.status != "active":
+                self._set_status(f"Unexpected status: {resp.status}")
+                return False
+
+            self._ws_url = resp.ws_url
+            self._expires_at_ms = resp.expires_at
+            self._extensions_used = resp.extensions_used or 0
+            self._write_par("Queueposition", 0)
+
+            if not self._ws_url:
+                self._set_status("No wsUrl from server")
+                return False
+
+            self._open_ws(self._ws_url)
+            return True
+
+    def Disconnect(self) -> None:
+        """Close WS + tell queue we're leaving."""
+        with self._lock:
+            if not self._connected and not self._session_id:
+                return
+            self._set_status("Disconnecting...")
+            try:
+                ws = self._ws()
+                if ws is not None:
+                    ws.par.active = False  # closes the socket
+            except Exception:
+                pass
+
+            if self._session_id:
+                base = self._read_par("Serverurl", "http://localhost:8000")
+                try:
+                    queue_mod.QueueClient(base, api_key=self._api_key or None).leave(
+                        self._session_id
+                    )
+                except queue_mod.QueueError:
+                    pass
+
+            self._connected = False
+            self._session_id = None
+            self._ws_url = None
+            self._expires_at_ms = None
+            self._dirty.clear()
+            self._ring.clear()
+            self._set_status("Idle")
+
+    # -------- auth -----------------------------------------------------------
+
+    def Authenticate(self) -> None:
+        """Kick off Daydream OAuth.
+
+        1. Pick a free port and start the local Web Server DAT (if present).
+        2. Open the browser to the Daydream sign-in URL.
+        3. The Web Server DAT's onHTTPRequest callback in this COMP routes the
+           OAuth callback to OnAuthCallback(), which validates state and
+           exchanges the token.
+
+        If no Web Server DAT is wired (older builds), this prints instructions
+        and the user falls back to Paste API Key.
+        """
+        with self._lock:
+            try:
+                self._oauth_port = oauth.find_free_port()
+                self._oauth_state = oauth.generate_state()
+            except oauth.OAuthError as e:
+                self.log(f"OAuth setup failed: {e}")
+                self._set_status("Auth setup failed")
+                return
+
+            server = self._oauth_server()
+            if server is not None:
+                try:
+                    server.par.port = self._oauth_port
+                    server.par.active = True
+                except Exception as e:
+                    self.log(f"Could not start oauth_server: {e}")
+                    self._set_status("Auth: paste API key manually")
+                    return
+
+            url = oauth.build_signin_url(self._oauth_port, self._oauth_state)
+            self.log(f"Opening browser: {url}")
+            opened = oauth.open_browser(url)
+            if not opened:
+                self._set_status("Browser unavailable; paste API key manually")
+            else:
+                self._set_status("Waiting for browser sign-in...")
+
+    def OnAuthCallback(self, query_string: str) -> tuple[int, str, str]:
+        """Called by the Web Server DAT's onHTTPRequest handler with the
+        query portion of /cb?token=...&state=...
+
+        Returns (http_status, content_type, body) for the response page.
+        """
+        params = oauth.parse_callback_query(query_string)
+        token = params.get("token")
+        state = params.get("state")
+
+        if not token or not state:
+            return 400, "text/html", oauth.CALLBACK_ERR_HTML.format(
+                reason="Missing token or state"
+            )
+
+        if state != (self._oauth_state or ""):
+            return 400, "text/html", oauth.CALLBACK_ERR_HTML.format(
+                reason="CSRF state mismatch"
+            )
+
+        try:
+            profile = oauth.complete_auth(token)
+        except oauth.OAuthError as e:
+            return 500, "text/html", oauth.CALLBACK_ERR_HTML.format(
+                reason=str(e)
+            )
+
+        # Persist
+        self.SetApiKey(profile.api_key)
+        self._set_status(
+            f"Authenticated{(' as ' + profile.display_name) if profile.display_name else ''}"
+        )
+
+        # Shut down the listener.
+        try:
+            server = self._oauth_server()
+            if server is not None:
+                server.par.active = False
+        except Exception:
+            pass
+
+        self._oauth_state = None
+        self._oauth_port = None
+        return 200, "text/html", oauth.CALLBACK_OK_HTML
+
+    def SetApiKey(self, key: str) -> None:
+        """Store a Daydream API key (also called by Paste API Key pulse)."""
+        with self._lock:
+            self._api_key = key or ""
+        self._write_par("Apikey", self._api_key)
+
+    def PromptForApiKey(self) -> None:
+        """Open a modal asking the user to paste an API key."""
+        try:
+            import ui  # type: ignore[name-defined]  # noqa: F401
+            value = ui.messageBox(  # type: ignore[name-defined]
+                "Paste Daydream API key",
+                "Paste your Daydream API key:",
+                buttons=["OK", "Cancel"],
+            )
+            if value:
+                self.SetApiKey(value)
+        except Exception:
+            self.log("PromptForApiKey: 'ui' unavailable; paste into the API Key par directly")
+
+    # -------- continuous param push ------------------------------------------
+
+    def SetParam(self, name: str, value: Any) -> None:
+        """One-shot: send a single param update immediately, bypassing the
+        8ms batch. Use for events you want immediate response on.
+
+        name : either a TD par name (e.g. 'Denoise') or a wire name (e.g. 'denoise')
+        """
+        wire_name = self._resolve_wire_name(name)
+        if not wire_name:
+            self.log(f"SetParam: unknown param {name}")
+            return
+        self._send_text(wire.encode_params({wire_name: value}, self._playback_pos))
+
+    def SetParams(self, d: dict[str, Any]) -> None:
+        """Batch send a dict of param values (mixed TD-names and wire-names)."""
+        raw: dict[str, Any] = {}
+        for k, v in d.items():
+            wn = self._resolve_wire_name(k)
+            if wn:
+                raw[wn] = v
+        if raw:
+            self._send_text(wire.encode_params(raw, self._playback_pos))
+
+    # -------- discrete messages ---------------------------------------------
+
+    def SendPrompt(self, tags: str | None = None, key: str | None = None,
+                   time_signature: str | None = None) -> None:
+        tags = tags if tags is not None else (self._read_par("Prompt", "") or "")
+        key = key if key is not None else (self._read_par("Key", "auto") or "auto")
+        time_signature = (time_signature if time_signature is not None
+                          else (self._read_par("Timesignature", "auto") or "auto"))
+        self._send_text(wire.encode_prompt(tags, key=key, time_signature=time_signature))
+        self.log(f"prompt: {tags!r} key={key} ts={time_signature}")
+
+    def SetPromptBlend(self, value: float | None = None) -> None:
+        v = value if value is not None else float(self._read_par("Promptblend", 0.4))
+        self._send_text(wire.encode_set_prompt_blend(v))
+
+    def EnableLora(self, id: str, strength: float = 1.0) -> None:
+        self._send_text(wire.encode_enable_lora(id, strength=strength))
+
+    def DisableLora(self, id: str) -> None:
+        self._send_text(wire.encode_disable_lora(id))
+
+    def SetTimbreStrength(self, value: float) -> None:
+        self._send_text(wire.encode_set_timbre_strength(float(value)))
+
+    def SetTimbreSource(self, chop: Any = None, name: str = "td_input") -> None:
+        """Upload the current CHOP input (or a referenced CHOP op) as timbre."""
+        pcm = self._snapshot_audio(chop)
+        if pcm is None:
+            self.log("SetTimbreSource: no audio input")
+            return
+        self._send_text(wire.encode_set_timbre_source(name))
+        self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+
+    def SetTimbreFixture(self, name: str | None = None) -> None:
+        n = name if name is not None else (self._read_par("Timbrefixture", "") or "")
+        if not n:
+            return
+        self._send_text(wire.encode_set_timbre_fixture(n))
+
+    def ClearTimbreSource(self) -> None:
+        self._send_text(wire.encode_clear_timbre_source())
+
+    def SetStructureSource(self, chop: Any = None, fixture: str | None = None,
+                           name: str = "td_input") -> None:
+        if fixture:
+            self._send_text(wire.encode_set_structure_fixture(fixture))
+            return
+        pcm = self._snapshot_audio(chop)
+        if pcm is None:
+            self.log("SetStructureSource: no audio input")
+            return
+        self._send_text(wire.encode_set_structure_source(name))
+        self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+
+    def SetStructureFixture(self, name: str | None = None) -> None:
+        n = name if name is not None else (self._read_par("Structurefixture", "") or "")
+        if not n:
+            return
+        self._send_text(wire.encode_set_structure_fixture(n))
+
+    def ClearStructureSource(self) -> None:
+        self._send_text(wire.encode_clear_structure_source())
+
+    def SwapSource(self, chop: Any = None, tags: str | None = None,
+                   key: str | None = None,
+                   time_signature: str | None = None,
+                   fixture: str | None = None) -> None:
+        tags = tags if tags is not None else (self._read_par("Swaptags", "") or None)
+        key = key if key is not None else (self._read_par("Key", "auto") or "auto")
+        time_signature = (time_signature if time_signature is not None
+                          else (self._read_par("Timesignature", "auto") or "auto"))
+
+        header = wire.encode_swap_source(
+            tags=tags, key=key, time_signature=time_signature,
+            fixture_name=fixture,
+        )
+        self._send_text(header)
+        if not fixture:
+            pcm = self._snapshot_audio(chop)
+            if pcm is not None:
+                self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+
+    # -------- TD callbacks ---------------------------------------------------
+
+    def OnParChange(self, par) -> None:
+        """Called by param_exec1 when any custom par changes.
+
+        Routes:
+          - pulse with discrete kind -> dispatch handler
+          - init par while connected -> revert + warn
+          - continuous par -> drop into _dirty
+          - session/local par -> ignored
+        """
+        name = par.name
+        schema = P.PARAM_BY_NAME.get(name)
+        if not schema:
+            return
+
+        # 1. Pulse actions
+        if schema.type == "Pulse":
+            self._handle_pulse(name)
+            return
+
+        # 2. Init param edited mid-session -> revert + warn
+        if name in P.INIT_PARAM_NAMES and self._connected:
+            prior = self._last_init_values.get(name, schema.default)
+            try:
+                par.val = prior
+            except Exception:
+                pass
+            self._set_status("Reconnect to apply Init changes")
+            return
+
+        # 3. Continuous param -> batch
+        if name in P.CONTINUOUS_PARAM_NAMES and schema.wire_name:
+            value = self._coerce_par_value(par, schema)
+            with self._lock:
+                self._dirty[schema.wire_name] = value
+
+    def OnTick(self) -> None:
+        """Called by tick8ms Timer CHOP every ~8ms.
+
+        Flushes any pending continuous-param changes as a single batch message.
+        Also advances the local playback position estimate.
+        """
+        if not self._connected:
+            return
+
+        with self._lock:
+            if not self._dirty:
+                # Still advance playback position
+                self._playback_pos += int(wire.SAMPLE_RATE * 0.008)
+                return
+            raw = dict(self._dirty)
+            self._dirty.clear()
+
+        try:
+            self._send_text(wire.encode_params(raw, self._playback_pos))
+        except Exception as e:
+            self.log(f"OnTick send error: {e}")
+        finally:
+            self._playback_pos += int(wire.SAMPLE_RATE * 0.008)
+
+    def OnHeartbeat(self) -> None:
+        """Called by the 5s heartbeat Timer CHOP. Polls /api/queue/status."""
+        if not self._connected or not self._session_id:
+            return
+        base = self._read_par("Serverurl", "http://localhost:8000")
+        try:
+            resp = queue_mod.QueueClient(base, api_key=self._api_key or None).status(
+                self._session_id
+            )
+        except queue_mod.QueueError as e:
+            self.log(f"Heartbeat poll failed: {e}")
+            return
+
+        if resp.expires_at:
+            self._expires_at_ms = resp.expires_at
+            now_ms = time.time() * 1000
+            self._write_par("Expiresin", max(0.0, (resp.expires_at - now_ms) / 1000))
+
+        if resp.status != "active":
+            self.log(f"Heartbeat saw status={resp.status}; disconnecting")
+            self.Disconnect()
+
+    def OnReceive(self, dat, rowIndex=None, message=None,
+                  bytes=None, peer=None) -> None:
+        """WebSocket DAT callback for incoming messages.
+
+        TD passes either `message` (str) or `bytes` (bytes) depending on frame type.
+        """
+        try:
+            if isinstance(bytes, (bytes, bytearray)) and bytes:
+                self._on_binary(bytes)
+            elif isinstance(message, str) and message:
+                self._on_text(message)
+        except Exception as e:
+            self.log(f"OnReceive error: {e}")
+
+    def OnHTTPRequest(self, request_uri: str) -> tuple[int, str, str]:
+        """Called by oauth_server (Web Server DAT) onHTTPRequest hook.
+
+        Returns (status, content_type, body).
+        """
+        # request_uri looks like '/cb?token=...&state=...'
+        path, _, query = request_uri.partition("?")
+        if path.rstrip("/") == "/cb":
+            return self.OnAuthCallback(query)
+        return 404, "text/plain", "Not found"
+
+    # -------- WS open + I/O --------------------------------------------------
+
+    def _open_ws(self, ws_url: str) -> None:
+        ws = self._ws()
+        if ws is None:
+            self._set_status("WebSocket DAT 'ws1' not found")
+            return
+        try:
+            ws.par.active = False
+            ws.par.netaddress = ws_url
+            ws.par.active = True
+        except Exception as e:
+            self.log(f"Failed to open WS: {e}")
+            self._set_status(f"WS open failed: {e}")
+            return
+
+        # Snapshot init params for revert-on-mid-session-edit
+        self._last_init_values = self._collect_init_params()
+
+        # Send config + a 1s silent priming buffer (server expects audio before 'ready').
+        cfg = self._build_session_config()
+        self._send_text(wire.encode_config(cfg))
+
+        prime = np.zeros((2, wire.SAMPLE_RATE), dtype=np.float32)
+        self._send_bytes(wire.encode_audio_frame(prime, channels=2))
+
+        # Mark connected once the WS reports open. TD's onConnect is hooked in the
+        # callbacks DAT; for now we optimistically flip the flag here.
+        self._connected = True
+        self._set_status("Connected")
+
+    def _build_session_config(self) -> dict[str, Any]:
+        cfg: dict[str, Any] = {}
+        for p in P.PARAMS:
+            if p.category == "init" and p.wire_name:
+                cfg[p.wire_name] = self._read_par(p.name, p.default)
+        cfg["enabled_loras"] = self._enabled_loras()
+        cfg["lora_strengths"] = self._lora_strengths()
+        # Politely request raw slices if the server supports it.
+        cfg.setdefault("compression", "none")
+        return cfg
+
+    def _enabled_loras(self) -> list[str]:
+        """Read which LoRAs are currently enabled (toggle pars are named
+        like 'Lora_enable_<id>' once the catalog is loaded)."""
+        out: list[str] = []
+        for lora_id in self._lora_ids:
+            par = self._par_by_name(f"Lora_enable_{lora_id}")
+            if par and par.eval():
+                out.append(lora_id)
+        return out
+
+    def _lora_strengths(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for lora_id in self._lora_ids:
+            par = self._par_by_name(f"Lora_str_{lora_id}")
+            if par:
+                out[lora_id] = float(par.eval())
+        return out
+
+    # -------- WS message handlers --------------------------------------------
+
+    def _on_text(self, msg: str) -> None:
+        try:
+            data = wire.decode_control(msg)
+        except Exception as e:
+            self.log(f"Bad WS text: {e}")
+            return
+
+        kind = data.get("type", "")
+        if kind == "ready":
+            self.log(f"server ready: ch={data.get('channels')} sr={data.get('sample_rate')}")
+            cat = data.get("lora_catalog") or []
+            self._apply_lora_catalog(cat)
+        elif kind == "lora_catalog":
+            self._apply_lora_catalog(data.get("catalog") or [])
+        elif kind == "params_update":
+            # Server-echoed param values; could be displayed but we don't overwrite UI.
+            pass
+        elif kind == "prompt_applied":
+            self.log(f"prompt applied: {data.get('tags')}")
+        elif kind == "swap_ready":
+            self._epoch += 1
+            self._ring.clear()
+            self.log(f"swap_ready ch={data.get('channels')}")
+        elif kind in ("timbre_set", "timbre_cleared", "structure_set",
+                      "structure_cleared"):
+            self.log(kind)
+        elif kind in ("timbre_failed", "structure_failed", "swap_failed", "error"):
+            self.log(f"server {kind}: {data.get('error') or data.get('message')}")
+            self._set_status(f"Error: {kind}")
+        else:
+            self.log(f"unknown server message: {kind}")
+
+    def _on_binary(self, buf: bytes) -> None:
+        try:
+            slice_ = wire.decode_slice(buf, zstd_dec=_ZSTD_DEC)
+        except Exception as e:
+            self.log(f"Bad slice: {e}")
+            return
+
+        # Reshape interleaved float32 -> (channels, samples_per_channel)
+        ch = max(1, slice_.channels)
+        n = slice_.pcm.size // ch
+        if n <= 0:
+            return
+        pcm = slice_.pcm[: n * ch].reshape(n, ch).T
+        self._ring.write(pcm)
+
+    # -------- LoRA catalog ---------------------------------------------------
+
+    def _apply_lora_catalog(self, catalog: list[dict]) -> None:
+        """Update Table DAT + dynamic per-LoRA params on the Prompt+LoRA page."""
+        table = self.ownerComp.op("lora_catalog")
+        if table is not None:
+            try:
+                table.clear()
+                table.appendRow(["id", "name", "default_strength"])
+                for entry in catalog:
+                    table.appendRow([
+                        entry.get("id", ""),
+                        entry.get("name") or entry.get("id", ""),
+                        entry.get("strength", 1.0),
+                    ])
+            except Exception as e:
+                self.log(f"lora_catalog write failed: {e}")
+
+        ids = [e.get("id", "") for e in catalog if e.get("id")]
+        with self._lock:
+            self._lora_ids = ids
+
+        # Dynamically add Toggle + Float par per LoRA on the Prompt+LoRA page.
+        try:
+            page = self._page_by_name("Prompt+LoRA")
+            if page is None:
+                return
+            existing = {p.name for p in page.pars}
+            for entry in catalog:
+                lid = entry.get("id", "")
+                if not lid:
+                    continue
+                toggle_name = f"Lora_enable_{lid}"
+                strength_name = f"Lora_str_{lid}"
+                if toggle_name not in existing:
+                    tp = page.appendToggle(toggle_name,
+                                           label=f"{entry.get('name', lid)} (on)")
+                    if tp:
+                        tp[0].default = False
+                if strength_name not in existing:
+                    sp = page.appendFloat(strength_name,
+                                          label=f"{entry.get('name', lid)} strength")
+                    if sp:
+                        sp[0].normMin = 0.0
+                        sp[0].normMax = 1.8
+                        sp[0].default = entry.get("strength", 1.0)
+                        sp[0].clampMin = True
+                        sp[0].clampMax = True
+        except Exception as e:
+            self.log(f"LoRA page update failed: {e}")
+
+    # -------- Pulse handlers -------------------------------------------------
+
+    def _handle_pulse(self, name: str) -> None:
+        dispatch = {
+            "Connect": lambda: self.Connect(),
+            "Disconnect": lambda: self.Disconnect(),
+            "Authenticate": lambda: self.Authenticate(),
+            "Pasteapikey": lambda: self.PromptForApiKey(),
+            "Stillplaying": lambda: self._extend_session(),
+            "Sendprompt": lambda: self.SendPrompt(),
+            "Setpromptblend": lambda: self.SetPromptBlend(),
+            "Swapsource": lambda: self.SwapSource(),
+            "Settimbresource": lambda: self.SetTimbreSource(),
+            "Cleartimbresource": lambda: self.ClearTimbreSource(),
+            "Settimbrefixture": lambda: self.SetTimbreFixture(),
+            "Setstructuresource": lambda: self.SetStructureSource(),
+            "Clearstructuresource": lambda: self.ClearStructureSource(),
+            "Setstructurefixture": lambda: self.SetStructureFixture(),
+        }
+        fn = dispatch.get(name)
+        if fn:
+            try:
+                fn()
+            except Exception as e:
+                self.log(f"Pulse {name} failed: {e}")
+
+    def _extend_session(self) -> None:
+        if not self._session_id:
+            return
+        base = self._read_par("Serverurl", "http://localhost:8000")
+        try:
+            resp = queue_mod.QueueClient(base, api_key=self._api_key or None).extend(
+                self._session_id
+            )
+            if resp.expires_at:
+                self._expires_at_ms = resp.expires_at
+            self._extensions_used = resp.extensions_used or self._extensions_used
+            self._set_status("Extended")
+        except queue_mod.QueueError as e:
+            self.log(f"Extend failed: {e}")
+
+    # -------- helpers --------------------------------------------------------
+
+    def _send_text(self, payload: str) -> None:
+        ws = self._ws()
+        if ws is None:
+            return
+        try:
+            ws.sendText(payload)
+        except Exception as e:
+            self.log(f"sendText failed: {e}")
+
+    def _send_bytes(self, payload: bytes) -> None:
+        ws = self._ws()
+        if ws is None:
+            return
+        try:
+            ws.sendBytes(payload)
+        except Exception as e:
+            self.log(f"sendBytes failed: {e}")
+
+    def _snapshot_audio(self, chop) -> np.ndarray | None:
+        """Grab the current samples from a CHOP (param-reference, op-path, or
+        the resampled COMP input). Returns (channels, samples) float32 or None.
+        """
+        try:
+            if chop is None:
+                chop = self.ownerComp.op("resample_in")
+            if isinstance(chop, str):
+                chop = self.ownerComp.op(chop) or op(chop)  # noqa: F821
+            if chop is None:
+                return None
+            # CHOP samples
+            ch_count = chop.numChans
+            if ch_count <= 0:
+                return None
+            samples = chop.numSamples
+            pcm = np.empty((ch_count, samples), dtype=np.float32)
+            for i in range(ch_count):
+                pcm[i] = np.fromiter(chop[i].vals, dtype=np.float32, count=samples)
+            return audio_mod.to_stereo(pcm)
+        except Exception as e:
+            self.log(f"_snapshot_audio failed: {e}")
+            return None
+
+    def _resolve_wire_name(self, name: str) -> str | None:
+        if name in P.PARAM_BY_WIRE:
+            return name
+        p = P.PARAM_BY_NAME.get(name)
+        return p.wire_name if p else None
+
+    def _coerce_par_value(self, par, schema: P.Param) -> Any:
+        if schema.type == "Toggle":
+            return bool(par.eval())
+        if schema.type == "Int":
+            return int(par.eval())
+        if schema.type == "Menu":
+            return str(par.eval())
+        if schema.type == "Str":
+            v = par.eval()
+            # Curves want JSON-parsed values, not strings.
+            if schema.wire_name and schema.wire_name.endswith("_curve") and v:
+                try:
+                    return json.loads(v)
+                except json.JSONDecodeError:
+                    self.log(f"Bad JSON in {schema.name}; sending as string")
+                    return v
+            return v
+        return float(par.eval())
+
+    def _collect_init_params(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for p in P.PARAMS:
+            if p.category == "init":
+                out[p.name] = self._read_par(p.name, p.default)
+        return out
+
+    # -------- TD plumbing ----------------------------------------------------
+
+    def _ws(self):
+        try:
+            return self.ownerComp.op("ws1")
+        except Exception:
+            return None
+
+    def _oauth_server(self):
+        try:
+            return self.ownerComp.op("oauth_server")
+        except Exception:
+            return None
+
+    def _par_by_name(self, name: str):
+        try:
+            return getattr(self.ownerComp.par, name)
+        except AttributeError:
+            return None
+
+    def _page_by_name(self, page_name: str):
+        for page in self.ownerComp.customPages:
+            if page.name == page_name:
+                return page
+        return None
+
+    def _read_par(self, name: str, default: Any = None) -> Any:
+        par = self._par_by_name(name)
+        if par is None:
+            return default
+        try:
+            return par.eval()
+        except Exception:
+            return default
+
+    def _write_par(self, name: str, value: Any) -> None:
+        par = self._par_by_name(name)
+        if par is None:
+            return
+        try:
+            par.val = value
+        except Exception:
+            pass
+
+    def _set_status(self, msg: str) -> None:
+        self._write_par("Status", msg)
+        self.log(f"status: {msg}")
+
+    # -------- logging --------------------------------------------------------
+
+    def log(self, msg: str) -> None:
+        try:
+            print(f"[demon] {msg}")
+        except Exception:
+            pass
+
+    # -------- script CHOP cook hooks ----------------------------------------
+    # These are called from the script_send / audio_out Script CHOPs.
+
+    def OnCookSend(self, scriptOp) -> None:
+        """script_send Script CHOP cook callback.
+
+        Pulls samples from `resample_in` and ships them as a binary frame.
+        Output CHOP has zero channels — it's purely a side-effect cook.
+        """
+        if not self._connected:
+            scriptOp.numSamples = 1
+            scriptOp.appendChan("dummy")
+            return
+
+        src = self.ownerComp.op("resample_in")
+        if src is None or src.numChans == 0:
+            scriptOp.numSamples = 1
+            scriptOp.appendChan("dummy")
+            return
+
+        try:
+            n = src.numSamples
+            ch = min(2, src.numChans)
+            pcm = np.empty((ch, n), dtype=np.float32)
+            for i in range(ch):
+                pcm[i] = np.fromiter(src[i].vals, dtype=np.float32, count=n)
+            pcm = audio_mod.to_stereo(pcm)
+            self._send_bytes(wire.encode_audio_frame(pcm, channels=2))
+        except Exception as e:
+            self.log(f"OnCookSend error: {e}")
+        finally:
+            scriptOp.numSamples = 1
+            scriptOp.appendChan("dummy")
+
+    def OnCookRecv(self, scriptOp) -> None:
+        """audio_out Script CHOP cook callback. Reads from ring buffer."""
+        # Pull a chunk equal to the project's cook block at 48k.
+        try:
+            target_samples = max(64, int(scriptOp.par.length or 512))
+        except Exception:
+            target_samples = 512
+
+        pcm = self._ring.read(target_samples)  # (2, target_samples)
+        scriptOp.clear()
+        scriptOp.numSamples = target_samples
+        scriptOp.rate = wire.SAMPLE_RATE
+        for i, ch_name in enumerate(("chan1", "chan2")):
+            ch = scriptOp.appendChan(ch_name)
+            ch.vals = pcm[i].tolist()

@@ -1,0 +1,30 @@
+[project]
+name = "demon-td"
+version = "0.1.0"
+description = "TouchDesigner operator for DEMON — real-time AI music generation"
+readme = "README.md"
+requires-python = ">=3.11"
+# Runtime deps are bundled in the .tox via vendor/ and TD's stdlib.
+# These are dev-only for unit tests:
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "responses>=0.24",  # mock HTTP for queue tests
+    "numpy>=1.24",      # already in TD; declared here for unit tests outside TD
+    "zstandard>=0.22",  # bundled in .tox; needed in dev for tests
+    "ruff>=0.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
