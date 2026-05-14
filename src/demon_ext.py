@@ -623,77 +623,62 @@ class DemonExt:
     # -------- WS open + I/O --------------------------------------------------
 
     def _open_ws(self, ws_url: str) -> None:
+        """Open the WS DAT against ws_url.
+
+        TD's WebSocket DAT splits the target into `netaddress` (host only,
+        no scheme, no port, no path) and `port` (separate par). It does NOT
+        accept a full URL in netaddress.  There is no openConnection() /
+        close() method — only par.active = True/False.
+
+        TD path component? The DAT has no `path` par, so we assume the
+        endpoint is at the host:port root (which matches DEMON's pod).
+        """
         ws = self._ws()
         if ws is None:
             self._set_status("WebSocket DAT 'ws1' not found")
             return
 
-        # Close any stale connection. TD 2025 prefers explicit methods on
-        # the DAT; older builds expose only par.active. We probe both.
-        self.log(f"_open_ws: target={ws_url}")
-        for op_name in ("close", "disconnect"):
-            fn = getattr(ws, op_name, None)
-            if callable(fn):
-                try:
-                    fn()
-                    self.log(f"_open_ws: called ws.{op_name}()")
-                    break
-                except Exception as e:
-                    self.log(f"_open_ws: ws.{op_name}() failed: {e}")
+        host, port = self._parse_ws_url(ws_url)
+        if host is None:
+            self._set_status(f"Bad WS URL: {ws_url}")
+            return
+        self.log(f"_open_ws: target={ws_url}  →  host={host!r} port={port}")
+
+        # Stop any prior connection
         try:
             ws.par.active = False
         except Exception:
             pass
 
-        # Set destination, then open.
         try:
-            ws.par.netaddress = ws_url
+            ws.par.netaddress = host
+            ws.par.port = port
         except Exception as e:
-            self.log(f"_open_ws: set netaddress failed: {e}")
+            self.log(f"_open_ws: set netaddress/port failed: {e}")
+            self._set_status(f"WS setup failed: {e}")
+            return
+
+        # Trigger the (re)connect
+        try:
+            ws.par.active = True
+            self.log("_open_ws: par.active = True (waiting for onConnect)")
+        except Exception as e:
+            self.log(f"_open_ws: par.active=True failed: {e}")
             self._set_status(f"WS open failed: {e}")
             return
 
-        opened = False
-        for op_name in ("openConnection", "open", "connect"):
-            fn = getattr(ws, op_name, None)
-            if callable(fn):
-                try:
-                    fn()
-                    self.log(f"_open_ws: called ws.{op_name}()")
-                    opened = True
-                    break
-                except Exception as e:
-                    self.log(f"_open_ws: ws.{op_name}() failed: {e}")
-        if not opened:
-            try:
-                ws.par.active = True
-                self.log("_open_ws: set par.active = True")
-            except Exception as e:
-                self.log(f"_open_ws: par.active=True failed: {e}")
-                self._set_status(f"WS open failed: {e}")
-                return
-
-        # Probe state after a brief settle. TD may not have actually opened
-        # the socket yet — log whatever introspection is available.
+    @staticmethod
+    def _parse_ws_url(url: str) -> tuple[str | None, int]:
+        """ws://host:port/path → ('host', port). Defaults port 80/443."""
         try:
-            for attr_name in ("connected", "isOpen", "isConnected", "ready",
-                              "readyState", "state"):
-                val = getattr(ws, attr_name, None)
-                if val is not None and not callable(val):
-                    self.log(f"_open_ws: ws.{attr_name} = {val!r}")
-            try:
-                peers = getattr(ws, "peers", None)
-                if peers is not None and not callable(peers):
-                    self.log(f"_open_ws: ws.peers = {peers!r}")
-            except Exception:
-                pass
-            try:
-                if hasattr(ws, "errors") and ws.errors:
-                    self.log(f"_open_ws: ws.errors = {ws.errors!r}")
-            except Exception:
-                pass
+            from urllib.parse import urlparse
+            u = urlparse(url)
+            if u.scheme not in ("ws", "wss") or not u.hostname:
+                return None, 0
+            default_port = 443 if u.scheme == "wss" else 80
+            return u.hostname, u.port or default_port
         except Exception:
-            pass
+            return None, 0
 
         # Snapshot init params for revert-on-mid-session-edit
         self._last_init_values = self._collect_init_params()

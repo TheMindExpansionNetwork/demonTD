@@ -489,9 +489,8 @@ def wire_callbacks(demon):
                     print(f"     custom: {p.name} = {p.eval()!r}")
                 except Exception:
                     pass
-            for pname in ("active", "netaddress", "format", "callbacks",
-                          "autoreconnect", "reconnectdelay", "receivebinary",
-                          "binarymessages", "receiveasbinary"):
+            for pname in ("active", "netaddress", "port", "timeout",
+                          "callbacks", "executeloc", "fromop"):
                 par = getattr(ws.par, pname, None)
                 if par is not None:
                     try:
