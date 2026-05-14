@@ -862,29 +862,31 @@ class DemonExt:
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
-        # 2. Throttled params send. Send when:
-        #     (a) we have dirty values to push (immediate),
-        #     (b) at least 100 ms have passed AND playback_pos has advanced
-        #         (heartbeat, keeps the server's flow control happy).
-        #    Avoid the 60 Hz flood of empty raw + zero playback_pos that
-        #    can spam DEMON's recv loop.
+        # 2. Throttled params send. Server uses our `playback_pos` updates
+        #    as flow-control signal — without them, the pipeline pauses.
+        #    Send a heartbeat every 200 ms UNCONDITIONALLY (even if cooks
+        #    haven't advanced playback_pos), plus immediate sends on dirty
+        #    changes. This breaks the cook/heartbeat deadlock.
         if self._connected:
             with self._lock:
                 raw = dict(self._dirty) if self._dirty else {}
                 self._dirty.clear()
             now = time.time()
             last_send = getattr(self, "_last_params_send", 0.0)
-            last_pos = getattr(self, "_last_sent_pos", -1)
             should_send = False
             if raw:
                 should_send = True
-            elif (now - last_send > 0.1) and self._playback_pos != last_pos:
+            elif now - last_send > 0.2:
+                # Even if OnCookRecv isn't firing, advance playback_pos by
+                # wall-clock so the server doesn't think we're stuck.
+                wall_advance = int((now - last_send) * wire.SAMPLE_RATE)
+                if last_send > 0:
+                    self._playback_pos += wall_advance
                 should_send = True
             if should_send:
                 try:
                     self._send_text(wire.encode_params(raw, self._playback_pos))
                     self._last_params_send = now
-                    self._last_sent_pos = self._playback_pos
                 except Exception as e:
                     self.log(f"frame param send error: {e}")
 
@@ -1674,32 +1676,21 @@ class DemonExt:
     def OnCookRecv(self, scriptOp) -> None:
         """audio_out Script CHOP cook callback. Reads from ring buffer.
 
-        Each cook:
-          1. Pop `n` samples from the ring (zero-padded on underrun).
-          2. Advance self._playback_pos by `n` so subsequent params
-             messages tell the server how much we've actually played.
-          3. Diagnose silence: if the read came back all-zero, the ring
-             was empty (server hasn't sent enough slices).
+        Time Slice is OFF (set by build_tox). Each cook produces a fixed
+        block of audio samples at 48 kHz; the downstream Audio Device Out
+        pulls these blocks at its own rate.
         """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
         if self._n_cook_recv == 1:
             try:
-                self.log(f"OnCookRecv: FIRST cook — numSamples={scriptOp.numSamples} "
-                         f"ring_avail={self._ring.available}")
+                self.log(f"OnCookRecv: FIRST cook — incoming numSamples="
+                         f"{scriptOp.numSamples} ring_avail={self._ring.available}")
             except Exception:
                 pass
 
-        n = 0
-        try:
-            n = int(scriptOp.numSamples)
-        except Exception:
-            n = 0
-        if n <= 0:
-            try:
-                n = int(project.audioBlock)  # type: ignore[name-defined]  # noqa: F821
-            except Exception:
-                n = 512
-        n = max(1, n)
+        # Produce a fixed block. 1024 samples @ 48 kHz = ~21 ms — small
+        # enough for low latency, big enough to not thrash.
+        n = 1024
 
         avail_before = self._ring.available
         pcm = self._ring.read(n)

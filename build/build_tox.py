@@ -774,14 +774,19 @@ def wire_audio(demon):
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
 
-    # Configure audio_out Script CHOP. Conservative.
+    # Configure audio_out Script CHOP.
+    # IMPORTANT: Time Slice = OFF. Time Slice CHOPs cook at frame rate
+    # (60 Hz) producing 1 sample per channel per cook — wrong for audio
+    # output. We want a regular CHOP that produces N samples at 48 kHz
+    # each cook, pulled by the downstream Audio Device Out at its block
+    # rate.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
         except Exception:
             pass
         try:
-            audio_out.par.timeslice = True
+            audio_out.par.timeslice = False
         except Exception:
             pass
         try:
