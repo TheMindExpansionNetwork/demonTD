@@ -75,7 +75,7 @@ if not os.path.isdir(SRC_DIR):
 # params.py / wire.py / etc. TD's Python keeps sys.modules across script
 # runs, so without this we'd use a stale Param dataclass and AttributeError
 # on any newly-added field.
-for _modname in ("params", "wire", "queue_client", "oauth", "audio"):
+for _modname in ("params", "wire", "queue_client", "oauth", "audio", "ws_client"):
     sys.modules.pop(_modname, None)
 
 import params as P  # noqa: E402  pylint: disable=wrong-import-position
@@ -318,7 +318,7 @@ def _add_one_param(demon, page_lookup, p) -> bool:
 # DAT sync
 # -----------------------------------------------------------------------------
 SRC_FILES = ["params.py", "wire.py", "queue_client.py", "oauth.py", "audio.py",
-             "demon_ext.py"]
+             "ws_client.py", "demon_ext.py"]
 
 
 def sync_text_dats(demon):

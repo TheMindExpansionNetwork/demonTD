@@ -40,41 +40,63 @@ import threading
 import time
 from typing import Any
 
-# --- vendored dependency: zstandard --------------------------------------------
-# Bundled wheels live in <comp folder>/vendor/zstandard/<platform>/
-# We prepend the matching platform directory to sys.path before import.
-def _prepend_vendor_path() -> None:
+# --- vendored dependencies -----------------------------------------------------
+# Bundled libs live under <repo>/vendor/.
+#   - zstandard: per-platform wheels for compressed audio slice decompression.
+#   - websocket-client: pure-Python, replaces TD's broken WebSocket DAT.
+def _prepend_vendor_paths() -> None:
     try:
         import platform
         sysname = platform.system().lower()
         machine = platform.machine().lower()
         if sysname == "darwin":
-            plat = "darwin-arm64" if "arm" in machine else "darwin-x64"
+            zstd_plat = "darwin-arm64" if "arm" in machine else "darwin-x64"
         elif sysname == "windows":
-            plat = "win-amd64"
+            zstd_plat = "win-amd64"
         else:
-            return  # other OSes: best-effort, user must install zstandard
+            zstd_plat = None
 
-        # `me` is injected by TD; outside TD this import block is no-op.
+        # Discover the vendor/ directory relative to this file or the COMP's
+        # externaltox path. `me` and `project` are TD globals.
+        base = ""
         try:
             comp = me.owner  # type: ignore[name-defined]  # noqa: F821
             base = comp.par.externaltox.eval() or ""
         except Exception:
-            base = ""
+            pass
         if not base:
-            # Fall back to project folder.
             try:
                 base = project.folder  # type: ignore[name-defined]  # noqa: F821
             except Exception:
                 base = os.getcwd()
-        vendor = os.path.join(os.path.dirname(base) if base.endswith(".tox") else base,
-                              "vendor", "zstandard", plat)
-        if os.path.isdir(vendor) and vendor not in sys.path:
-            sys.path.insert(0, vendor)
+
+        repo_root = os.path.dirname(base) if base.endswith(".tox") else base
+        # Look up the tree for vendor/. Repos check out at e.g. ~/git/demon-td/
+        # but a TD project elsewhere needs us to find the bundled vendor.
+        for candidate in (
+            os.path.join(repo_root, "vendor"),
+            os.path.join(os.path.dirname(repo_root), "vendor"),
+            os.path.join(os.path.dirname(os.path.dirname(repo_root)), "vendor"),
+        ):
+            if os.path.isdir(candidate):
+                vendor_root = candidate
+                break
+        else:
+            return  # no vendor/ found; fall back to user-installed libs
+
+        # zstandard (platform-specific)
+        if zstd_plat:
+            zstd_dir = os.path.join(vendor_root, "zstandard", zstd_plat)
+            if os.path.isdir(zstd_dir) and zstd_dir not in sys.path:
+                sys.path.insert(0, zstd_dir)
+        # websocket-client (pure-Python)
+        wsc_dir = os.path.join(vendor_root, "websocket-client")
+        if os.path.isdir(wsc_dir) and wsc_dir not in sys.path:
+            sys.path.insert(0, wsc_dir)
     except Exception:
         pass
 
-_prepend_vendor_path()
+_prepend_vendor_paths()
 
 try:
     import zstandard as zstd
@@ -101,12 +123,14 @@ try:
     queue_mod = _mod('queue_client')
     oauth = _mod('oauth')
     audio_mod = _mod('audio')
+    ws_client_mod = _mod('ws_client')
 except NameError:
     import params as P  # type: ignore
     import wire  # type: ignore
     import queue_client as queue_mod  # type: ignore
     import oauth  # type: ignore
     import audio as audio_mod  # type: ignore
+    import ws_client as ws_client_mod  # type: ignore
 
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
@@ -153,6 +177,9 @@ class DemonExt:
         self._ring = audio_mod.RingBuffer(channels=2,
                                           max_samples=wire.SAMPLE_RATE * 30)
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
+
+        # WS client (Python thread; replaces TD's broken WebSocket DAT)
+        self._wsc = None  # ws_client_mod.WSClient | None
 
         self.log("DemonExt initialized")
 
@@ -264,15 +291,15 @@ class DemonExt:
     def Disconnect(self) -> None:
         """Close WS + tell queue we're leaving (when in queue mode)."""
         with self._lock:
-            if not self._connected and not self._session_id:
+            if not self._connected and not self._session_id and self._wsc is None:
                 return
             self._set_status("Disconnecting...")
-            try:
-                ws = self._ws()
-                if ws is not None:
-                    ws.par.active = False  # closes the socket
-            except Exception:
-                pass
+            if self._wsc is not None:
+                try:
+                    self._wsc.close()
+                except Exception:
+                    pass
+                self._wsc = None
 
             if self._session_id:
                 base = self._read_par("Serverurl", "http://localhost:1318")
@@ -623,30 +650,22 @@ class DemonExt:
     # -------- WS open + I/O --------------------------------------------------
 
     def _open_ws(self, ws_url: str) -> None:
-        """Resolve source audio first, THEN open the WS.
+        """Open a Python WebSocket to DEMON.
 
-        Critical ordering: source-audio resolution can take several seconds
-        (afconvert decoding MP3 → WAV). The WS opens in ~30 ms. If we open
-        the WS first, onConnect fires before _pending_audio is ready, the
-        flush returns silently, the server times us out, and we reconnect-
-        flap forever.
+        We do NOT use TD's built-in WebSocket DAT — its sendBinary silently
+        fails on payloads above ~few MB. Instead we run a `websocket-client`
+        connection in a background thread (see ws_client.py).
+
+        Resolution order:
+          1. Snapshot init params for the revert-on-mid-session-edit guard.
+          2. Resolve source audio (afconvert may take seconds).
+          3. Stash _pending_* so the on_open callback can flush them.
+          4. Construct WSClient and connect.
         """
-        ws = self._ws()
-        if ws is None:
-            self._set_status("WebSocket DAT 'ws1' not found")
-            return
-
-        host, port = self._parse_ws_url(ws_url)
-        if host is None:
-            self._set_status(f"Bad WS URL: {ws_url}")
-            return
-        self.log(f"_open_ws: target={ws_url}  →  host={host!r} port={port}")
-
         # 1. Snapshot init params for revert-on-mid-session-edit
         self._last_init_values = self._collect_init_params()
 
-        # 2. Resolve source audio NOW (BEFORE opening the socket). Slow but
-        #    necessary — onConnect mustn't fire before _pending_* is set.
+        # 2. Resolve source audio (slow)
         self._set_status("Loading source audio...")
         cfg = self._build_session_config()
         pcm = self._resolve_source_pcm()
@@ -654,13 +673,9 @@ class DemonExt:
             self._set_status(
                 "Set Source Audio File or wire an Audio File In CHOP, then reconnect"
             )
-            try:
-                ws.par.active = False
-            except Exception:
-                pass
             return
 
-        # 3. Stash for onConnect.
+        # 3. Stash for the on_open callback.
         sf = self._read_par("Sourcefile", "")
         if sf:
             source_label = os.path.basename(sf)
@@ -675,34 +690,56 @@ class DemonExt:
         self.log(f"_open_ws: pending {pcm.shape[1]} samples "
                  f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) from {source_label}")
 
-        # 4. Open the WS. netaddress is host-only; port is separate.
-        try:
-            ws.par.active = False
-        except Exception:
-            pass
-        try:
-            ws.par.netaddress = host
-        except Exception as e:
-            self.log(f"_open_ws: set netaddress failed: {e}")
-            self._set_status(f"WS setup failed: {e}")
-            return
-        try:
-            ws.par.port = port
-        except Exception as e:
-            self.log(f"_open_ws: set port failed: {e}")
+        # 4. Close any prior client, build a new one, connect.
+        if self._wsc is not None:
+            try:
+                self._wsc.close()
+            except Exception:
+                pass
+            self._wsc = None
 
         self._set_status(f"Opening {ws_url}...")
         try:
-            run("op('ws1').par.active = True",  # type: ignore[name-defined]  # noqa: F821
-                fromOP=self.ownerComp, delayFrames=2)
-            self.log("_open_ws: scheduled par.active = True (delayFrames=2)")
+            self._wsc = ws_client_mod.WSClient(
+                url=ws_url,
+                on_open=self._on_ws_open,
+                on_text=self._on_ws_text,
+                on_binary=self._on_ws_binary,
+                on_close=self._on_ws_close,
+                log=self.log,
+                timeout=30.0,
+            )
+            self._wsc.connect()
+            self.log(f"_open_ws: WSClient.connect() scheduled (thread starting)")
         except Exception as e:
-            self.log(f"_open_ws: deferred run failed, activating now: {e}")
-            try:
-                ws.par.active = True
-            except Exception as e2:
-                self._set_status(f"WS open failed: {e2}")
-                return
+            self.log(f"_open_ws: WSClient construct/connect failed: {e}")
+            self._set_status(f"WS open failed: {e}")
+            self._wsc = None
+
+    # --- WSClient callbacks (background recv thread) -------------------------
+
+    def _on_ws_open(self) -> None:
+        self.log(f"[ws_client] open — flushing config + audio")
+        self._flush_pending()
+
+    def _on_ws_text(self, msg: str) -> None:
+        try:
+            self.log(f"[ws_client] <- text {len(msg)}B: {msg[:120]!r}")
+            self._on_text(msg)
+        except Exception as e:
+            self.log(f"_on_ws_text error: {e}")
+
+    def _on_ws_binary(self, payload: bytes) -> None:
+        try:
+            self._on_binary(payload)
+        except Exception as e:
+            self.log(f"_on_ws_binary error: {e}")
+
+    def _on_ws_close(self, code, reason) -> None:
+        self.log(f"[ws_client] closed code={code} reason={reason!r}")
+        with self._lock:
+            self._connected = False
+        self._set_status(f"Disconnected ({reason or 'closed'})")
 
     @staticmethod
     def _parse_ws_url(url: str) -> tuple[str | None, int]:
@@ -1206,68 +1243,22 @@ class DemonExt:
     # -------- helpers --------------------------------------------------------
 
     def _send_text(self, payload: str) -> None:
-        ws = self._ws()
-        if ws is None:
-            self.log("_send_text: no ws DAT")
+        """Send a text frame via the Python WS client."""
+        wsc = self._wsc
+        if wsc is None:
+            self.log("_send_text: no WS client")
             return
-        # Probe state — useful for diagnosing "sent but server got nothing"
-        try:
-            connected = getattr(ws, "connected", None)
-            if connected is False:
-                self.log(f"_send_text: WS not connected (ws.connected={connected!r}); "
-                         f"send anyway")
-        except Exception:
-            pass
-        for method_name in ("sendText", "send"):
-            method = getattr(ws, method_name, None)
-            if method is None:
-                continue
-            try:
-                method(payload)
-                self.log(f"_send_text: ws.{method_name}({len(payload)} chars) ok")
-                return
-            except Exception as e:
-                self.log(f"_send_text: ws.{method_name} failed: {e}")
-        self.log("no working text-send method on WebSocket DAT")
+        ok = wsc.send_text(payload)
+        self.log(f"_send_text: {len(payload)} chars {'ok' if ok else 'FAILED'}")
 
     def _send_bytes(self, payload: bytes) -> None:
-        """Send a binary frame on the WebSocket DAT.
-
-        TD versions differ on the method name across releases:
-          - TD 2023+ : ws.sendBinary(bytes)
-          - older    : ws.sendBytes(bytes)
-          - some     : ws.send(bytes, asBinary=True)
-        """
-        ws = self._ws()
-        if ws is None:
-            self.log("_send_bytes: no ws DAT")
+        """Send a binary frame via the Python WS client."""
+        wsc = self._wsc
+        if wsc is None:
+            self.log("_send_bytes: no WS client")
             return
-        try:
-            connected = getattr(ws, "connected", None)
-            if connected is False:
-                self.log(f"_send_bytes: WS not connected (ws.connected={connected!r}); "
-                         f"send anyway")
-        except Exception:
-            pass
-        for method_name in ("sendBinary", "sendBytes"):
-            method = getattr(ws, method_name, None)
-            if method is None:
-                continue
-            try:
-                method(payload)
-                self.log(f"_send_bytes: ws.{method_name}({len(payload)} B) ok")
-                return
-            except Exception as e:
-                self.log(f"_send_bytes: ws.{method_name} failed: {e}")
-        send = getattr(ws, "send", None)
-        if send is not None:
-            try:
-                send(payload, asBinary=True)
-                self.log(f"_send_bytes: ws.send(binary, {len(payload)} B) ok")
-                return
-            except Exception as e:
-                self.log(f"_send_bytes: ws.send(binary) failed: {e}")
-        self.log("no working binary-send method on WebSocket DAT")
+        ok = wsc.send_binary(payload)
+        self.log(f"_send_bytes: {len(payload)} B {'ok' if ok else 'FAILED'}")
 
     def _snapshot_audio(self, chop) -> np.ndarray | None:
         """Grab the current samples from a CHOP (param-reference, op-path, or
