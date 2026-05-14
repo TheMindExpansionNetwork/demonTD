@@ -623,14 +623,13 @@ class DemonExt:
     # -------- WS open + I/O --------------------------------------------------
 
     def _open_ws(self, ws_url: str) -> None:
-        """Open the WS DAT against ws_url.
+        """Resolve source audio first, THEN open the WS.
 
-        TD's WebSocket DAT splits the target into `netaddress` (host only,
-        no scheme, no port, no path) and `port` (separate par). There is
-        no openConnection() / close() — only par.active = True/False.
-
-        We schedule the active-toggle on a short delay so TD has a chance
-        to apply netaddress/port writes before reconnecting.
+        Critical ordering: source-audio resolution can take several seconds
+        (afconvert decoding MP3 → WAV). The WS opens in ~30 ms. If we open
+        the WS first, onConnect fires before _pending_audio is ready, the
+        flush returns silently, the server times us out, and we reconnect-
+        flap forever.
         """
         ws = self._ws()
         if ws is None:
@@ -643,13 +642,44 @@ class DemonExt:
             return
         self.log(f"_open_ws: target={ws_url}  →  host={host!r} port={port}")
 
-        # Phase 1: deactivate (synchronous, fast).
+        # 1. Snapshot init params for revert-on-mid-session-edit
+        self._last_init_values = self._collect_init_params()
+
+        # 2. Resolve source audio NOW (BEFORE opening the socket). Slow but
+        #    necessary — onConnect mustn't fire before _pending_* is set.
+        self._set_status("Loading source audio...")
+        cfg = self._build_session_config()
+        pcm = self._resolve_source_pcm()
+        if pcm is None:
+            self._set_status(
+                "Set Source Audio File or wire an Audio File In CHOP, then reconnect"
+            )
+            try:
+                ws.par.active = False
+            except Exception:
+                pass
+            return
+
+        # 3. Stash for onConnect.
+        sf = self._read_par("Sourcefile", "")
+        if sf:
+            source_label = os.path.basename(sf)
+        else:
+            wired = self._wired_chop_file_path()
+            source_label = (f"wired CHOP file: {os.path.basename(wired)}"
+                            if wired else "wired CHOP snapshot")
+        self._pending_config = wire.encode_config(cfg)
+        self._pending_audio = wire.encode_audio_frame(pcm, channels=2)
+        self._pending_source_label = source_label
+        self._pending_audio_samples = pcm.shape[1]
+        self.log(f"_open_ws: pending {pcm.shape[1]} samples "
+                 f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) from {source_label}")
+
+        # 4. Open the WS. netaddress is host-only; port is separate.
         try:
             ws.par.active = False
-        except Exception as e:
-            self.log(f"_open_ws: deactivate failed: {e}")
-
-        # Phase 2: rewrite address.
+        except Exception:
+            pass
         try:
             ws.par.netaddress = host
         except Exception as e:
@@ -660,22 +690,17 @@ class DemonExt:
             ws.par.port = port
         except Exception as e:
             self.log(f"_open_ws: set port failed: {e}")
-            # netaddress might also encode port in some TD versions; carry on
 
-        # Phase 3: defer the activate so TD processes the par writes first.
-        # `run` schedules a Python string for execution on the main thread
-        # after `delayFrames` frames (1 frame ~= 16ms at 60fps).
+        self._set_status(f"Opening {ws_url}...")
         try:
             run("op('ws1').par.active = True",  # type: ignore[name-defined]  # noqa: F821
                 fromOP=self.ownerComp, delayFrames=2)
             self.log("_open_ws: scheduled par.active = True (delayFrames=2)")
         except Exception as e:
-            # Fallback: immediate activate
-            self.log(f"_open_ws: deferred run failed, activating immediately: {e}")
+            self.log(f"_open_ws: deferred run failed, activating now: {e}")
             try:
                 ws.par.active = True
             except Exception as e2:
-                self.log(f"_open_ws: par.active=True failed: {e2}")
                 self._set_status(f"WS open failed: {e2}")
                 return
 
@@ -691,57 +716,6 @@ class DemonExt:
             return u.hostname, u.port or default_port
         except Exception:
             return None, 0
-
-        # Snapshot init params for revert-on-mid-session-edit
-        self._last_init_values = self._collect_init_params()
-
-        # Resolve the source audio NOW (so we know it's valid) and stash it
-        # along with the config. We fire both only when OnWsConnect arrives.
-        cfg = self._build_session_config()
-        pcm = self._resolve_source_pcm()
-        source_label = "(unknown)"
-        if pcm is None:
-            self._set_status(
-                "Set Source Audio File or wire an Audio File In CHOP, then reconnect"
-            )
-            for op_name in ("close", "disconnect"):
-                fn = getattr(ws, op_name, None)
-                if callable(fn):
-                    try:
-                        fn()
-                    except Exception:
-                        pass
-            try:
-                ws.par.active = False
-            except Exception:
-                pass
-            return
-
-        # Cheap label heuristic — what did we end up using?
-        sf = self._read_par("Sourcefile", "")
-        if sf:
-            source_label = os.path.basename(sf)
-        else:
-            wired = self._wired_chop_file_path()
-            if wired:
-                source_label = f"wired CHOP file: {os.path.basename(wired)}"
-            else:
-                source_label = "wired CHOP snapshot"
-
-        self._pending_config = wire.encode_config(cfg)
-        self._pending_audio = wire.encode_audio_frame(pcm, channels=2)
-        self._pending_source_label = source_label
-        self._pending_audio_samples = pcm.shape[1]
-
-        # If TD already reports the WS as open right now, send immediately
-        # (some TD versions never fire onConnect for fast-completing connects).
-        try:
-            already_open = getattr(ws, "connected", None) is True
-        except Exception:
-            already_open = False
-        if already_open:
-            self.log("_open_ws: WS already reports connected; flushing pending now")
-            self._flush_pending()
 
     def OnWsConnect(self, dat) -> None:
         """Called by the callbacks DAT's onConnect. We held back the config
