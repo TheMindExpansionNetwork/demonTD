@@ -266,15 +266,29 @@ def sync_text_dats(demon):
             dat = demon.create(textDAT, dat_name)
         abs_path = os.path.join(SRC_DIR, fname)
         try:
-            with open(abs_path, "r", encoding="utf-8") as fh:
-                dat.text = fh.read()
+            # utf-8-sig strips a leading BOM if present. TD's tokenizer
+            # rejects U+FEFF, and some editors / IDE auto-saves add one.
+            with open(abs_path, "r", encoding="utf-8-sig") as fh:
+                text = fh.read()
+            # Defensive: also strip any in-text BOMs from accidental
+            # multi-encode passes.
+            if text.startswith("﻿"):
+                text = text.lstrip("﻿")
+            dat.text = text
+            print(f"[build_tox]   loaded {fname} ({len(text)} chars)")
         except Exception as e:
             print(f"!! could not read {abs_path}: {e}")
             continue
         try:
             dat.par.file = abs_path
-            dat.par.syncfile = True
+            # Important: keep one-way (file -> DAT) load only.
+            # Bidirectional sync re-writes the .py file from the DAT every
+            # cook, which can round-trip BOMs or other in-memory artifacts
+            # back to disk. Build-time scripts edit src/ on disk; we want
+            # TD to read those changes, not overwrite them.
+            dat.par.syncfile = False
             dat.par.loadonstart = True
+            dat.par.writepulse.pulse() if hasattr(dat.par, "writepulse") else None
         except Exception as e:
             print(f"!! sync flags on {fname}: {e}")
 

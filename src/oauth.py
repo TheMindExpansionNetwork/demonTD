@@ -1,4 +1,4 @@
-﻿"""
+"""
 Daydream OAuth flow for the DEMON TouchDesigner operator.
 
 Mirrors demon-public-demo/lib/auth/daydream.ts:

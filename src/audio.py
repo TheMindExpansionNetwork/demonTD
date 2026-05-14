@@ -1,4 +1,4 @@
-﻿"""
+"""
 Audio I/O helpers for the DEMON TouchDesigner operator.
 
 - Thread-safe ring buffer for decoded server audio (WS receive thread writes,

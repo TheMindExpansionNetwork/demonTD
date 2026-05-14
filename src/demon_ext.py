@@ -1,4 +1,4 @@
-﻿"""
+"""
 DemonExt — the TouchDesigner extension class for the DEMON operator.
 
 This module is loaded inside TD as the Extension of a Base COMP. It owns
