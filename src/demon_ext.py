@@ -322,34 +322,75 @@ class DemonExt:
         return url
 
     def Disconnect(self) -> None:
-        """Close WS + tell queue we're leaving (when in queue mode)."""
+        """Close the WS cleanly (status 1000) and free the server-side session.
+
+        Sends a proper WebSocket close frame so DEMON's handle_client returns
+        promptly and frees its GPU memory. Without this the server's session
+        lingers until the TCP connection times out (~30s+), and rapid
+        reconnects pile up sessions and OOM the GPU.
+        """
         with self._lock:
             if not self._connected and not self._session_id and self._wsc is None:
                 return
             self._set_status("Disconnecting...")
-            if self._wsc is not None:
-                try:
-                    self._wsc.close()
-                except Exception:
-                    pass
-                self._wsc = None
-
-            if self._session_id:
-                base = self._read_par("Serverurl", "http://localhost:1318")
-                try:
-                    queue_mod.QueueClient(base, api_key=self._api_key or None).leave(
-                        self._session_id
-                    )
-                except queue_mod.QueueError:
-                    pass
-
+            wsc = self._wsc
+            self._wsc = None
+            session_id = self._session_id
             self._connected = False
             self._session_id = None
             self._ws_url = None
             self._expires_at_ms = None
             self._dirty.clear()
             self._ring.clear()
-            self._set_status("Idle")
+
+        # Outside the lock: blocking I/O.
+        if wsc is not None:
+            try:
+                # status=1000 is "normal closure" — tells DEMON's websockets
+                # lib we're done and to clean up the session.
+                wsc.close(code=1000, reason="client disconnect")
+                self.log("Disconnect: WS closed cleanly")
+            except Exception as e:
+                self.log(f"Disconnect: close failed: {e}")
+
+        if session_id:
+            base = self._read_par("Serverurl", "http://localhost:1318")
+            try:
+                queue_mod.QueueClient(base, api_key=self._api_key or None).leave(
+                    session_id
+                )
+            except queue_mod.QueueError:
+                pass
+
+        self._set_status("Idle")
+
+    # --- TD lifecycle hooks ---------------------------------------------------
+
+    def Cleanup(self) -> None:
+        """Called when the COMP is deleted or the project is closing.
+
+        Forces a Disconnect so the GPU session on DEMON is freed. Safe to
+        call from multiple paths (TD project exit, COMP delete, __del__).
+        """
+        try:
+            self.log("Cleanup: tearing down session")
+        except Exception:
+            pass
+        try:
+            self.Disconnect()
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Best-effort: when the extension instance is garbage-collected, send
+        # a close frame. Python doesn't guarantee __del__ runs in interpreter
+        # shutdown but TD's typical COMP-delete path should hit it.
+        try:
+            wsc = getattr(self, "_wsc", None)
+            if wsc is not None:
+                wsc.close(code=1000, reason="extension teardown")
+        except Exception:
+            pass
 
     # -------- auth -----------------------------------------------------------
 

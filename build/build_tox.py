@@ -434,6 +434,19 @@ def wire_extension(demon):
             demon.par.reinitextensions.pulse()
         except Exception:
             pass
+
+        # Wire the COMP-level Cleanup script. TD calls this when the COMP
+        # is deleted (or the project shuts down), and it's our hook to
+        # force-close the WS so DEMON frees its GPU session immediately.
+        # If this fails, project.onExit (frame_exec) is the backup.
+        for cleanup_par in ("cleanupdat", "cleanupscript"):
+            try:
+                setattr(demon.par, cleanup_par,
+                        "op('./demon_ext').module.DemonExt.Cleanup(parent().ext.DemonExt)")
+                break
+            except Exception:
+                pass
+
         # Verify
         try:
             ext_inst = demon.ext.DemonExt
@@ -653,7 +666,14 @@ def onPreSave(): pass
 def onPostSave(): pass
 def onStart(): pass
 def onCreate(): pass
-def onExit(): pass
+
+def onExit():
+    # Project shutdown — force a clean WS close so the DEMON pod frees
+    # its GPU session immediately instead of waiting for TCP timeout.
+    try:
+        parent().ext.DemonExt.Cleanup()
+    except Exception as e:
+        print(f"[frame_exec onExit] cleanup failed: {e}")
 '''
 
 
