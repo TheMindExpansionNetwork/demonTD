@@ -1,4 +1,4 @@
-"""
+﻿"""
 Declarative parameter schema for the DEMON TouchDesigner operator.
 
 This is the SOURCE OF TRUTH. The build script (build/build_tox.py)

@@ -1,4 +1,4 @@
-"""
+﻿"""
 DEMON queue API client.
 
 Pure HTTP, no TouchDesigner dependencies — uses stdlib urllib so it runs in

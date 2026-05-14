@@ -1,4 +1,4 @@
-"""
+﻿"""
 DEMON WebSocket wire protocol — encoders and decoders.
 
 Pure functions, no TouchDesigner dependencies. Fully unit-testable.

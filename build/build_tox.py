@@ -283,23 +283,73 @@ def wire_extension(demon):
     """Point the COMP's extension at the demon_ext Text DAT.
 
     For the .module property to resolve, the DAT must contain valid Python
-    AT THE TIME the extension expression is evaluated. sync_text_dats() now
-    writes the text directly, so by the time we get here the DAT is ready.
+    AT THE TIME the extension expression is evaluated. We verify the
+    sibling module loads cleanly before wiring it as an extension —
+    that way `.module is None` errors surface here as a clear traceback
+    rather than as a mystery NoneType later.
     """
+    # ---- diagnostic: can we load demon_ext as a module right now? ----
+    demon_ext_dat = demon.op("demon_ext")
+    if demon_ext_dat is None:
+        print("!! demon_ext DAT not found inside the COMP")
+        return
+    text_len = len(demon_ext_dat.text or "")
+    print(f"[build_tox]   demon_ext DAT: {text_len} bytes of text")
+
     try:
-        # Reinit any previous extension first to avoid stale-NoneType.
+        m = demon_ext_dat.module
+    except Exception as e:
+        print(f"!! demon_ext.module raised: {type(e).__name__}: {e}")
+        m = None
+
+    if m is None:
+        print("!! demon_ext.module is None — the DAT failed to compile.")
+        print("   Likely cause: sibling-module import inside demon_ext.py "
+              "couldn't resolve. Check that params/wire/queue_client/oauth/"
+              "audio Text DATs all exist and have text.")
+        for sibling in ("params", "wire", "queue_client", "oauth", "audio"):
+            d = demon.op(sibling)
+            if d is None:
+                print(f"     !! sibling '{sibling}' is missing!")
+            else:
+                blen = len(d.text or "")
+                try:
+                    sm = d.module
+                except Exception as e:
+                    sm = None
+                    print(f"     !! sibling '{sibling}' ({blen}B): .module raised {type(e).__name__}: {e}")
+                if sm is not None:
+                    print(f"     ok '{sibling}' ({blen}B) -> module {sm.__name__}")
+                elif d is not None:
+                    print(f"     !! sibling '{sibling}' ({blen}B): .module is None")
+        # Don't wire the extension if it's known broken — leave it unwired
+        # so the COMP still saves and the user can manually fix.
+        return
+
+    if not hasattr(m, "DemonExt"):
+        print(f"!! demon_ext.module loaded but has no DemonExt class. "
+              f"Module dir: {sorted(d for d in dir(m) if not d.startswith('_'))}")
+        return
+
+    # ---- wire it ----
+    try:
         try:
             demon.par.extension1 = ""
         except Exception:
             pass
         demon.par.extname1 = "DemonExt"
-        demon.par.extension1 = "op('demon_ext').module.DemonExt(me)"
+        demon.par.extension1 = "op('./demon_ext').module.DemonExt(me)"
         demon.par.promoteextension1 = True
-        # Force the extension to re-resolve on this frame.
         try:
             demon.par.reinitextensions.pulse()
         except Exception:
             pass
+        # Verify
+        try:
+            ext_inst = demon.ext.DemonExt
+            print(f"[build_tox]   extension wired: {type(ext_inst).__name__}")
+        except Exception as e:
+            print(f"!! extension verify failed: {type(e).__name__}: {e}")
     except Exception as e:
         print(f"!! extension wire failed: {e}")
 
