@@ -221,21 +221,41 @@ class DemonExt:
         try:
             ao = ownerComp.op("audio_out")
             if ao is not None:
-                self.log("=== AUDIO_OUT PARS ===")
-                for p in ao.pars():
-                    try:
-                        v = p.eval()
-                        if isinstance(v, (int, float, bool, str)) or v is None:
-                            self.log(f"  {p.name} = {v!r}")
-                    except Exception:
-                        pass
+                self.log("=== AUDIO_OUT PARS (all pages) ===")
+                for page in ao.pages:
+                    self.log(f"  -- page: {page.name} --")
+                    for p in page.pars:
+                        try:
+                            v = p.eval()
+                            if isinstance(v, (int, float, bool, str)) or v is None:
+                                self.log(f"    {p.name} = {v!r}")
+                        except Exception:
+                            pass
                 try:
                     self.log(f"=== AUDIO_OUT STATE: chans={ao.numChans} "
                              f"samples={ao.numSamples} rate={ao.rate} ===")
                 except Exception:
                     pass
+                # Also dump out_chop (the CHOP between audio_out and the COMP output)
+                oc = ownerComp.op("out_chop")
+                if oc is not None:
+                    self.log("=== OUT_CHOP PARS (all pages) ===")
+                    for page in oc.pages:
+                        self.log(f"  -- page: {page.name} --")
+                        for p in page.pars:
+                            try:
+                                v = p.eval()
+                                if isinstance(v, (int, float, bool, str)) or v is None:
+                                    self.log(f"    {p.name} = {v!r}")
+                            except Exception:
+                                pass
+                    try:
+                        self.log(f"=== OUT_CHOP STATE: chans={oc.numChans} "
+                                 f"samples={oc.numSamples} rate={oc.rate} ===")
+                    except Exception:
+                        pass
         except Exception as e:
-            self.log(f"audio_out par dump failed: {e}")
+            self.log(f"par dump failed: {e}")
 
     # -------- properties (public read-only) ----------------------------------
 
