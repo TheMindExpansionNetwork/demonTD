@@ -597,10 +597,28 @@ class DemonExt:
         self._send_text(wire.encode_config(cfg))
 
         # Send source audio frame (REQUIRED). Loaded from the Source File par.
+        # Resolve the source audio. Two paths, in order:
+        #   1. `Source Audio File` par — explicit file path.
+        #   2. Wired-in CHOP — if an Audio File In (or any CHOP with samples)
+        #      is plugged into demon's input port, snapshot its current
+        #      buffer. This is a one-shot read at Connect, not a continuous
+        #      stream.
         source_path = self._read_par("Sourcefile", "") or ""
-        pcm = self._load_source_wav(source_path)
+        pcm = None
+        source_label = ""
+        if source_path:
+            pcm = self._load_source_wav(source_path)
+            source_label = os.path.basename(source_path)
+
         if pcm is None:
-            self._set_status("Pick a Source Audio File (.wav) and reconnect")
+            pcm = self._snapshot_input_chop()
+            if pcm is not None:
+                source_label = "wired CHOP input"
+
+        if pcm is None:
+            self._set_status(
+                "Set Source Audio File or wire an Audio File In CHOP, then reconnect"
+            )
             try:
                 ws.par.active = False
             except Exception:
@@ -612,7 +630,44 @@ class DemonExt:
         self._connected = True
         self._set_status("Connected")
         self.log(f"sent {pcm.shape[1]} samples ({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) "
-                 f"from {os.path.basename(source_path)}")
+                 f"from {source_label}")
+
+    def _snapshot_input_chop(self) -> "np.ndarray | None":
+        """Snapshot the COMP's wired CHOP input as (2, samples) float32 at 48k.
+
+        Reads from the `audio_in` In CHOP (the COMP's CHOP input port). If
+        nothing is wired, or the upstream produces zero samples, returns None.
+
+        This is a one-shot snapshot at Connect time — not continuous streaming.
+        """
+        try:
+            src = self.ownerComp.op("audio_in")
+        except Exception:
+            return None
+        if src is None:
+            return None
+        try:
+            n = int(src.numSamples)
+            ch_count = int(src.numChans)
+        except Exception:
+            return None
+        if n <= 0 or ch_count <= 0:
+            return None
+        try:
+            ch_count = min(2, ch_count)
+            pcm = np.empty((ch_count, n), dtype=np.float32)
+            for i in range(ch_count):
+                pcm[i] = np.fromiter(src[i].vals, dtype=np.float32, count=n)
+            try:
+                src_rate = int(src.rate) if src.rate else wire.SAMPLE_RATE
+            except Exception:
+                src_rate = wire.SAMPLE_RATE
+            if src_rate != wire.SAMPLE_RATE:
+                pcm = audio_mod.linear_resample(pcm, src_rate, wire.SAMPLE_RATE)
+            return audio_mod.to_stereo(pcm).astype(np.float32, copy=False)
+        except Exception as e:
+            self.log(f"_snapshot_input_chop failed: {e}")
+            return None
 
     def _load_source_wav(self, path: str) -> "np.ndarray | None":
         """Load a WAV file off disk → (2, samples) float32 at 48 kHz.
