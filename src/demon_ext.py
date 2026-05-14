@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -202,6 +203,16 @@ class DemonExt:
 
         # WS client (Python thread; replaces TD's broken WebSocket DAT)
         self._wsc = None  # ws_client_mod.WSClient | None
+
+        # Inbound message queue — populated by the WS recv thread, drained
+        # on the main TD thread (OnTick / 8 ms timer). TD forbids touching
+        # any operator from a non-main thread, so we MUST marshal here.
+        self._inbound: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+        # Protocol state: after server sends `ready`, the FIRST binary
+        # message is the raw float16 initial buffer (NO 23-byte header).
+        # Subsequent binaries are slices. We flip this on `ready`.
+        self._expecting_initial_buffer: bool = False
 
         self.log("DemonExt initialized")
 
@@ -592,11 +603,18 @@ class DemonExt:
                 self._dirty[schema.wire_name] = value
 
     def OnTick(self) -> None:
-        """Called by tick8ms Timer CHOP every ~8ms.
+        """Called by tick8ms Timer CHOP every ~8ms (MAIN THREAD).
 
-        Flushes any pending continuous-param changes as a single batch message.
-        Also advances the local playback position estimate.
+        Two jobs:
+          1. Drain the WS recv thread's inbound message queue (so server
+             messages can safely touch TD operators).
+          2. Flush pending continuous-param changes as a single batched
+             {type:"params"} message.
         """
+        # 1. Drain inbound from WS thread FIRST so connect/open/text events
+        #    process before any param sends try to use the connection.
+        self._drain_inbound()
+
         if not self._connected:
             return
 
@@ -739,29 +757,50 @@ class DemonExt:
             self._wsc = None
 
     # --- WSClient callbacks (background recv thread) -------------------------
+    #
+    # CRITICAL: these run on the websocket-client recv thread. TD forbids
+    # touching any operator from a non-main thread (raises a modal dialog,
+    # may even crash). All we do here is enqueue the event. The main thread
+    # drains the queue from OnTick().
 
     def _on_ws_open(self) -> None:
-        self.log(f"[ws_client] open — flushing config + audio")
-        self._flush_pending()
+        self._inbound.put(("open", None))
 
     def _on_ws_text(self, msg: str) -> None:
-        try:
-            self.log(f"[ws_client] <- text {len(msg)}B: {msg[:120]!r}")
-            self._on_text(msg)
-        except Exception as e:
-            self.log(f"_on_ws_text error: {e}")
+        self._inbound.put(("text", msg))
 
     def _on_ws_binary(self, payload: bytes) -> None:
-        try:
-            self._on_binary(payload)
-        except Exception as e:
-            self.log(f"_on_ws_binary error: {e}")
+        self._inbound.put(("binary", payload))
 
     def _on_ws_close(self, code, reason) -> None:
-        self.log(f"[ws_client] closed code={code} reason={reason!r}")
-        with self._lock:
-            self._connected = False
-        self._set_status(f"Disconnected ({reason or 'closed'})")
+        self._inbound.put(("close", (code, reason)))
+
+    def _drain_inbound(self) -> None:
+        """Main-thread drain of WS events. Called from OnTick (Timer CHOP)."""
+        # Limit how many we process per tick so a slice flood can't stall
+        # the cook for seconds. The queue persists, leftovers next tick.
+        max_per_tick = 64
+        for _ in range(max_per_tick):
+            try:
+                kind, payload = self._inbound.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if kind == "open":
+                    self.log("[ws_client] open — flushing config + audio")
+                    self._flush_pending()
+                elif kind == "text":
+                    self.log(f"[ws_client] <- text {len(payload)}B: {payload[:120]!r}")
+                    self._on_text(payload)
+                elif kind == "binary":
+                    self._on_binary(payload)
+                elif kind == "close":
+                    code, reason = payload
+                    self.log(f"[ws_client] closed code={code} reason={reason!r}")
+                    self._connected = False
+                    self._set_status(f"Disconnected ({reason or 'closed'})")
+            except Exception as e:
+                self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
     @staticmethod
     def _parse_ws_url(url: str) -> tuple[str | None, int]:
@@ -1133,6 +1172,11 @@ class DemonExt:
         kind = data.get("type", "")
         if kind == "ready":
             self.log(f"server ready: ch={data.get('channels')} sr={data.get('sample_rate')}")
+            # The very next binary frame is the initial buffer (raw float16
+            # PCM with NO header — NOT slice format). Flag it so _on_binary
+            # decodes accordingly.
+            self._expecting_initial_buffer = True
+            self._ready_channels = int(data.get("channels", 2)) or 2
             cat = data.get("lora_catalog") or []
             self._apply_lora_catalog(cat)
         elif kind == "lora_catalog":
@@ -1145,6 +1189,9 @@ class DemonExt:
         elif kind == "swap_ready":
             self._epoch += 1
             self._ring.clear()
+            # Next binary is again the raw float16 initial buffer for the new track.
+            self._expecting_initial_buffer = True
+            self._ready_channels = int(data.get("channels", 2)) or 2
             self.log(f"swap_ready ch={data.get('channels')}")
         elif kind in ("timbre_set", "timbre_cleared", "structure_set",
                       "structure_cleared"):
@@ -1156,13 +1203,36 @@ class DemonExt:
             self.log(f"unknown server message: {kind}")
 
     def _on_binary(self, buf: bytes) -> None:
+        # The first binary frame after `ready` (or `swap_ready`) is the
+        # raw float16 initial buffer — interleaved PCM, no 23-byte slice
+        # header. Subsequent frames are slices.
+        if self._expecting_initial_buffer:
+            self._expecting_initial_buffer = False
+            ch = getattr(self, "_ready_channels", 2) or 2
+            try:
+                u16 = np.frombuffer(bytes(buf), dtype=np.uint16)
+                pcm = u16.view(np.float16).astype(np.float32)
+                n = pcm.size // ch
+                if n <= 0:
+                    self.log(f"initial buffer: empty")
+                    return
+                interleaved = pcm[: n * ch].reshape(n, ch).T
+                self._ring.write(interleaved)
+                self.log(
+                    f"initial buffer: {n} samples ({n / wire.SAMPLE_RATE:.2f}s) "
+                    f"ch={ch}"
+                )
+            except Exception as e:
+                self.log(f"initial buffer decode failed: {e}")
+            return
+
+        # Streaming slice (23-byte header + raw/zstd float16)
         try:
             slice_ = wire.decode_slice(buf, zstd_dec=_ZSTD_DEC)
         except Exception as e:
-            self.log(f"Bad slice: {e}")
+            self.log(f"Bad slice ({len(buf)}B, flags=0x{buf[0]:02x}): {e}")
             return
 
-        # Reshape interleaved float32 -> (channels, samples_per_channel)
         ch = max(1, slice_.channels)
         n = slice_.pcm.size // ch
         if n <= 0:
