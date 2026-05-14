@@ -712,15 +712,42 @@ def wire_audio(demon):
         except Exception:
             pass
         # Time Slice on — TD pulls a block per audio cycle from downstream.
-        for parname in ("timeslice", "timeslicemode"):
+        # Try each known par name variant.
+        timeslice_set = False
+        for parname in ("timeslice", "timeslicemode", "Timeslice"):
             try:
                 setattr(audio_out.par, parname, True)
+                timeslice_set = True
                 break
             except Exception:
+                continue
+        if not timeslice_set:
+            print("[build_tox] !! could not enable Time Slice on audio_out")
+        # Force the Script CHOP to cook at audio rate.
+        for pname, val in (
+            ("rate", 48000),
+            ("samplerate", 48000),
+            ("ext", "Sample"),  # tell it samples are time-based
+        ):
+            try:
+                setattr(audio_out.par, pname, val)
+            except Exception:
                 pass
-        # 2-channel default; the cook callback will set the actual sample count.
+        # 2-channel default.
         try:
             audio_out.par.channelnames = "chan1 chan2"
+        except Exception:
+            pass
+        # Dump par state for diagnosis
+        try:
+            print("[build_tox]   audio_out pars:")
+            for pn in ("timeslice", "rate", "ext", "channelnames", "callbacks"):
+                par = getattr(audio_out.par, pn, None)
+                if par is not None:
+                    try:
+                        print(f"     {pn} = {par.eval()!r}")
+                    except Exception:
+                        pass
         except Exception:
             pass
 

@@ -619,6 +619,17 @@ class DemonExt:
         #    process before any param sends try to use the connection.
         self._drain_inbound()
 
+        # Periodic ring-buffer telemetry so we can see audio flowing in.
+        # Logs at most every ~2 s once connected.
+        if self._connected:
+            now = time.time()
+            last = getattr(self, "_last_buf_log", 0.0)
+            if now - last > 2.0:
+                self._last_buf_log = now
+                buffered = self._ring.available
+                buf_s = buffered / wire.SAMPLE_RATE
+                self.log(f"buffered={buffered} samples ({buf_s:.2f}s)")
+
         if not self._connected:
             return
 
@@ -1314,6 +1325,11 @@ class DemonExt:
         # Dynamically add Toggle + Float par per LoRA on the Prompt+LoRA page.
         # Par names must be TD-legal: start uppercase, only lowercase/digits
         # afterwards, no underscores, no trailing digit. Use _lora_par_safe.
+        #
+        # NOTE: appendToggle/appendFloat return a ParGroup whose truthiness
+        # is unsupported in TD — must check `is not None` not `if tp:`.
+        DEFAULT_ON = {"bach"}  # LoRAs to enable by default
+
         try:
             page = self._page_by_name("Prompt+LoRA")
             if page is None:
@@ -1328,37 +1344,62 @@ class DemonExt:
                 safe = self._lora_par_safe(lid)
                 toggle_name = f"Loraenable{safe}"
                 strength_name = f"Lorastr{safe}"
+                default_on = lid in DEFAULT_ON
+
                 if toggle_name not in existing:
                     try:
                         tp = page.appendToggle(
                             toggle_name,
                             label=f"{entry.get('name', lid)} on"
                         )
-                        if tp:
-                            tp[0].default = False
+                        if tp is not None:
+                            try:
+                                tp[0].default = default_on
+                                tp[0].val = default_on
+                            except Exception:
+                                pass
                         n_added += 1
                     except Exception as e:
-                        self.log(f"LoRA toggle {toggle_name} failed: {e}")
+                        self.log(f"LoRA toggle {toggle_name} failed: "
+                                 f"{type(e).__name__}: {e}")
+
                 if strength_name not in existing:
                     try:
                         sp = page.appendFloat(
                             strength_name,
                             label=f"{entry.get('name', lid)} strength"
                         )
-                        if sp:
-                            sp[0].normMin = 0.0
-                            sp[0].normMax = 1.8
+                        if sp is not None:
                             try:
-                                sp[0].default = float(entry.get("strength", 1.0))
+                                sp[0].normMin = 0.0
+                                sp[0].normMax = 1.8
+                                sp[0].clampMin = True
+                                sp[0].clampMax = True
+                                default_strength = float(entry.get("strength", 1.0))
+                                sp[0].default = default_strength
+                                sp[0].val = default_strength
                             except Exception:
                                 pass
-                            sp[0].clampMin = True
-                            sp[0].clampMax = True
                         n_added += 1
                     except Exception as e:
-                        self.log(f"LoRA float {strength_name} failed: {e}")
+                        self.log(f"LoRA float {strength_name} failed: "
+                                 f"{type(e).__name__}: {e}")
             self.log(f"LoRA page: added {n_added} pars for "
                      f"{len(catalog)} LoRAs")
+
+            # If any default-on LoRAs were just added (or already enabled),
+            # tell the server to load them now via the discrete enable_lora
+            # message. This means newcomers actually HEAR a LoRA after
+            # Connect without having to toggle anything.
+            for entry in catalog:
+                lid = entry.get("id", "")
+                if lid in DEFAULT_ON:
+                    strength = float(entry.get("strength", 1.0))
+                    try:
+                        self._send_text(wire.encode_enable_lora(lid, strength))
+                        self.log(f"auto-enabled LoRA {lid} (strength {strength})")
+                    except Exception as e:
+                        self.log(f"auto-enable {lid} failed: {e}")
         except Exception as e:
             self.log(f"LoRA page update failed: {type(e).__name__}: {e}")
 
