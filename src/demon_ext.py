@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "wave-clock-v1"
+BUILD_MARKER = "frame-pump-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1683,10 +1683,10 @@ class DemonExt:
     def OnCookRecv(self, scriptOp) -> None:
         """audio_out Script CHOP cook callback. Reads from ring buffer.
 
-        Time Slice is ON. TD sets scriptOp.numSamples to the audio block
-        size (samples per channel for this cook). Audio Device Out pulls
-        from us at audio rate; each cook produces exactly the requested
-        block.
+        FRAME-PUMP mode (Time Slice = False):
+          - Called from frame_exec onFrameStart at frame rate (~60 Hz).
+          - We produce a frame-sized block of samples each cook.
+          - 60 cooks/sec × 800 samples = 48000 samples/sec = audio rate.
         """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
         if self._n_cook_recv == 1:
@@ -1696,14 +1696,21 @@ class DemonExt:
             except Exception:
                 pass
 
-        # Time Slice mode: TD tells us how many samples to produce.
-        n = 0
+        # Frame-pump: produce one frame's worth of samples per cook.
+        # At 60fps the math is 48000/60 = 800 samples; we round up slightly
+        # to give us a tiny cushion against jitter in frame timing.
+        # If TD reports a numSamples > our default (e.g. an audio-rate
+        # consumer IS pulling), honor that.
         try:
-            n = int(scriptOp.numSamples)
+            fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
         except Exception:
-            n = 0
-        if n <= 0:
-            n = 512  # fallback if TD hasn't set it yet
+            fps = 60.0
+        n_default = max(int(wire.SAMPLE_RATE / fps) + 32, 256)
+        try:
+            n_td = int(scriptOp.numSamples)
+        except Exception:
+            n_td = 0
+        n = max(n_td, n_default)
 
         avail_before = self._ring.available
         pcm = self._ring.read(n)
