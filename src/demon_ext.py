@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "post-cook-diag-v1"
+BUILD_MARKER = "honor-numSamples-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1801,17 +1801,29 @@ class DemonExt:
             except Exception:
                 pass
 
-        # Frame-pump: read exactly one frame's worth of samples per cook.
-        # cookRate is TD's frame rate (typically 60). At 60fps, 48000/60 = 800
-        # samples per cook. If frame rate dips, we'll briefly under-produce
-        # which manifests as a tiny audible glitch — acceptable.
+        # HONOR TD's cook context. When audiodevout1's audio thread pulls
+        # audio_out at audio rate (Time Slice = True), TD sets
+        # scriptOp.numSamples to the requested block (e.g. 256, 1024).
+        # Returning a different size produces garbled audio downstream.
+        #
+        # Fallback default = one frame's worth at 48 kHz / 60 fps = 800.
+        # Used only when frame_exec force-cooks audio_out outside any
+        # audio-rate pull context (TD then sets numSamples=1).
+        n_td = 0
         try:
-            fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
-            if fps <= 0:
-                fps = 60.0
+            n_td = int(scriptOp.numSamples)
         except Exception:
-            fps = 60.0
-        n = max(1, int(wire.SAMPLE_RATE / fps))
+            n_td = 0
+        if n_td >= 64:
+            n = n_td
+        else:
+            try:
+                fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
+                if fps <= 0:
+                    fps = 60.0
+            except Exception:
+                fps = 60.0
+            n = max(1, int(wire.SAMPLE_RATE / fps))
 
         pos_before = self._ring.position
         pcm = self._ring.read(n)
