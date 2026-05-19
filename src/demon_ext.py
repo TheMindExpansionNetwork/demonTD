@@ -116,6 +116,28 @@ def _prepend_vendor_paths() -> None:
         if os.path.isdir(wsc_dir) and wsc_dir not in sys.path:
             sys.path.insert(0, wsc_dir)
             print(f"[demon_ext]   + {wsc_dir}")
+        # sounddevice (pure Python; bundled portaudio dylib is loaded from
+        # vendor/sounddevice/_sounddevice_data/portaudio-binaries/ at
+        # sounddevice import time)
+        sd_dir = os.path.join(vendor_root, "sounddevice")
+        if os.path.isdir(sd_dir) and sd_dir not in sys.path:
+            sys.path.insert(0, sd_dir)
+            print(f"[demon_ext]   + {sd_dir}")
+            # macOS Gatekeeper may quarantine the dylib on first download.
+            # Strip the quarantine attribute proactively — silent no-op if
+            # already clear or on a non-darwin host.
+            try:
+                if sysname == "darwin":
+                    import subprocess
+                    dylib = os.path.join(
+                        sd_dir, "_sounddevice_data", "portaudio-binaries",
+                        "libportaudio.dylib")
+                    if os.path.isfile(dylib):
+                        subprocess.run(
+                            ["xattr", "-d", "com.apple.quarantine", dylib],
+                            capture_output=True, check=False)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[demon_ext] _prepend_vendor_paths failed: {e}")
 
@@ -158,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "honor-numSamples-v1"
+BUILD_MARKER = "sounddevice-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -212,6 +234,16 @@ class DemonExt:
         # See src/audio.py for the LoopBuffer implementation.
         self._ring = audio_mod.LoopBuffer(channels=2)
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
+
+        # Python-side audio playback (bypasses TD's CHOP audio chain via
+        # sounddevice / PortAudio). Lifecycle is start()'d when initial
+        # buffer arrives and stop()'d on Disconnect.
+        self._speaker_out = audio_mod.SpeakerOut(
+            self._ring,
+            sample_rate=wire.SAMPLE_RATE,
+            channels=2,
+            log=self.log,
+        )
 
         # WS client (Python thread; replaces TD's broken WebSocket DAT)
         self._wsc = None  # ws_client_mod.WSClient | None
@@ -354,6 +386,12 @@ class DemonExt:
             self._expires_at_ms = None
             self._dirty.clear()
             self._ring.clear()
+
+        # Stop Python-side audio playback. Idempotent.
+        try:
+            self._speaker_out.stop()
+        except Exception as e:
+            self.log(f"speaker_out stop raised: {e}")
 
         # Outside the lock: blocking I/O.
         if wsc is not None:
@@ -1425,6 +1463,13 @@ class DemonExt:
                     f"initial buffer: {n} frames ({n / wire.SAMPLE_RATE:.2f}s) "
                     f"ch={ch} — loop initialized"
                 )
+                # Start Python-side audio playback if the user has it
+                # enabled (default True). Bypasses TD's CHOP audio chain.
+                try:
+                    if bool(self._read_par("Speakerout", True)):
+                        self._speaker_out.start()
+                except Exception as e:
+                    self.log(f"speaker_out start raised: {e}")
             except Exception as e:
                 self.log(f"initial buffer decode failed: {e}")
             return

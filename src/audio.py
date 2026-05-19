@@ -1,4 +1,4 @@
-"""
+﻿"""
 Audio I/O helpers for the DEMON TouchDesigner operator.
 
 This module mirrors demon-public-demo's audio model: DEMON streams audio as
@@ -254,3 +254,122 @@ def to_stereo(pcm: np.ndarray) -> np.ndarray:
     if pcm.shape[0] > 2:
         return pcm[:2]
     raise ValueError(f"Unsupported PCM shape: {pcm.shape}")
+
+
+# -----------------------------------------------------------------------------
+# SpeakerOut — Python-side audio playback via sounddevice / PortAudio.
+# -----------------------------------------------------------------------------
+#
+# We use this to bypass TD's CHOP audio chain (which cannot pull a Script
+# CHOP at audio rate across a Base COMP output boundary in TD 2025). The
+# OutputStream callback runs in PortAudio's own audio thread; we just pull
+# samples from the LoopBuffer and write them into the output buffer.
+#
+# The TD Script CHOP `audio_out` path is left functional so users can still
+# tap the audio for visual reactivity in their networks — both paths read
+# from the same thread-safe LoopBuffer.
+
+
+class SpeakerOut:
+    """Plays a LoopBuffer to the system default audio device at audio rate.
+
+    Thin wrapper around sounddevice.OutputStream. Idempotent start/stop.
+    Loads sounddevice lazily — if the vendored library can't be loaded
+    (e.g. macOS Gatekeeper quarantine on the dylib), `start()` logs the
+    error and returns False so the caller can fall back gracefully.
+    """
+
+    def __init__(self, loop: "LoopBuffer",
+                 sample_rate: int = 48000,
+                 channels: int = 2,
+                 log=print):
+        self._loop = loop
+        self._sample_rate = sample_rate
+        self._channels = channels
+        self._log = log
+        self._stream = None
+        self._underrun_count = 0
+        self._callback_count = 0
+
+    @property
+    def underrun_count(self) -> int:
+        return self._underrun_count
+
+    @property
+    def is_running(self) -> bool:
+        s = self._stream
+        try:
+            return s is not None and s.active
+        except Exception:
+            return False
+
+    def start(self) -> bool:
+        """Open the OutputStream and start audio playback. Returns True on
+        success, False on any error (already logged)."""
+        if self._stream is not None:
+            return True
+        try:
+            import sounddevice as sd
+        except Exception as e:
+            self._log(f"[speaker_out] sounddevice import failed: {e}")
+            return False
+        try:
+            stream = sd.OutputStream(
+                samplerate=self._sample_rate,
+                channels=self._channels,
+                dtype="float32",
+                blocksize=0,            # let PortAudio pick
+                latency="low",
+                callback=self._callback,
+            )
+            stream.start()
+            self._stream = stream
+            self._log(
+                f"[speaker_out] started sd.OutputStream "
+                f"sr={self._sample_rate} ch={self._channels} "
+                f"latency={stream.latency:.4f}s"
+            )
+            return True
+        except Exception as e:
+            self._log(f"[speaker_out] OutputStream.start failed: {e}")
+            self._stream = None
+            return False
+
+    def stop(self) -> None:
+        s = self._stream
+        self._stream = None
+        if s is None:
+            return
+        try:
+            s.stop()
+            s.close()
+            self._log(f"[speaker_out] stopped (cb_count={self._callback_count} "
+                      f"underruns={self._underrun_count})")
+        except Exception as e:
+            self._log(f"[speaker_out] stop failed: {e}")
+
+    def _callback(self, outdata, frames, time_info, status):
+        """PortAudio audio callback. Runs in PortAudio's thread."""
+        self._callback_count += 1
+        # status is a CallbackFlags object. If output underflowed, count it.
+        if status:
+            try:
+                if status.output_underflow:
+                    self._underrun_count += 1
+            except Exception:
+                pass
+        try:
+            pcm = self._loop.read(frames)  # (channels, frames) float32
+        except Exception:
+            outdata.fill(0.0)
+            return
+        # PortAudio expects (frames, channels) interleaved by default.
+        # LoopBuffer hands us (channels, frames) planar — transpose.
+        if pcm.shape == (self._channels, frames):
+            outdata[:] = pcm.T
+        elif pcm.size == 0:
+            outdata.fill(0.0)
+        else:
+            # Defensive: if shape mismatches, fill silence rather than
+            # let numpy raise from inside an audio callback.
+            outdata.fill(0.0)

@@ -73,6 +73,14 @@ SESSION_PARAMS: list[Param] = [
     Param("Status", None, "Session", "Str", "session", default="Idle",
           order=50, readonly=True,
           help="Current connection status."),
+    Param("Speakerout", None, "Session", "Toggle", "session", default=True,
+          order=55, label="Python Audio Out",
+          help="Play generated audio directly via Python sounddevice / "
+               "PortAudio to the system default output. Required because "
+               "TD's CHOP audio chain doesn't pull a Script CHOP at audio "
+               "rate across a Base COMP boundary. Toggle off if you want "
+               "to route the audio only via the COMP's out_chop port to "
+               "your own external Audio Device Out CHOP."),
     Param("Hostedheader", None, "Session", "Header", "session",
           order=60, section_header=True, label="Hosted Mode (coming soon)"),
     Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=70,
