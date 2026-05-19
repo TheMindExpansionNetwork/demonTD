@@ -769,13 +769,13 @@ def onHTTPRequest(webServerDAT, request, response):
 
 # Script CHOP cook hook. TD calls onCook(scriptOp) on the configured DAT.
 # We dispatch by the calling op's name.
-# DIAGNOSTIC: print on the first 3 calls so we can verify TD is actually
-# invoking this from a sibling DAT (Script CHOPs are finicky about that).
+# DIAGNOSTIC: print every Nth call so we can verify the cadence.
 _onCook_calls = 0
 def onCook(scriptOp):
     global _onCook_calls
     _onCook_calls += 1
-    if _onCook_calls <= 3:
+    # Print first 5 cooks (boot + early connect activity), then every 1000th.
+    if _onCook_calls <= 5 or (_onCook_calls % 1000 == 0):
         try:
             print(f"[callbacks.onCook #{_onCook_calls}] op={scriptOp.name} "
                   f"numSamples={scriptOp.numSamples}")
@@ -808,27 +808,23 @@ def wire_audio(demon):
     out_chop = demon.op("out_chop")
     audiodevout = demon.op("audiodevout")
 
-    # Configure audio_clock (Constant CHOP, Time Slice = ON).
-    # This is a silent audio-rate "metronome" wired as audio_out's input
-    # so that audio_out (a source-only Script CHOP) cooks at audio block
-    # rate instead of frame rate. The actual sample values don't matter —
-    # only its time-slice cadence does.
+    # audio_clock is now VESTIGIAL — kept in TOPOLOGY for backward compat,
+    # but DISCONNECTED from audio_out. We originally added it as a
+    # Time-Slice'd Constant CHOP input to force audio-rate cooking, but
+    # because its output is CONSTANT, TD considered audio_out "clean"
+    # forever and reused its (empty) first cook output. Now with audiodevout
+    # internal-pulling at audio rate, audio_out cooks correctly when it
+    # has NO input — TD dirties it every frame from the downstream pull.
     if audio_clock is not None:
         try:
-            audio_clock.par.timeslice = True
-        except Exception as e:
-            print(f"!! audio_clock.timeslice: {e}")
-        # Give it a single named channel with value 0. Time-Slice Constant
-        # CHOP will emit (numSamples,) zeros at audio-rate cadence.
-        try:
-            audio_clock.par.name0 = "clk"
-            audio_clock.par.value0 = 0.0
-        except Exception as e:
-            print(f"!! audio_clock channel setup: {e}")
+            audio_clock.par.timeslice = False
+        except Exception:
+            pass
 
     # Configure audio_out Script CHOP.
-    # Time Slice = ON so Audio Device Out can pull it at audio block rate.
-    # NO pre-declared channels — those were locking it into frame-rate mode.
+    # Time Slice = ON; NO upstream input (source-only).
+    # The downstream internal audiodevout pulls at audio rate and that's
+    # what drives the cook cadence.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
@@ -838,17 +834,13 @@ def wire_audio(demon):
             audio_out.par.timeslice = True
         except Exception:
             pass
-        # Wire audio_clock as audio_out's input. The Python OnCookRecv
-        # callback ignores the input data — it only needs the upstream
-        # time-slice cadence to be cooked at audio rate.
-        if audio_clock is not None:
-            try:
-                for c in audio_out.inputConnectors:
-                    if c.connections:
-                        c.disconnect()
-                audio_out.inputConnectors[0].connect(audio_clock)
-            except Exception as e:
-                print(f"!! audio_clock -> audio_out wire: {e}")
+        # Detach any prior input wiring (e.g. audio_clock from earlier builds).
+        try:
+            for c in audio_out.inputConnectors:
+                if c.connections:
+                    c.disconnect()
+        except Exception as e:
+            print(f"!! audio_out input detach: {e}")
 
     # Wire audio_out -> audiodevout (the internal Audio Device Out CHOP).
     # This is the consumer that actually pulls at audio rate from inside
