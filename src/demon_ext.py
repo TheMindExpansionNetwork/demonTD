@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "frame-pump-v1"
+BUILD_MARKER = "frame-pump-v2-wallclock"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1696,16 +1696,29 @@ class DemonExt:
             except Exception:
                 pass
 
-        # Frame-pump: produce one frame's worth of samples per cook.
-        # At 60fps the math is 48000/60 = 800 samples; we round up slightly
-        # to give us a tiny cushion against jitter in frame timing.
-        # If TD reports a numSamples > our default (e.g. an audio-rate
-        # consumer IS pulling), honor that.
-        try:
-            fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
-        except Exception:
-            fps = 60.0
-        n_default = max(int(wire.SAMPLE_RATE / fps) + 32, 256)
+        # Frame-pump: produce N samples per cook based on wall-clock elapsed
+        # time since the last cook. This is sample-accurate against actual
+        # frame timing instead of assuming a fixed 60fps cookRate.
+        #   - First cook: produce one frame's worth based on cookRate.
+        #   - Subsequent cooks: produce exactly (elapsed_seconds * SAMPLE_RATE)
+        #     samples — keeps playback rate locked to wall clock.
+        # Clamp to [256, 4096] to avoid pathological values.
+        now = time.time()
+        last = getattr(self, "_last_cook_time", None)
+        self._last_cook_time = now
+        if last is None:
+            try:
+                fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
+            except Exception:
+                fps = 60.0
+            n_default = int(wire.SAMPLE_RATE / fps)
+        else:
+            elapsed = max(0.001, now - last)
+            n_default = int(elapsed * wire.SAMPLE_RATE)
+        n_default = max(256, min(n_default, 4096))
+        # If TD's Time Slice context still set a sensible numSamples, honor
+        # the larger of the two (a real audio consumer pulling more than a
+        # frame block wins).
         try:
             n_td = int(scriptOp.numSamples)
         except Exception:
