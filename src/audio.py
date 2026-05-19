@@ -1,120 +1,214 @@
-﻿"""
+"""
 Audio I/O helpers for the DEMON TouchDesigner operator.
 
-- Thread-safe ring buffer for decoded server audio (WS receive thread writes,
-  Script CHOP cook reads).
-- float16 ↔ float32 helpers.
-- Linear resample (cheap; for cosmetic SR mismatch — DEMON always operates
-  at 48kHz internally).
+This module mirrors demon-public-demo's audio model: DEMON streams audio as
+a LOOP. The server first sends an "initial buffer" containing the full
+track (typically 24s = 1,152,000 samples at 48 kHz). After that, each
+binary slice carries a `start_sample` (start frame in the loop) and PCM
+data that PATCHES that region of the loop. Playback advances continuously
+and wraps at end-of-buffer.
 
-Pure Python + numpy. No TD dependencies.
+This is NOT a FIFO/streaming model — slices don't arrive in playback
+order, they target arbitrary positions. The earlier RingBuffer
+implementation treated slices as appended audio, which produced silence
++ glitches because slice positions didn't line up with the consumer's
+read head.
+
+Reference: demon-public-demo/vendor/demon-ui/engine/audio/AudioPlayer.ts
+
+No TD dependencies.
 """
 
 from __future__ import annotations
 
 import threading
-from collections import deque
 
 import numpy as np
 
 
-class RingBuffer:
-    """A thread-safe stereo PCM ring buffer.
+class LoopBuffer:
+    """Fixed-size stereo PCM loop buffer with positional patching.
 
-    Stored as a deque of (channels, samples_in_chunk) float32 arrays — pop
-    samples from the head, write whole arrays to the tail. Cheap and avoids
-    re-allocating a large contiguous buffer on every WS slice.
+    Storage layout: (channels, frames) float32. The playback position
+    advances on each `read()` call and wraps modulo `frames`. Slices
+    (server → client) are written via `patch()` or `add_delta()` at
+    explicit start-frame offsets — they DO NOT advance the read head.
 
-    Reads return silence on underrun rather than blocking, so they're safe
-    to call from the TD cook thread.
+    Reads return silence on uninitialized buffer rather than blocking.
     """
 
-    def __init__(self, channels: int = 2, max_samples: int = 48000 * 30):
+    def __init__(self, channels: int = 2):
         self.channels = channels
-        self.max_samples = max_samples
-        self._chunks: deque[np.ndarray] = deque()
-        self._head_offset = 0  # samples already consumed from _chunks[0]
-        self._total = 0        # total samples available
+        self._buffer: np.ndarray | None = None  # shape (channels, frames)
+        self._frames: int = 0
+        self._position: int = 0  # next read frame
         self._lock = threading.Lock()
 
     @property
-    def available(self) -> int:
-        """Samples currently buffered (per channel)."""
+    def frames(self) -> int:
+        """Total frames in the loop (per channel). 0 if uninitialized."""
+        return self._frames
+
+    @property
+    def position(self) -> int:
+        """Current playback position in frames (per channel)."""
         with self._lock:
-            return self._total
+            return self._position
+
+    @property
+    def available(self) -> int:
+        """Compatibility shim with RingBuffer.available for telemetry.
+        In a loop model, "available" is always the loop size — the loop
+        always has content (silence or audio). Reports frames * 2 to mirror
+        the RingBuffer behavior (which counted total samples across channels)
+        in legacy logs."""
+        return self._frames
 
     def clear(self) -> None:
         with self._lock:
-            self._chunks.clear()
-            self._head_offset = 0
-            self._total = 0
+            self._buffer = None
+            self._frames = 0
+            self._position = 0
 
-    def write(self, pcm: np.ndarray) -> None:
-        """Append PCM to the tail.
+    def init(self, pcm: np.ndarray, channels: int | None = None) -> None:
+        """Initialize the loop with the server's initial buffer.
 
-        pcm: shape (channels, samples) float32. If interleaved is given,
-        de-interleave first.
+        Parameters
+        ----------
+        pcm : np.ndarray
+            Either 1D interleaved (L0,R0,L1,R1,...) or 2D (channels, frames)
+            float32. Sets the loop size to this length.
+        channels : int, optional
+            Override the channel count. Defaults to self.channels.
         """
+        ch = int(channels or self.channels)
         pcm = np.ascontiguousarray(pcm, dtype=np.float32)
         if pcm.ndim == 1:
-            # Assume interleaved
-            samples = pcm.shape[0] // self.channels
-            pcm = pcm.reshape(samples, self.channels).T
-        elif pcm.ndim == 2 and pcm.shape[0] != self.channels:
-            # (samples, channels) -> (channels, samples)
-            pcm = pcm.T
+            frames = pcm.shape[0] // ch
+            buf = pcm[: frames * ch].reshape(frames, ch).T
+        elif pcm.ndim == 2:
+            if pcm.shape[0] == ch:
+                buf = pcm
+                frames = pcm.shape[1]
+            else:
+                buf = pcm.T
+                frames = pcm.shape[0]
+        else:
+            raise ValueError(f"unsupported pcm.ndim={pcm.ndim}")
 
         with self._lock:
-            self._chunks.append(pcm)
-            self._total += pcm.shape[1]
-            # Trim from head if we exceeded max_samples (avoid runaway memory).
-            while self._total > self.max_samples and self._chunks:
-                head = self._chunks[0]
-                head_remaining = head.shape[1] - self._head_offset
-                if self._total - head_remaining >= self.max_samples:
-                    self._total -= head_remaining
-                    self._chunks.popleft()
-                    self._head_offset = 0
-                else:
-                    drop = self._total - self.max_samples
-                    self._head_offset += drop
-                    self._total -= drop
-                    break
+            self.channels = ch
+            self._buffer = np.ascontiguousarray(buf, dtype=np.float32)
+            self._frames = frames
+            self._position = 0
 
-    def read(self, num_samples: int) -> np.ndarray:
-        """Pop num_samples per channel from the head.
+    def swap(self, pcm: np.ndarray, channels: int | None = None) -> None:
+        """Replace the entire loop buffer (server `swap_ready` path).
 
-        Returns shape (channels, num_samples) float32. On underrun, the
-        missing portion is zero-padded so the return shape is always
-        deterministic.
+        Resets playback position to 0 like AudioPlayer.swap() does.
         """
-        out = np.zeros((self.channels, num_samples), dtype=np.float32)
-        if num_samples <= 0:
+        self.init(pcm, channels=channels)
+
+    def patch(self, start_frame: int, pcm: np.ndarray) -> None:
+        """Overwrite frames[start_frame : start_frame + N] with `pcm`.
+
+        Wraps if the write region crosses the loop end.
+        """
+        self._write(start_frame, pcm, add=False)
+
+    def add_delta(self, start_frame: int, pcm: np.ndarray) -> None:
+        """Additive blend (used for SLICE_FLAG_DELTA payloads)."""
+        self._write(start_frame, pcm, add=True)
+
+    def _write(self, start_frame: int, pcm: np.ndarray, add: bool) -> None:
+        pcm = np.ascontiguousarray(pcm, dtype=np.float32)
+        ch = self.channels
+        if pcm.ndim == 1:
+            n = pcm.shape[0] // ch
+            pcm_2d = pcm[: n * ch].reshape(n, ch).T
+        elif pcm.ndim == 2 and pcm.shape[0] == ch:
+            pcm_2d = pcm
+            n = pcm.shape[1]
+        elif pcm.ndim == 2 and pcm.shape[1] == ch:
+            pcm_2d = pcm.T
+            n = pcm.shape[0]
+        else:
+            return
+
+        if n <= 0:
+            return
+
+        with self._lock:
+            buf = self._buffer
+            frames = self._frames
+            if buf is None or frames == 0:
+                return
+            start = start_frame % frames
+            end = start + n
+            if end <= frames:
+                if add:
+                    buf[:, start:end] += pcm_2d
+                else:
+                    buf[:, start:end] = pcm_2d
+            else:
+                first_chunk = frames - start
+                if add:
+                    buf[:, start:] += pcm_2d[:, :first_chunk]
+                else:
+                    buf[:, start:] = pcm_2d[:, :first_chunk]
+                rem = n - first_chunk
+                # If pcm is larger than the whole loop, last block wins.
+                if rem >= frames:
+                    if add:
+                        buf[:, :] += pcm_2d[:, first_chunk:first_chunk + frames]
+                    else:
+                        buf[:, :] = pcm_2d[:, first_chunk:first_chunk + frames]
+                else:
+                    if add:
+                        buf[:, :rem] += pcm_2d[:, first_chunk:]
+                    else:
+                        buf[:, :rem] = pcm_2d[:, first_chunk:]
+
+    def read(self, num_frames: int) -> np.ndarray:
+        """Read `num_frames` frames at the playback position; advance head.
+
+        Returns shape (channels, num_frames) float32. Wraps the loop
+        automatically. If the buffer is uninitialized, returns silence.
+        """
+        ch = self.channels
+        out = np.zeros((ch, num_frames), dtype=np.float32)
+        if num_frames <= 0:
             return out
 
         with self._lock:
+            buf = self._buffer
+            frames = self._frames
+            if buf is None or frames == 0:
+                return out
+
+            pos = self._position
             written = 0
-            while written < num_samples and self._chunks:
-                head = self._chunks[0]
-                head_len = head.shape[1] - self._head_offset
-                if head_len <= 0:
-                    self._chunks.popleft()
-                    self._head_offset = 0
-                    continue
-
-                take = min(head_len, num_samples - written)
-                out[:, written:written + take] = head[
-                    :, self._head_offset:self._head_offset + take
-                ]
-                self._head_offset += take
+            while written < num_frames:
+                end_in_buf = frames - pos
+                take = min(end_in_buf, num_frames - written)
+                out[:, written:written + take] = buf[:, pos:pos + take]
                 written += take
-                self._total -= take
+                pos = (pos + take) % frames
 
-                if self._head_offset >= head.shape[1]:
-                    self._chunks.popleft()
-                    self._head_offset = 0
+            self._position = pos
+            return out
 
-        return out
+    def seek(self, position_frames: int) -> None:
+        """Set the playback position. Wraps modulo loop size."""
+        with self._lock:
+            if self._frames > 0:
+                self._position = position_frames % self._frames
+
+
+# Back-compat alias: existing call sites use `RingBuffer`. Map it to
+# LoopBuffer with a similar interface so the rest of the code base
+# doesn't have to be touched everywhere.
+RingBuffer = LoopBuffer
 
 
 # -----------------------------------------------------------------------------
@@ -126,9 +220,6 @@ def linear_resample(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray
 
     pcm: shape (channels, samples) float32.
     Returns shape (channels, new_samples).
-
-    For higher fidelity, prefer a real polyphase filter — this is good enough
-    for routing 48kHz↔44.1kHz inside TD where rate mismatch is small.
     """
     if src_rate == dst_rate or pcm.size == 0:
         return pcm

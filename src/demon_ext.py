@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "frame-pump-v2-wallclock"
+BUILD_MARKER = "loop-buffer-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -200,9 +200,12 @@ class DemonExt:
         # LoRA catalog (mirrors the Table DAT)
         self._lora_ids: list[str] = []
 
-        # Audio buffers
-        self._ring = audio_mod.RingBuffer(channels=2,
-                                          max_samples=wire.SAMPLE_RATE * 30)
+        # Audio buffer — DEMON's audio model is a LOOP, not a stream.
+        # Server sends an initial buffer (typically 24s) that becomes the
+        # full loop. Subsequent slices PATCH specific positions in the loop
+        # via their `start_sample` field. Playback wraps continuously.
+        # See src/audio.py for the LoopBuffer implementation.
+        self._ring = audio_mod.LoopBuffer(channels=2)
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
 
         # WS client (Python thread; replaces TD's broken WebSocket DAT)
@@ -682,18 +685,20 @@ class DemonExt:
 
         with self._lock:
             if not self._dirty:
-                # Still advance playback position
-                self._playback_pos += int(wire.SAMPLE_RATE * 0.008)
+                # No dirty params — nothing to send. Playback position is
+                # tracked by OnCookRecv from the loop buffer's read head,
+                # not dead-reckoned in OnTick.
                 return
             raw = dict(self._dirty)
             self._dirty.clear()
 
+        # Use the loop buffer's actual read position (in seconds) as
+        # playback_pos. Mirrors demon-public-demo's session.player.positionSec.
+        playback_sec = self._ring.position / wire.SAMPLE_RATE
         try:
-            self._send_text(wire.encode_params(raw, self._playback_pos))
+            self._send_text(wire.encode_params(raw, playback_sec))
         except Exception as e:
             self.log(f"OnTick send error: {e}")
-        finally:
-            self._playback_pos += int(wire.SAMPLE_RATE * 0.008)
 
     def OnHeartbeat(self) -> None:
         """Called by the 5s heartbeat Timer CHOP. Polls /api/queue/status."""
@@ -880,11 +885,9 @@ class DemonExt:
             last_send = getattr(self, "_last_params_send", 0.0)
             elapsed = now - last_send
             if elapsed > 0.008 or raw:
-                # If cooks aren't running, advance pos by wall-clock so
-                # the server's flow control sees forward progress.
-                if last_send > 0 and self._n_cook_recv == 0:
-                    self._playback_pos += int(elapsed * wire.SAMPLE_RATE)
-                playback_sec = self._playback_pos / wire.SAMPLE_RATE
+                # playback_sec mirrors demon-public-demo's positionSec:
+                # the loop buffer's current read head, in seconds.
+                playback_sec = self._ring.position / wire.SAMPLE_RATE
                 try:
                     self._send_text(wire.encode_params(raw, playback_sec))
                     self._last_params_send = now
@@ -1333,7 +1336,8 @@ class DemonExt:
 
         # The first binary frame after `ready` (or `swap_ready`) is the
         # raw float16 initial buffer — interleaved PCM, no 23-byte slice
-        # header. Subsequent frames are slices.
+        # header. This becomes the full loop content. Subsequent frames
+        # are slices that patch specific positions in the loop.
         if self._expecting_initial_buffer:
             self._expecting_initial_buffer = False
             ch = getattr(self, "_ready_channels", 2) or 2
@@ -1344,17 +1348,19 @@ class DemonExt:
                 if n <= 0:
                     self.log(f"initial buffer: empty")
                     return
-                interleaved = pcm[: n * ch].reshape(n, ch).T
-                self._ring.write(interleaved)
+                # Initialize the loop with this buffer (channels, frames).
+                self._ring.init(pcm[: n * ch], channels=ch)
                 self.log(
-                    f"initial buffer: {n} samples ({n / wire.SAMPLE_RATE:.2f}s) "
-                    f"ch={ch}"
+                    f"initial buffer: {n} frames ({n / wire.SAMPLE_RATE:.2f}s) "
+                    f"ch={ch} — loop initialized"
                 )
             except Exception as e:
                 self.log(f"initial buffer decode failed: {e}")
             return
 
-        # Streaming slice (23-byte header + raw/zstd float16)
+        # Streaming slice (23-byte header + raw/zstd float16). Each slice
+        # PATCHES the loop at slice.start_sample. Flag bit 1 = delta (mix),
+        # otherwise overwrite. Mirrors useStartSession.ts.
         try:
             slice_ = wire.decode_slice(buf, zstd_dec=_ZSTD_DEC)
         except Exception as e:
@@ -1365,8 +1371,10 @@ class DemonExt:
         n = slice_.pcm.size // ch
         if n <= 0:
             return
-        pcm = slice_.pcm[: n * ch].reshape(n, ch).T
-        self._ring.write(pcm)
+        if slice_.flags == wire.SLICE_FLAG_DELTA:
+            self._ring.add_delta(slice_.start_sample, slice_.pcm[: n * ch])
+        else:
+            self._ring.patch(slice_.start_sample, slice_.pcm[: n * ch])
 
     # -------- LoRA catalog ---------------------------------------------------
 
@@ -1681,64 +1689,54 @@ class DemonExt:
         scriptOp.appendChan("dummy")
 
     def OnCookRecv(self, scriptOp) -> None:
-        """audio_out Script CHOP cook callback. Reads from ring buffer.
+        """audio_out Script CHOP cook callback. Reads from the loop buffer.
 
         FRAME-PUMP mode (Time Slice = False):
           - Called from frame_exec onFrameStart at frame rate (~60 Hz).
           - We produce a frame-sized block of samples each cook.
           - 60 cooks/sec × 800 samples = 48000 samples/sec = audio rate.
+
+        The loop buffer wraps automatically: when position reaches end,
+        it continues reading from frame 0. That's DEMON's intended model
+        — the track loops forever as the server keeps patching the loop
+        content via slices.
         """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
         if self._n_cook_recv == 1:
             try:
                 self.log(f"OnCookRecv: FIRST cook — numSamples="
-                         f"{scriptOp.numSamples} ring_avail={self._ring.available}")
+                         f"{scriptOp.numSamples} loop_frames={self._ring.frames}")
             except Exception:
                 pass
 
-        # Frame-pump: produce N samples per cook based on wall-clock elapsed
-        # time since the last cook. This is sample-accurate against actual
-        # frame timing instead of assuming a fixed 60fps cookRate.
-        #   - First cook: produce one frame's worth based on cookRate.
-        #   - Subsequent cooks: produce exactly (elapsed_seconds * SAMPLE_RATE)
-        #     samples — keeps playback rate locked to wall clock.
-        # Clamp to [256, 4096] to avoid pathological values.
-        now = time.time()
-        last = getattr(self, "_last_cook_time", None)
-        self._last_cook_time = now
-        if last is None:
-            try:
-                fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
-            except Exception:
-                fps = 60.0
-            n_default = int(wire.SAMPLE_RATE / fps)
-        else:
-            elapsed = max(0.001, now - last)
-            n_default = int(elapsed * wire.SAMPLE_RATE)
-        n_default = max(256, min(n_default, 4096))
-        # If TD's Time Slice context still set a sensible numSamples, honor
-        # the larger of the two (a real audio consumer pulling more than a
-        # frame block wins).
+        # Frame-pump: read exactly one frame's worth of samples per cook.
+        # cookRate is TD's frame rate (typically 60). At 60fps, 48000/60 = 800
+        # samples per cook. If frame rate dips, we'll briefly under-produce
+        # which manifests as a tiny audible glitch — acceptable.
         try:
-            n_td = int(scriptOp.numSamples)
+            fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
+            if fps <= 0:
+                fps = 60.0
         except Exception:
-            n_td = 0
-        n = max(n_td, n_default)
+            fps = 60.0
+        n = max(1, int(wire.SAMPLE_RATE / fps))
 
-        avail_before = self._ring.available
+        pos_before = self._ring.position
         pcm = self._ring.read(n)
 
-        # Track samples consumed for accurate playback_pos in params messages.
-        self._playback_pos += n
+        # Track playback position from the loop. _playback_pos is the
+        # current play head in frames (= samples per channel). Sent to
+        # the server as `playback_pos` in params messages, in seconds.
+        self._playback_pos = self._ring.position
 
-        # Diagnose every Nth cook: did we get real audio, or silence?
+        # Diagnose every Nth cook: did we read real audio, or silence?
         if self._n_cook_recv % 600 == 0:
             try:
                 peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
                 self.log(
                     f"OnCookRecv #{self._n_cook_recv}: n={n} "
-                    f"ring_before={avail_before} ring_after={self._ring.available} "
-                    f"peak={peak:.4f} (silence if 0)"
+                    f"loop_pos_before={pos_before} loop_pos_after={self._ring.position} "
+                    f"loop_frames={self._ring.frames} peak={peak:.4f}"
                 )
             except Exception:
                 pass
