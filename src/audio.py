@@ -377,10 +377,17 @@ class SpeakerOut:
                  sample_rate: int = 48000,
                  channels: int = 2,
                  log=print,
-                 dylib_path: str | None = None):
+                 dylib_path: str | None = None,
+                 frames_per_buffer: int = 2048):
         self._loop = loop
         self._sample_rate = float(sample_rate)
         self._channels = int(channels)
+        # Larger blocks = fewer Python callbacks per second = less GIL
+        # contention with TD's main thread. 2048 frames @ 48kHz = ~43ms.
+        # That's our audio latency floor; acceptable for a generative
+        # session, and avoids the choppy playback that the default
+        # ~256-frame block size produces under Python GIL pressure.
+        self._frames_per_buffer = int(frames_per_buffer)
         self._log = log
         self._dylib_path = dylib_path
         self._stream: int | None = None  # raw c_void_p value
@@ -419,11 +426,11 @@ class SpeakerOut:
         stream_ptr = _ctypes.c_void_p()
         err = lib.Pa_OpenDefaultStream(
             _ctypes.byref(stream_ptr),
-            0,                       # no input
+            0,                              # no input
             self._channels,
             _paFloat32,
             self._sample_rate,
-            0,                       # framesPerBuffer = 0: PortAudio picks
+            self._frames_per_buffer,        # bigger block = less GIL pressure
             _ctypes.cast(self._c_callback, _ctypes.c_void_p),
             None,
         )
@@ -442,7 +449,9 @@ class SpeakerOut:
         self._stream = stream_ptr.value
         self._stream_ptr = stream_ptr
         self._log(f"[speaker_out] started PortAudio default stream "
-                  f"sr={self._sample_rate} ch={self._channels}")
+                  f"sr={self._sample_rate} ch={self._channels} "
+                  f"frames_per_buffer={self._frames_per_buffer} "
+                  f"(latency~{self._frames_per_buffer / self._sample_rate * 1000:.1f}ms)")
         return True
 
     def stop(self) -> None:
@@ -462,27 +471,34 @@ class SpeakerOut:
 
     def _pa_callback(self, in_buf, out_buf, frames, time_info, status_flags,
                      user_data) -> int:
-        """PortAudio callback (audio thread)."""
+        """PortAudio callback (audio thread).
+
+        Kept minimal: read N frames from LoopBuffer, transpose to interleaved
+        float32, memmove into PortAudio's output pointer. No allocations
+        beyond what numpy does inside LoopBuffer.read.
+        """
         self._callback_count += 1
         if status_flags & _paOutputUnderflow:
             self._underrun_count += 1
+            # Periodically log underruns so we know if the GIL is starving us.
+            if self._underrun_count <= 3 or self._underrun_count % 50 == 0:
+                try:
+                    self._log(f"[speaker_out] underrun "
+                              f"(count={self._underrun_count}, "
+                              f"cb={self._callback_count}, "
+                              f"frames={frames})")
+                except Exception:
+                    pass
+        n = int(frames)
+        n_bytes = n * self._channels * 4
         try:
-            pcm = self._loop.read(int(frames))  # (channels, frames) float32
-        except Exception:
-            # On read error, write silence so the audio thread doesn't underrun.
-            _ctypes.memset(out_buf, 0, int(frames) * self._channels * 4)
-            return _paContinue
-        # Convert planar (channels, frames) -> interleaved (frames, channels).
-        try:
+            pcm = self._loop.read(n)  # (channels, frames) float32
             interleaved = np.ascontiguousarray(pcm.T, dtype=np.float32)
-            n_bytes = int(frames) * self._channels * 4
-            if interleaved.nbytes >= n_bytes and out_buf:
-                _ctypes.memmove(out_buf, interleaved.ctypes.data, n_bytes)
-            else:
-                _ctypes.memset(out_buf, 0, n_bytes)
+            _ctypes.memmove(out_buf, interleaved.ctypes.data, n_bytes)
         except Exception:
+            # Any failure: write silence so the audio thread doesn't break.
             try:
-                _ctypes.memset(out_buf, 0, int(frames) * self._channels * 4)
+                _ctypes.memset(out_buf, 0, n_bytes)
             except Exception:
                 pass
         return _paContinue
