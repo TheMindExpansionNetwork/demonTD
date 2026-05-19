@@ -156,6 +156,10 @@ except NameError:
     import ws_client as ws_client_mod  # type: ignore
 
 
+# Bump this on every meaningful change so the user can confirm at boot
+# which build is actually loaded. Visible on the "DemonExt initialized" line.
+BUILD_MARKER = "fb0d17d-detach-audio_clock"
+
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
 
@@ -214,7 +218,7 @@ class DemonExt:
         # Subsequent binaries are slices. We flip this on `ready`.
         self._expecting_initial_buffer: bool = False
 
-        self.log("DemonExt initialized")
+        self.log(f"DemonExt initialized — BUILD={BUILD_MARKER}")
 
     # -------- properties (public read-only) ----------------------------------
 

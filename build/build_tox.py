@@ -80,6 +80,22 @@ for _modname in ("params", "wire", "queue_client", "oauth", "audio", "ws_client"
 
 import params as P  # noqa: E402  pylint: disable=wrong-import-position
 
+# Pull the BUILD_MARKER constant out of demon_ext.py so both the build-time
+# log and the runtime extension boot log show the same string. (We can't
+# import demon_ext directly — it depends on TD globals — so just grep it.)
+def _read_build_marker() -> str:
+    try:
+        with open(os.path.join(SRC_DIR, "demon_ext.py"), encoding="utf-8-sig") as fh:
+            for line in fh:
+                if line.startswith("BUILD_MARKER"):
+                    return line.split("=", 1)[1].strip().strip('"\'')
+    except Exception:
+        pass
+    return "unknown"
+
+BUILD_MARKER = _read_build_marker()
+print(f"[build_tox] BUILD={BUILD_MARKER}")
+
 
 # -----------------------------------------------------------------------------
 # Internal topology — operators inside the Base COMP `demon`
@@ -841,6 +857,13 @@ def wire_audio(demon):
                     c.disconnect()
         except Exception as e:
             print(f"!! audio_out input detach: {e}")
+        # Diagnostic: confirm wiring matches expected (0 inputs).
+        try:
+            n_in = sum(1 for c in audio_out.inputConnectors if c.connections)
+            print(f"[build_tox] BUILD={BUILD_MARKER} audio_out inputs={n_in} "
+                  f"(expected 0 — audio_clock detached)")
+        except Exception:
+            pass
 
     # Wire audio_out -> audiodevout (the internal Audio Device Out CHOP).
     # This is the consumer that actually pulls at audio rate from inside
