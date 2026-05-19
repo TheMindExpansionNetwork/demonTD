@@ -158,10 +158,15 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "loop-buffer-v1"
+BUILD_MARKER = "diag-dump-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
+
+# Debug-only: where to dump WAV snapshots of decoded audio for offline
+# inspection. Used by BUILD=diag-dump-* builds to isolate which side of
+# the wire is corrupting bytes when playback comes out as static.
+DEBUG_DUMP_DIR = "/tmp/demon-debug"
 
 
 # -----------------------------------------------------------------------------
@@ -796,6 +801,20 @@ class DemonExt:
         self._pending_audio_samples = pcm.shape[1]
         self.log(f"_open_ws: pending {pcm.shape[1]} samples "
                  f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) from {source_label}")
+        # Diagnostic: dump the EXACT PCM we're about to encode + send. If
+        # this WAV plays correctly in Audacity/QuickTime, our source is
+        # good and any garbage in the echo comes from the server side.
+        try:
+            peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
+            mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
+            self.log(f"[DIAG sent_to_server] shape={pcm.shape} "
+                     f"dtype={pcm.dtype} peak={peak:.4f} mean_abs={mabs:.4f}")
+        except Exception:
+            pass
+        self._dump_wav(
+            os.path.join(DEBUG_DUMP_DIR, "sent_to_server.wav"),
+            pcm, channels=2,
+        )
 
         # 4. Close any prior client, build a new one, connect.
         if self._wsc is not None:
@@ -1330,6 +1349,35 @@ class DemonExt:
         else:
             self.log(f"unknown server message: {kind}")
 
+    def _dump_wav(self, path: str, pcm: np.ndarray, channels: int,
+                  sample_rate: int = 48000) -> None:
+        """Diagnostic: write a (channels, frames) float32 ndarray as int16
+        WAV. Best-effort — failures log but don't propagate."""
+        try:
+            import wave
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            pcm = np.asarray(pcm, dtype=np.float32)
+            # Normalize shape to (channels, frames).
+            if pcm.ndim == 1:
+                # Assume interleaved.
+                frames = pcm.shape[0] // channels
+                pcm = pcm[: frames * channels].reshape(frames, channels).T
+            elif pcm.ndim == 2 and pcm.shape[0] != channels and pcm.shape[1] == channels:
+                pcm = pcm.T
+            frames = pcm.shape[1]
+            # Re-interleave for WAV.
+            interleaved = pcm.T.reshape(-1)
+            clipped = np.clip(interleaved, -1.0, 1.0)
+            i16 = np.int16(clipped * 32767.0)
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(i16.tobytes())
+            self.log(f"_dump_wav: wrote {path} ({frames} frames, ch={channels})")
+        except Exception as e:
+            self.log(f"_dump_wav failed for {path}: {e}")
+
     def _on_binary(self, buf: bytes) -> None:
         # Counter for telemetry
         self._n_binary_frames = getattr(self, "_n_binary_frames", 0) + 1
@@ -1348,8 +1396,31 @@ class DemonExt:
                 if n <= 0:
                     self.log(f"initial buffer: empty")
                     return
+                # ---- DIAGNOSTIC ----
+                try:
+                    head_hex = bytes(buf[:32]).hex(" ")
+                    peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
+                    mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
+                    self.log(
+                        f"[DIAG initial_buffer] bytes={len(buf)} "
+                        f"head32={head_hex}"
+                    )
+                    self.log(
+                        f"[DIAG initial_buffer] decoded peak={peak:.4f} "
+                        f"mean_abs={mabs:.4f} first10={pcm[:10].tolist()}"
+                    )
+                except Exception as e:
+                    self.log(f"[DIAG initial_buffer] log failed: {e}")
+                # Dump to disk for offline inspection.
+                self._dump_wav(
+                    os.path.join(DEBUG_DUMP_DIR, "initial_buffer.wav"),
+                    pcm[: n * ch], ch,
+                )
                 # Initialize the loop with this buffer (channels, frames).
                 self._ring.init(pcm[: n * ch], channels=ch)
+                # Reset per-session slice debug counter so dumps are
+                # named slice_0/1/2 on every reconnect.
+                self._debug_slice_count = 0
                 self.log(
                     f"initial buffer: {n} frames ({n / wire.SAMPLE_RATE:.2f}s) "
                     f"ch={ch} — loop initialized"
@@ -1371,6 +1442,27 @@ class DemonExt:
         n = slice_.pcm.size // ch
         if n <= 0:
             return
+
+        # ---- DIAGNOSTIC: log + dump first 3 slices ----
+        idx = getattr(self, "_debug_slice_count", 0)
+        if idx < 3:
+            try:
+                peak = float(np.max(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
+                mabs = float(np.mean(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
+                self.log(
+                    f"[DIAG slice_{idx}] flags={slice_.flags} "
+                    f"start_sample={slice_.start_sample} num_samples={slice_.num_samples} "
+                    f"channels={slice_.channels} peak={peak:.4f} mean_abs={mabs:.4f} "
+                    f"first10={slice_.pcm[:10].tolist()}"
+                )
+            except Exception:
+                pass
+            self._dump_wav(
+                os.path.join(DEBUG_DUMP_DIR, f"slice_{idx}.wav"),
+                slice_.pcm[: n * ch], ch,
+            )
+            self._debug_slice_count = idx + 1
+
         if slice_.flags == wire.SLICE_FLAG_DELTA:
             self._ring.add_delta(slice_.start_sample, slice_.pcm[: n * ch])
         else:
