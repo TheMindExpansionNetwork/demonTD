@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "copyNumpyArray-v1"
+BUILD_MARKER = "post-cook-diag-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1833,6 +1833,9 @@ class DemonExt:
             except Exception:
                 pass
 
+        # POST-COOK DIAGNOSTIC: log what TD actually thinks the Script
+        # CHOP contains AFTER our write. Sampling every 600th cook
+        # matches the existing peak/loop_pos log cadence.
         scriptOp.clear()
         try:
             scriptOp.rate = wire.SAMPLE_RATE
@@ -1859,3 +1862,33 @@ class DemonExt:
                 self.log(f"OnCookRecv write failed (fallback): {e}")
         except Exception as e:
             self.log(f"OnCookRecv copyNumpyArray failed: {e}")
+
+        # POST-WRITE DIAGNOSTIC: every 600th cook, log what TD now thinks
+        # the Script CHOP actually contains. If numSamples=800 / rate=48000
+        # / numChans=2 then our data is in TD correctly and the bug is
+        # downstream (out_chop / COMP boundary / audiodevout1).
+        if self._n_cook_recv % 600 == 0:
+            try:
+                post = (
+                    f"[POST] scriptOp.numSamples={scriptOp.numSamples} "
+                    f"rate={scriptOp.rate} numChans={scriptOp.numChans} "
+                    f"input_arr_shape={arr.shape} input_arr_peak="
+                    f"{float(np.max(np.abs(arr))):.4f}"
+                )
+                # Also sample 3 widely-spaced values from chan1 of the
+                # Script CHOP itself, post-write, to confirm samples
+                # actually landed (not just the metadata).
+                try:
+                    ns = int(scriptOp.numSamples)
+                    if ns > 0:
+                        i_mid = ns // 2
+                        i_last = ns - 1
+                        v0 = scriptOp[0][0]
+                        vm = scriptOp[0][i_mid]
+                        vl = scriptOp[0][i_last]
+                        post += f"  chan0[0,{i_mid},{i_last}]=({v0:.4f}, {vm:.4f}, {vl:.4f})"
+                except Exception as e2:
+                    post += f"  chan-read-failed: {e2}"
+                self.log(post)
+            except Exception as e:
+                self.log(f"[POST] log failed: {e}")
