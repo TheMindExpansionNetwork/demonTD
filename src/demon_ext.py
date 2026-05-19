@@ -180,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "sounddevice-v1"
+BUILD_MARKER = "ctypes-portaudio-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -236,13 +236,28 @@ class DemonExt:
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
 
         # Python-side audio playback (bypasses TD's CHOP audio chain via
-        # sounddevice / PortAudio). Lifecycle is start()'d when initial
+        # ctypes -> libportaudio.dylib). Lifecycle is start()'d when initial
         # buffer arrives and stop()'d on Disconnect.
+        # Path to the vendored PortAudio dylib is computed from the
+        # demon_ext.py file location (vendor/sounddevice/_sounddevice_data/
+        # portaudio-binaries/libportaudio.dylib).
+        dylib_path = None
+        try:
+            here = os.path.dirname(os.path.abspath(
+                me.par.file.eval()))  # type: ignore[name-defined]  # noqa: F821
+            dylib_path = os.path.abspath(os.path.join(
+                here, os.pardir, "vendor", "sounddevice",
+                "_sounddevice_data", "portaudio-binaries", "libportaudio.dylib"))
+            if not os.path.isfile(dylib_path):
+                dylib_path = None
+        except Exception:
+            pass
         self._speaker_out = audio_mod.SpeakerOut(
             self._ring,
             sample_rate=wire.SAMPLE_RATE,
             channels=2,
             log=self.log,
+            dylib_path=dylib_path,
         )
 
         # WS client (Python thread; replaces TD's broken WebSocket DAT)
