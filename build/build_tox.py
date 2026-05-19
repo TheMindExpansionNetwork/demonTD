@@ -119,7 +119,13 @@ TOPOLOGY = [
     # cook rate to track audio block cadence. The Constant CHOP outputs
     # silence (constant 0) — audio_out's Python callback ignores the input
     # data and writes its own PCM from the ring buffer.
-    ("audio_clock",    "constantCHOP",  {}, (200, -200)),
+    # audio_clock is a Time-Slice'd Wave CHOP wired as audio_out's input.
+    # Its job is to make audio_out's input "dirty" every cook so TD doesn't
+    # cache audio_out's output. A Constant CHOP fails this — same value
+    # every cook → TD never re-cooks. A Wave CHOP's sine output advances
+    # phase every cook, so the samples differ → TD marks audio_out dirty
+    # → OnCookRecv runs at audio rate.
+    ("audio_clock",    "waveCHOP",      {}, (200, -200)),
     ("audio_out",      "scriptCHOP",    {}, (400, -200)),
     ("resample_out",   "resampleCHOP",  {}, (600, -200)),
     ("out_chop",       "outCHOP",       {}, (800, -200)),
@@ -185,6 +191,7 @@ def get_opclass_lookup():
         "scriptCHOP":          scriptCHOP,
         "resampleCHOP":        resampleCHOP,
         "constantCHOP":        constantCHOP,
+        "waveCHOP":            waveCHOP,
         "audiodeviceoutCHOP":  audiodeviceoutCHOP,
     }
 
@@ -824,23 +831,24 @@ def wire_audio(demon):
     out_chop = demon.op("out_chop")
     audiodevout = demon.op("audiodevout")
 
-    # audio_clock is now VESTIGIAL — kept in TOPOLOGY for backward compat,
-    # but DISCONNECTED from audio_out. We originally added it as a
-    # Time-Slice'd Constant CHOP input to force audio-rate cooking, but
-    # because its output is CONSTANT, TD considered audio_out "clean"
-    # forever and reused its (empty) first cook output. Now with audiodevout
-    # internal-pulling at audio rate, audio_out cooks correctly when it
-    # has NO input — TD dirties it every frame from the downstream pull.
+    # Configure audio_clock (Wave CHOP, Time Slice = ON, low-amplitude sine).
+    # Its purpose is to give audio_out a TIME-VARYING input every cook so
+    # TD doesn't cache audio_out's output. amplitude is near-silent (0.0001)
+    # because users may sum the COMP's out_chop into their audio chain and
+    # we don't want this carrier to be audible.
     if audio_clock is not None:
-        try:
-            audio_clock.par.timeslice = False
-        except Exception:
-            pass
+        for pname, pval in (("timeslice", True),
+                            ("type", "sin"),
+                            ("frequency", 1.0),
+                            ("amplitude", 0.0001),
+                            ("offset", 0.0)):
+            try:
+                setattr(audio_clock.par, pname, pval)
+            except Exception:
+                pass
 
     # Configure audio_out Script CHOP.
-    # Time Slice = ON; NO upstream input (source-only).
-    # The downstream internal audiodevout pulls at audio rate and that's
-    # what drives the cook cadence.
+    # Time Slice = ON; audio_clock wired as input (dirties it per cook).
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
@@ -850,18 +858,20 @@ def wire_audio(demon):
             audio_out.par.timeslice = True
         except Exception:
             pass
-        # Detach any prior input wiring (e.g. audio_clock from earlier builds).
-        try:
-            for c in audio_out.inputConnectors:
-                if c.connections:
-                    c.disconnect()
-        except Exception as e:
-            print(f"!! audio_out input detach: {e}")
-        # Diagnostic: confirm wiring matches expected (0 inputs).
+        # Wire audio_clock as audio_out's input.
+        if audio_clock is not None:
+            try:
+                for c in audio_out.inputConnectors:
+                    if c.connections:
+                        c.disconnect()
+                audio_out.inputConnectors[0].connect(audio_clock)
+            except Exception as e:
+                print(f"!! audio_clock -> audio_out wire: {e}")
+        # Diagnostic.
         try:
             n_in = sum(1 for c in audio_out.inputConnectors if c.connections)
             print(f"[build_tox] BUILD={BUILD_MARKER} audio_out inputs={n_in} "
-                  f"(expected 0 — audio_clock detached)")
+                  f"(expected 1 — wired to audio_clock Wave CHOP)")
         except Exception:
             pass
 
