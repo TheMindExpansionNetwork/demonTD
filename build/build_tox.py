@@ -829,24 +829,23 @@ def wire_audio(demon):
     resample_out = demon.op("resample_out")
     out_chop = demon.op("out_chop")
 
-    # FRAME-PUMP APPROACH:
-    #   - audio_out is a source-only Script CHOP, NO inputs.
-    #   - timeslice = False so we control numSamples ourselves.
-    #   - frame_exec onFrameStart force-cooks audio_out every frame (60fps).
-    #   - OnCookRecv pulls a frame-block (~800 samples) from the ring and
-    #     writes them, setting scriptOp.numSamples = 800.
-    #   - User's external audiodevout1 with Cook Every Frame = On pulls
-    #     out_chop every frame and plays the 800-sample block. 60fps *
-    #     800 samples = 48000 sample/s = audio rate.
-    # This bypasses TD's broken Time Slice propagation across COMP
-    # boundaries. Latency = 1 frame (~17 ms at 60fps).
+    # HYBRID FRAME-PUMP + TIME-SLICE:
+    #   - audio_out.timeslice = True so TD's audio chain treats its output
+    #     as audio-rate (mandatory for Audio Device Out to interpret
+    #     numSamples + rate correctly). With timeslice=False, samples
+    #     were getting interpreted as frame-rate garbage downstream.
+    #   - frame_exec force-cooks audio_out every frame to GUARANTEE the
+    #     cook happens (since pull-based Time Slice across COMP boundary
+    #     is unreliable in TD 2025).
+    #   - OnCookRecv produces ~800 samples per cook with numSamples + rate
+    #     explicitly set, regardless of TD's Time Slice context.
     if audio_out is not None:
         try:
             audio_out.par.callbacks = "callbacks"
         except Exception:
             pass
         try:
-            audio_out.par.timeslice = False
+            audio_out.par.timeslice = True
         except Exception:
             pass
         # Detach any input from previous builds (audio_clock, etc.).
