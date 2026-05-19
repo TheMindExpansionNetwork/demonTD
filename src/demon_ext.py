@@ -158,7 +158,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "timeslice-pump-v1"
+BUILD_MARKER = "copyNumpyArray-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1838,9 +1838,24 @@ class DemonExt:
             scriptOp.rate = wire.SAMPLE_RATE
         except Exception:
             pass
-        scriptOp.numSamples = n
+        # Use copyNumpyArray for direct (channels, samples) ndarray transfer.
+        # The previous appendChan('chan1').vals = list approach was producing
+        # a step-function in the CHOP viewer (flat segments jumping at frame
+        # rate) — TD seems not to honor multi-sample assignment via vals
+        # when the Script CHOP is the audio source for an Audio Device Out.
+        # copyNumpyArray is the canonical high-sample-count API.
         try:
-            scriptOp.appendChan("chan1").vals = pcm[0].tolist()
-            scriptOp.appendChan("chan2").vals = pcm[1].tolist()
+            # Ensure contiguous float32 (channels, samples). pcm is already
+            # (2, n) float32 from the LoopBuffer.
+            arr = np.ascontiguousarray(pcm, dtype=np.float32)
+            scriptOp.copyNumpyArray(arr)
+        except AttributeError:
+            # Fallback for TD builds that lack copyNumpyArray.
+            scriptOp.numSamples = n
+            try:
+                scriptOp.appendChan("chan1").vals = pcm[0].tolist()
+                scriptOp.appendChan("chan2").vals = pcm[1].tolist()
+            except Exception as e:
+                self.log(f"OnCookRecv write failed (fallback): {e}")
         except Exception as e:
-            self.log(f"OnCookRecv write failed: {e}")
+            self.log(f"OnCookRecv copyNumpyArray failed: {e}")
