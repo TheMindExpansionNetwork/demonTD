@@ -180,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "td-native-chain-v1"
+BUILD_MARKER = "seed-dirty-on-ready-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1403,6 +1403,7 @@ class DemonExt:
             self._ready_channels = int(data.get("channels", 2)) or 2
             cat = data.get("lora_catalog") or []
             self._apply_lora_catalog(cat)
+            self._seed_dirty_from_current_pars()
         elif kind == "lora_catalog":
             self._apply_lora_catalog(data.get("catalog") or [])
         elif kind == "params_update":
@@ -1794,6 +1795,32 @@ class DemonExt:
             if p.category == "init":
                 out[p.name] = self._read_par(p.name, p.default)
         return out
+
+    def _seed_dirty_from_current_pars(self) -> None:
+        """Populate self._dirty with EVERY continuous-param's current value.
+
+        Called once on `ready`. Without this, the server uses its internal
+        defaults (notably denoise=0 = passthrough) until the user moves a
+        slider — which is why "generated audio didn't kick in until I
+        touched denoise". After this call, the next OnTick sends a full
+        params message containing the user's current UI values, and the
+        server starts generating immediately.
+        """
+        seeded = 0
+        with self._lock:
+            for p in P.PARAMS:
+                if p.category != "continuous" or not p.wire_name:
+                    continue
+                par = self._par_by_name(p.name)
+                if par is None:
+                    continue
+                try:
+                    value = self._coerce_par_value(par, p)
+                except Exception:
+                    continue
+                self._dirty[p.wire_name] = value
+                seeded += 1
+        self.log(f"seeded {seeded} continuous params into _dirty for first tick")
 
     # -------- TD plumbing ----------------------------------------------------
 
