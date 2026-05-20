@@ -493,15 +493,17 @@ class SpeakerOut:
                  channels: int = 2,
                  log=print,
                  dylib_path: str | None = None,
-                 frames_per_buffer: int = 2048):
+                 frames_per_buffer: int = 4096):
         self._loop = loop
         self._sample_rate = float(sample_rate)
         self._channels = int(channels)
         # Larger blocks = fewer Python callbacks per second = less GIL
-        # contention with TD's main thread. 2048 frames @ 48kHz = ~43ms.
+        # contention with TD's main thread. 4096 frames @ 48 kHz = ~85 ms.
         # That's our audio latency floor; acceptable for a generative
-        # session, and avoids the choppy playback that the default
-        # ~256-frame block size produces under Python GIL pressure.
+        # session, and avoids occasional stutters when a wrap-spanning
+        # callback coincides with TD doing heavy work on the main thread.
+        # 2048 had occasional misses (~5% glitch rate); 4096 doubles our
+        # deadline headroom for the audio callback to complete.
         self._frames_per_buffer = int(frames_per_buffer)
         self._log = log
         self._dylib_path = dylib_path
