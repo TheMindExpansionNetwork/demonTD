@@ -180,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "seed-dirty-on-ready-v1"
+BUILD_MARKER = "v0.1.2-polish"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -236,18 +236,28 @@ class DemonExt:
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
 
         # Python-side audio playback (bypasses TD's CHOP audio chain via
-        # ctypes -> libportaudio.dylib). Lifecycle is start()'d when initial
-        # buffer arrives and stop()'d on Disconnect.
-        # Path to the vendored PortAudio dylib is computed from the
-        # demon_ext.py file location (vendor/sounddevice/_sounddevice_data/
-        # portaudio-binaries/libportaudio.dylib).
+        # ctypes -> bundled PortAudio binary). Lifecycle is start()'d when
+        # initial buffer arrives and stop()'d on Disconnect.
+        # Path to the vendored PortAudio binary is computed from the
+        # demon_ext.py file location + the host platform's filename:
+        #   - macOS:   libportaudio.dylib (universal2 arm64+x86_64)
+        #   - Windows: libportaudio64bit.dll
+        #   - Linux:   libportaudio.so (not vendored yet; falls back to system)
         dylib_path = None
         try:
+            import platform as _platform
+            _sysname = _platform.system().lower()
+            if _sysname == "darwin":
+                _libname = "libportaudio.dylib"
+            elif _sysname == "windows":
+                _libname = "libportaudio64bit.dll"
+            else:
+                _libname = "libportaudio.so"
             here = os.path.dirname(os.path.abspath(
                 me.par.file.eval()))  # type: ignore[name-defined]  # noqa: F821
             dylib_path = os.path.abspath(os.path.join(
                 here, os.pardir, "vendor", "sounddevice",
-                "_sounddevice_data", "portaudio-binaries", "libportaudio.dylib"))
+                "_sounddevice_data", "portaudio-binaries", _libname))
             if not os.path.isfile(dylib_path):
                 dylib_path = None
         except Exception:
@@ -320,9 +330,23 @@ class DemonExt:
             if direct is None:
                 direct = bool(self._read_par("Directpod", True))
 
-            base = self._read_par("Serverurl", "http://localhost:1318")
+            base = self._read_par("Serverurl", "ws://localhost:8765/")
             api_key = None if anonymous else (self._read_par("Apikey", "") or None)
             self._api_key = api_key or ""
+
+            # Pre-flight: source audio is required. Bail loudly BEFORE any
+            # WS work so the user gets immediate feedback (status text + a
+            # popup dialog) instead of a status string buried below a
+            # half-completed connect.
+            if not self._has_source_audio():
+                msg = ("Set Source Audio File on the Session page "
+                       "(WAV / MP3 / M4A), then pulse Connect.")
+                self._set_status(msg)
+                try:
+                    ui.messageBox("DEMON: source audio required", msg)  # noqa: F821
+                except Exception:
+                    pass
+                return False
 
             if direct:
                 ws_url = self._http_to_ws(base)
@@ -1146,6 +1170,17 @@ class DemonExt:
 
         # 4. snapshot
         return self._snapshot_input_chop()
+
+    def _has_source_audio(self) -> bool:
+        """Quick pre-flight check: did the user provide a source?
+        Either a Source Audio File par or a wired CHOP with a file par.
+        Used by Connect() to bail with a clear error before any WS work."""
+        try:
+            if (self._read_par("Sourcefile", "") or "").strip():
+                return True
+        except Exception:
+            pass
+        return self._wired_chop_file_path() is not None
 
     def _wired_chop_file_path(self) -> str | None:
         """If an upstream CHOP (e.g. Audio File In) is wired into the COMP's

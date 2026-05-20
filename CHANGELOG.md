@@ -2,6 +2,40 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.2] — 2026-05-20
+
+Polish + Windows build. No behavior changes for working flows.
+
+### UX
+- **Session page decluttered.** The disabled `Hosted Mode (coming soon)`
+  header and its eight greyed-out children (`Anonymous`, `Direct Pod`,
+  `Authenticate`, `Paste API Key`, `API Key`, `Queue Position`, `Expires In`,
+  `Still Playing`) are gone for v0.1.x. The supporting code in
+  `demon_ext.py` is unchanged — defaults via `_read_par` fallbacks keep
+  the direct-anonymous mode that's always been the only working path.
+  Hosted mode reappears in v0.2 when it actually works.
+- **Source Audio File pre-flight.** Pulsing Connect without a source
+  file (and no wired CHOP) now bails immediately with a clear status
+  message AND a TD popup dialog, instead of half-attempting a connect
+  and burying the error in textport.
+- **Server URL default** is now `ws://localhost:8765/` (DEMON's
+  realtime_motion_graph_web port) instead of the bogus
+  `http://localhost:1318`.
+
+### Windows build (untested by maintainer)
+- Vendored `libportaudio64bit.dll` and `libportaudio64bit-asio.dll` from
+  the `sounddevice` Windows wheel into
+  `vendor/sounddevice/_sounddevice_data/portaudio-binaries/`.
+- Cross-platform path resolution in `demon_ext.py` picks the right
+  binary at runtime: `.dylib` on macOS, `.dll` on Windows, `.so` on
+  Linux (Linux not vendored — falls through to a system install).
+- `SpeakerOut._load_lib` candidate list extended with Windows + Linux
+  paths.
+
+### Internal
+- Removed `_playback_pos` redundant += updates (already done in v0.1.1,
+  reconfirmed here).
+
 ## [0.1.1] — 2026-05-20
 
 End-to-end audio playback now works on macOS. v0.1.0 shipped with the wire

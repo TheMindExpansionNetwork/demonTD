@@ -278,10 +278,13 @@ We bundle three things under `vendor/` so users don't need to install anything:
 - **`zstandard`** — for DEMON's zstd-compressed audio slices. Per-platform wheels.
 - **`websocket-client`** — pure-Python WS lib that replaces TD's broken WebSocket
   DAT (TD 2025's DAT silently drops binary frames > a few MB).
-- **`sounddevice` + `libportaudio.dylib`** — for the Python audio output path.
-  The dylib is macOS universal2; one file works for arm64 and x86_64.
+- **`sounddevice` + PortAudio** — for the Python audio output path. Universal
+  macOS dylib (arm64 + x86_64) + Windows x64 DLLs (regular + ASIO variants)
+  ship in the same `_sounddevice_data/portaudio-binaries/` directory. The
+  cross-platform loader in `src/audio.py` picks the right one at runtime.
 
-Windows binary support is on the v0.2 list.
+The Windows binaries are vendored but **not yet runtime-tested** by the
+maintainer — please open an issue if anything misbehaves on Windows.
 
 ## Development
 
@@ -305,12 +308,13 @@ can still import it.
 
 ## Out of scope (v0.1, deferred to v0.2+)
 
-- **Windows build** — `libportaudio.dll` vendoring + Windows-specific path
-  resolution.
+- **Hosted Daydream mode** — queue join/status/leave + OAuth (code is in
+  `src/queue_client.py` and `src/oauth.py`; UI controls return in v0.2).
+  v0.1 is direct-pod only.
 - **Internal `audiodeviceoutCHOP`** — a Session-page device picker that
   embeds a TD-native `Audio Device Out` inside the COMP. Currently
   unnecessary since SpeakerOut handles playback; useful for users who want
-  their audio device choice picked in TD instead of macOS Sound.
+  their audio device choice picked in TD instead of OS Sound settings.
 - **Custom C++ CHOP** — the "drop one op and everything works for any TD
   audio chain" solution. Significant build complexity; revisit if adoption
   justifies it.

@@ -63,9 +63,11 @@ SESSION_PARAMS: list[Param] = [
     Param("Disconnect", None, "Session", "Pulse", "session", order=20,
           help="Close the active WebSocket session."),
     Param("Serverurl", None, "Session", "Str", "session",
-          default="http://localhost:1318", order=30, label="Server URL",
-          help="DEMON pod origin. Default http://localhost:1318 is the port "
-               "DEMON's demos.realtime_motion_graph_web uses."),
+          default="ws://localhost:8765/", order=30, label="Server URL",
+          help="DEMON pod WebSocket URL. ws://localhost:8765/ is the default "
+               "port used by DEMON's demos.realtime_motion_graph_web; for a "
+               "Vast.ai-hosted pod use the Direct WS line printed by "
+               "scripts/vast/launch.sh (e.g. ws://1.2.3.4:44105/)."),
     Param("Sourcefile", None, "Session", "File", "session",
           default="", order=40, label="Source Audio File",
           help="WAV file to send as the source/reference audio on Connect. "
@@ -81,28 +83,11 @@ SESSION_PARAMS: list[Param] = [
                "rate across a Base COMP boundary. Toggle off if you want "
                "to route the audio only via the COMP's out_chop port to "
                "your own external Audio Device Out CHOP."),
-    Param("Hostedheader", None, "Session", "Header", "session",
-          order=60, section_header=True, label="Hosted Mode (coming soon)"),
-    Param("Anonymous", None, "Session", "Toggle", "session", default=True, order=70,
-          enable=False,
-          help="Hosted Daydream mode is coming soon. Local pod is the only "
-               "supported path in this release."),
-    Param("Directpod", None, "Session", "Toggle", "session", default=True, order=75,
-          label="Direct Pod", enable=False,
-          help="Direct pod mode is locked on. Hosted/queue mode is coming soon."),
-    Param("Authenticate", None, "Session", "Pulse", "session", order=80,
-          label="Authenticate (coming soon)", enable=False,
-          help="Daydream OAuth. Disabled in this release."),
-    Param("Pasteapikey", None, "Session", "Pulse", "session", order=85,
-          label="Paste API Key (coming soon)", enable=False),
-    Param("Apikey", None, "Session", "Str", "session", default="", order=90,
-          label="API Key", secret=True, enable=False),
-    Param("Queueposition", None, "Session", "Int", "session", default=0,
-          order=95, readonly=True, enable=False, label="Queue Position"),
-    Param("Expiresin", None, "Session", "Float", "session", default=0.0,
-          order=100, readonly=True, enable=False, label="Expires In"),
-    Param("Stillplaying", None, "Session", "Pulse", "session", order=105,
-          label="Still Playing (coming soon)", enable=False),
+    # Hosted-mode pars (Anonymous, Apikey, Queueposition, etc.) were
+    # removed for v0.1.1 to declutter the Session page. The supporting
+    # code in demon_ext.py is kept (anonymous=True, direct=True defaults
+    # via _read_par fallback) so a future v0.2 release can re-add these
+    # pars with enable=True and hosted mode just works.
     Param("Debug", None, "Session", "Toggle", "session", default=False,
           order=999, label="Debug Logging",
           help="When on, the extension prints verbose textport diagnostics "

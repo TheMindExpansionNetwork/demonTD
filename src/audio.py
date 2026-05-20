@@ -354,12 +354,25 @@ class SpeakerOut:
         candidates: list[str] = []
         if vendor_dylib_path:
             candidates.append(vendor_dylib_path)
-        # System-installed PortAudio (e.g. homebrew) as fallback.
-        candidates.extend([
-            "/opt/homebrew/lib/libportaudio.dylib",
-            "/usr/local/lib/libportaudio.dylib",
-            "libportaudio.dylib",  # let dlopen search DYLD path
-        ])
+        # System-installed PortAudio fallbacks, per platform.
+        import platform as _platform
+        sysname = _platform.system().lower()
+        if sysname == "darwin":
+            candidates.extend([
+                "/opt/homebrew/lib/libportaudio.dylib",
+                "/usr/local/lib/libportaudio.dylib",
+                "libportaudio.dylib",  # let dlopen search DYLD path
+            ])
+        elif sysname == "windows":
+            candidates.extend([
+                "libportaudio64bit.dll",
+                "libportaudio.dll",  # some installs drop the bitness suffix
+            ])
+        else:
+            candidates.extend([
+                "libportaudio.so",
+                "libportaudio.so.2",
+            ])
         last_err = None
         for path in candidates:
             try:
@@ -371,7 +384,7 @@ class SpeakerOut:
             except OSError as e:
                 last_err = e
                 continue
-        log(f"[speaker_out] could not load libportaudio.dylib: {last_err}")
+        log(f"[speaker_out] could not load PortAudio binary: {last_err}")
         return None
 
     @staticmethod
