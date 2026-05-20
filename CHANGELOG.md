@@ -2,6 +2,43 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.4] — 2026-05-20
+
+Two audio-thread improvements landing the playback path at zero
+underruns over hundreds of callbacks of testing.
+
+### Vectorized loop-seam read
+
+v0.1.3's seam crossfade used a per-frame Python loop inside
+`LoopBuffer.read` — ~2k iterations per audio callback at audio
+rate. Each iteration did several numpy ops. Total cost was small
+(~2 ms per callback) but Python overhead caught by TD's main-
+thread GIL pressure occasionally pushed wrap-spanning callbacks
+past their 43 ms deadline → ~5% audible stutter rate.
+
+The read is now split into vectorized runs of (a) bulk copy from
+contiguous buffer ranges, (b) numpy-vectorized crossfade over the
+tail seam. Crossfade math is identical to the AudioWorklet, just
+batched. Per-callback Python overhead dropped from ~2k iterations
+to ~3 numpy ops.
+
+### Bigger PortAudio block (4096 frames)
+
+Audio latency floor: ~43 ms (2048 frames) → ~85 ms (4096 frames).
+Doubles the audio callback's deadline so wrap-spanning callbacks
+have headroom even when TD's main thread holds the GIL for >40 ms.
+
+Verified clean: `[speaker_out] stopped (cb_count=615 underruns=0)`
+after ~52 s of normal use with TD activity. Pre-fix the same
+session produced occasional audible glitches.
+
+### Files changed
+- `src/audio.py` — `LoopBuffer.read` vectorized; `SpeakerOut`
+  default `frames_per_buffer` 2048 → 4096.
+- `src/demon_ext.py` — bump `BUILD_MARKER` to `4k-buffer-v1`.
+
+BUILD_MARKER → 4k-buffer-v1.
+
 ## [0.1.3] — 2026-05-20
 
 Single fix: loop seam crossfade.
