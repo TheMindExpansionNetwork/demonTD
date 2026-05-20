@@ -214,7 +214,7 @@ PROMPT_LORA_PARAMS: list[Param] = [
 # Page 4: Synthesis (the hot continuous params)
 # -----------------------------------------------------------------------------
 SYNTHESIS_PARAMS: list[Param] = [
-    Param("Denoise", "denoise", "Synthesis", "Float", "continuous", default=0.7,
+    Param("Denoise", "denoise", "Synthesis", "Float", "continuous", default=0.85,
           min=0.0, max=1.0, clamp_min=True, clamp_max=True, order=10,
           help="Denoising strength."),
     Param("Seed", "seed", "Synthesis", "Float", "continuous", default=0.0,

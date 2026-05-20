@@ -1632,7 +1632,15 @@ class DemonExt:
                                 sp[0].normMax = 1.8
                                 sp[0].clampMin = True
                                 sp[0].clampMax = True
-                                default_strength = float(entry.get("strength", 1.0))
+                                # Default strength: 1.0 for any DEFAULT_ON LoRA
+                                # (the server occasionally reports strength=0
+                                # before the LoRA is loaded, which would
+                                # otherwise leave the par at 0). For other
+                                # LoRAs, honor the server's reported default.
+                                if default_on:
+                                    default_strength = 1.0
+                                else:
+                                    default_strength = float(entry.get("strength", 1.0))
                                 sp[0].default = default_strength
                                 sp[0].val = default_strength
                             except Exception:
