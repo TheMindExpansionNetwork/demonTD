@@ -103,6 +103,12 @@ SESSION_PARAMS: list[Param] = [
           order=100, readonly=True, enable=False, label="Expires In"),
     Param("Stillplaying", None, "Session", "Pulse", "session", order=105,
           label="Still Playing (coming soon)", enable=False),
+    Param("Debug", None, "Session", "Toggle", "session", default=False,
+          order=999, label="Debug Logging",
+          help="When on, the extension prints verbose textport diagnostics "
+               "(per-tick state, sample-decode hex dumps, slice/initial "
+               "buffer WAV files to /tmp/demon-debug/, ws frame echoes). "
+               "Off by default — keep off unless investigating a bug."),
 ]
 
 
@@ -117,25 +123,29 @@ INIT_PARAMS: list[Param] = [
     Param("Depth", "depth", "Init", "Int", "init", default=4,
           min=1, max=8, clamp_min=True, clamp_max=True, order=30,
           help="DiT pipeline depth (latency/quality tradeoff)."),
-    Param("Vaewindow", "vae_window", "Init", "Float", "init", default=3.0,
+    Param("Vaewindow", "vae_window", "Init", "Float", "init", default=6.0,
           min=0.5, max=10.0, clamp_min=True, clamp_max=True, order=40,
-          label="VAE Window", help="VAE decoder sliding window in seconds."),
+          label="VAE Window", help="VAE decoder sliding window in seconds. "
+                                   "Matches demon-public-demo default."),
     Param("Crop", "crop", "Init", "Float", "init", default=0.0,
           min=0.0, max=120.0, clamp_min=True, order=50,
           help="Crop input audio to N seconds (0 = no crop)."),
     Param("Steps", "steps", "Init", "Int", "init", default=8,
           min=1, max=32, clamp_min=True, clamp_max=True, order=60,
           help="Generation steps per latent frame."),
-    Param("Fastvae", "fast_vae", "Init", "Toggle", "init", default=True, order=70,
-          label="Fast VAE", help="Use dreamvae distilled decoder (TensorRT only)."),
+    Param("Fastvae", "fast_vae", "Init", "Toggle", "init", default=False, order=70,
+          label="Fast VAE", help="Use dreamvae distilled decoder (TensorRT only). "
+                                  "Off matches demon-public-demo default."),
     Param("Walkwindow", "walk_window", "Init", "Toggle", "init", default=False, order=80,
           label="Walk Window", help="For long sources, use 60s engine at boundaries."),
     Param("Walkwindows", "walk_window_s", "Init", "Float", "init", default=60.0,
           min=1.0, max=240.0, clamp_min=True, order=90,
           label="Walk Window (s)", help="Walk window duration in seconds."),
-    Param("Initprompt", "prompt", "Init", "Str", "init", default="instrumental music",
+    Param("Initprompt", "prompt", "Init", "Str", "init",
+          default="heavy dubstep, deathstep, afxdump, growl heavy bass distortion",
           order=100, multiline=True, label="Initial Prompt",
-          help="Text prompt at session start (changeable later via Send Prompt)."),
+          help="Text prompt at session start (changeable later via Send Prompt). "
+               "Default matches demon-public-demo."),
     Param("Fixturename", "fixture_name", "Init", "Str", "init", default="",
           order=110, label="Fixture Name",
           help="Known fixture name for sidecar lookup (BPM/key/latents). Optional."),

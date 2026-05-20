@@ -174,6 +174,12 @@ class LoopBuffer:
 
         Returns shape (channels, num_frames) float32. Wraps the loop
         automatically. If the buffer is uninitialized, returns silence.
+
+        IMPORTANT: This is the AUTHORITATIVE play head. Only one consumer
+        (the actual audio output thread — SpeakerOut._pa_callback) should
+        call this. Other consumers (e.g. the Script CHOP cook callback,
+        for visual reactivity) must use `peek()` so they don't race the
+        head forward and cause the audio thread to skip samples.
         """
         ch = self.channels
         out = np.zeros((ch, num_frames), dtype=np.float32)
@@ -196,6 +202,42 @@ class LoopBuffer:
                 pos = (pos + take) % frames
 
             self._position = pos
+            return out
+
+    def peek(self, num_frames: int,
+             position: int | None = None) -> np.ndarray:
+        """Read `num_frames` frames WITHOUT advancing the play head.
+
+        For non-authoritative consumers (e.g. a Script CHOP that wants
+        to mirror the current audio for visual reactivity but must not
+        affect what the actual speaker thread plays). Returns shape
+        (channels, num_frames) float32; wraps the loop automatically;
+        returns silence if uninitialized.
+
+        `position` lets you read from an explicit frame offset instead
+        of the current play head. Defaults to the play head.
+        """
+        ch = self.channels
+        out = np.zeros((ch, num_frames), dtype=np.float32)
+        if num_frames <= 0:
+            return out
+
+        with self._lock:
+            buf = self._buffer
+            frames = self._frames
+            if buf is None or frames == 0:
+                return out
+
+            pos = self._position if position is None else (position % frames)
+            written = 0
+            while written < num_frames:
+                end_in_buf = frames - pos
+                take = min(end_in_buf, num_frames - written)
+                out[:, written:written + take] = buf[:, pos:pos + take]
+                written += take
+                pos = (pos + take) % frames
+
+            # Critically: do NOT update self._position here.
             return out
 
     def seek(self, position_frames: int) -> None:

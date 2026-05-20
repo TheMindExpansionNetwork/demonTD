@@ -745,41 +745,22 @@ def onTimer(timerOp, segment):
         ext.OnHeartbeat()
 
 def onReceiveText(dat, rowIndex, message):
-    try:
-        print(f"[ws onReceiveText] len={len(message) if message else 0}: {message[:200] if message else ''!r}")
-    except Exception:
-        pass
+    # The TD WebSocket DAT is vestigial — we use ws_client.py instead, which
+    # bypasses these callbacks entirely. Kept here so any future direct-DAT
+    # usage still dispatches to the extension.
     _ext().OnReceive(dat, rowIndex=rowIndex, message=message)
 
 def onReceiveBinary(dat, contents):
-    try:
-        print(f"[ws onReceiveBinary] len={len(contents) if contents else 0}")
-    except Exception:
-        pass
     _ext().OnReceive(dat, contents=contents)
 
 def onConnect(dat):
-    try:
-        print(f"[ws onConnect] {dat.name} netaddress={dat.par.netaddress.eval()}")
-    except Exception:
-        pass
     try:
         _ext().OnWsConnect(dat)
     except Exception as e:
         print(f"[ws onConnect] OnWsConnect failed: {e}")
 
 def onDisconnect(dat):
-    # TD WebSocket DAT exposes the last close code/reason on the DAT.
-    # Surface anything available so we can diagnose server-side kicks.
-    info_bits = []
-    for attr in ("closeCode", "closeReason", "lastError", "errors"):
-        v = getattr(dat, attr, None)
-        if v is not None and not callable(v):
-            info_bits.append(f"{attr}={v!r}")
-    try:
-        print(f"[ws onDisconnect] {dat.name} " + (" ".join(info_bits) or ""))
-    except Exception:
-        pass
+    pass
 
 def onHTTPRequest(webServerDAT, request, response):
     uri = request.get("uri", "")
@@ -792,18 +773,7 @@ def onHTTPRequest(webServerDAT, request, response):
 
 # Script CHOP cook hook. TD calls onCook(scriptOp) on the configured DAT.
 # We dispatch by the calling op's name.
-# DIAGNOSTIC: print every Nth call so we can verify the cadence.
-_onCook_calls = 0
 def onCook(scriptOp):
-    global _onCook_calls
-    _onCook_calls += 1
-    # Print first 5 cooks (boot + early connect activity), then every 1000th.
-    if _onCook_calls <= 5 or (_onCook_calls % 1000 == 0):
-        try:
-            print(f"[callbacks.onCook #{_onCook_calls}] op={scriptOp.name} "
-                  f"numSamples={scriptOp.numSamples}")
-        except Exception:
-            pass
     name = scriptOp.name
     ext = _ext()
     if name == "script_send":

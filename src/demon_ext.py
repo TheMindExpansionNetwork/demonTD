@@ -180,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "bigblock-v1"
+BUILD_MARKER = "cleanup-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -272,6 +272,12 @@ class DemonExt:
         # message is the raw float16 initial buffer (NO 23-byte header).
         # Subsequent binaries are slices. We flip this on `ready`.
         self._expecting_initial_buffer: bool = False
+
+        # Cached state of the `Debug` toggle on the Session page. When True,
+        # verbose diagnostics are logged + WAV dumps go to /tmp/demon-debug/.
+        # Refreshed via OnParChange("Debug", ...). Cached so we don't read
+        # a par on every log call.
+        self._debug_enabled: bool = bool(self._read_par("Debug", False))
 
         self.log(f"DemonExt initialized — BUILD={BUILD_MARKER}")
 
@@ -689,6 +695,16 @@ class DemonExt:
         if not schema:
             return
 
+        # 0. Debug toggle — cache the new value so log call sites can
+        # check a fast bool instead of evaluating a par every time.
+        if name == "Debug":
+            try:
+                self._debug_enabled = bool(par.eval())
+            except Exception:
+                self._debug_enabled = False
+            self.log(f"Debug logging {'enabled' if self._debug_enabled else 'disabled'}")
+            return
+
         # 1. Pulse actions
         if schema.type == "Pulse":
             self._handle_pulse(name)
@@ -719,17 +735,18 @@ class DemonExt:
           2. Flush pending continuous-param changes as a single batched
              {type:"params"} message.
         """
-        # First-tick beacon so we can confirm the timer is firing.
-        if not getattr(self, "_ticked_once", False):
+        # First-tick beacon so we can confirm the timer is firing. Gated:
+        # only printed when Debug is on.
+        if self._debug_enabled and not getattr(self, "_ticked_once", False):
             self._ticked_once = True
             self.log("OnTick: timer is running (first tick)")
         # 1. Drain inbound from WS thread FIRST so connect/open/text events
         #    process before any param sends try to use the connection.
         self._drain_inbound()
 
-        # Periodic ring-buffer telemetry so we can see audio flowing in.
-        # Logs at most every ~2 s once connected.
-        if self._connected:
+        # Periodic ring-buffer telemetry (~2 s cadence). Gated behind Debug;
+        # operationally not useful once we know the chain works.
+        if self._debug_enabled and self._connected:
             now = time.time()
             last = getattr(self, "_last_buf_log", 0.0)
             if now - last > 2.0:
@@ -854,20 +871,21 @@ class DemonExt:
         self._pending_audio_samples = pcm.shape[1]
         self.log(f"_open_ws: pending {pcm.shape[1]} samples "
                  f"({pcm.shape[1] / wire.SAMPLE_RATE:.2f}s) from {source_label}")
-        # Diagnostic: dump the EXACT PCM we're about to encode + send. If
-        # this WAV plays correctly in Audacity/QuickTime, our source is
-        # good and any garbage in the echo comes from the server side.
-        try:
-            peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
-            mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
-            self.log(f"[DIAG sent_to_server] shape={pcm.shape} "
-                     f"dtype={pcm.dtype} peak={peak:.4f} mean_abs={mabs:.4f}")
-        except Exception:
-            pass
-        self._dump_wav(
-            os.path.join(DEBUG_DUMP_DIR, "sent_to_server.wav"),
-            pcm, channels=2,
-        )
+        # Optional debug: dump the EXACT PCM we're about to encode + send
+        # so a user can verify on disk what's leaving the client. Behind
+        # the Debug toggle so the .tox doesn't write to /tmp every Connect.
+        if self._debug_enabled:
+            try:
+                peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
+                mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
+                self.log(f"[DIAG sent_to_server] shape={pcm.shape} "
+                         f"dtype={pcm.dtype} peak={peak:.4f} mean_abs={mabs:.4f}")
+            except Exception:
+                pass
+            self._dump_wav(
+                os.path.join(DEBUG_DUMP_DIR, "sent_to_server.wav"),
+                pcm, channels=2,
+            )
 
         # 4. Close any prior client, build a new one, connect.
         if self._wsc is not None:
@@ -933,7 +951,8 @@ class DemonExt:
                     self.log("[ws_client] open — flushing config + audio")
                     self._flush_pending()
                 elif kind == "text":
-                    self.log(f"[ws_client] <- text {len(payload)}B: {payload[:120]!r}")
+                    if self._debug_enabled:
+                        self.log(f"[ws_client] <- text {len(payload)}B: {payload[:120]!r}")
                     self._on_text(payload)
                 elif kind == "binary":
                     self._on_binary(payload)
@@ -966,8 +985,9 @@ class DemonExt:
                 except Exception as e:
                     self.log(f"frame param send error: {e}")
 
-        # 3. Telemetry (~every 2 s)
-        if self._connected:
+        # 3. Telemetry (~every 2 s) — gated behind Debug. Once we know the
+        # chain works, these counters are pure noise.
+        if self._debug_enabled and self._connected:
             now = time.time()
             last = getattr(self, "_last_telem_log", 0.0)
             if now - last > 2.0:
@@ -1309,18 +1329,22 @@ class DemonExt:
         def init_val(td_name: str, default: Any) -> Any:
             return self._read_par(td_name, default)
 
+        # Fallback defaults below match demon-public-demo's
+        # useStartSession.ts buildConfig() — only used if the par read
+        # somehow fails (par missing, type error, etc.).
         cfg: dict[str, Any] = {
             "sde":          bool(init_val("Sde", False)),
             "lora":         bool(init_val("Lora", True)),
             "depth":        int(init_val("Depth", 4)),
-            "vae_window":   float(init_val("Vaewindow", 3.0)),
+            "vae_window":   float(init_val("Vaewindow", 6.0)),
             "crop":         float(init_val("Crop", 0.0)),
             "steps":        int(init_val("Steps", 8)),
-            "fast_vae":     bool(init_val("Fastvae", True)),
+            "fast_vae":     bool(init_val("Fastvae", False)),
             "walk_window":  bool(init_val("Walkwindow", False)),
             "walk_window_s": float(init_val("Walkwindows", 60.0)),
             "enabled_loras": self._enabled_loras(),
-            "prompt":       str(init_val("Initprompt", "instrumental music")),
+            "prompt":       str(init_val("Initprompt",
+                "heavy dubstep, deathstep, afxdump, growl heavy bass distortion")),
             "lora_strengths": self._lora_strengths(),
             "fixture_name": str(init_val("Fixturename", "")),
         }
@@ -1449,30 +1473,24 @@ class DemonExt:
                 if n <= 0:
                     self.log(f"initial buffer: empty")
                     return
-                # ---- DIAGNOSTIC ----
-                try:
-                    head_hex = bytes(buf[:32]).hex(" ")
-                    peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
-                    mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
-                    self.log(
-                        f"[DIAG initial_buffer] bytes={len(buf)} "
-                        f"head32={head_hex}"
+                # Optional debug: log byte stats + dump WAV. Gated.
+                if self._debug_enabled:
+                    try:
+                        head_hex = bytes(buf[:32]).hex(" ")
+                        peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
+                        mabs = float(np.mean(np.abs(pcm))) if pcm.size > 0 else 0.0
+                        self.log(f"[DIAG initial_buffer] bytes={len(buf)} "
+                                 f"head32={head_hex}")
+                        self.log(f"[DIAG initial_buffer] decoded peak={peak:.4f} "
+                                 f"mean_abs={mabs:.4f} first10={pcm[:10].tolist()}")
+                    except Exception as e:
+                        self.log(f"[DIAG initial_buffer] log failed: {e}")
+                    self._dump_wav(
+                        os.path.join(DEBUG_DUMP_DIR, "initial_buffer.wav"),
+                        pcm[: n * ch], ch,
                     )
-                    self.log(
-                        f"[DIAG initial_buffer] decoded peak={peak:.4f} "
-                        f"mean_abs={mabs:.4f} first10={pcm[:10].tolist()}"
-                    )
-                except Exception as e:
-                    self.log(f"[DIAG initial_buffer] log failed: {e}")
-                # Dump to disk for offline inspection.
-                self._dump_wav(
-                    os.path.join(DEBUG_DUMP_DIR, "initial_buffer.wav"),
-                    pcm[: n * ch], ch,
-                )
                 # Initialize the loop with this buffer (channels, frames).
                 self._ring.init(pcm[: n * ch], channels=ch)
-                # Reset per-session slice debug counter so dumps are
-                # named slice_0/1/2 on every reconnect.
                 self._debug_slice_count = 0
                 self.log(
                     f"initial buffer: {n} frames ({n / wire.SAMPLE_RATE:.2f}s) "
@@ -1503,25 +1521,25 @@ class DemonExt:
         if n <= 0:
             return
 
-        # ---- DIAGNOSTIC: log + dump first 3 slices ----
-        idx = getattr(self, "_debug_slice_count", 0)
-        if idx < 3:
-            try:
-                peak = float(np.max(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
-                mabs = float(np.mean(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
-                self.log(
-                    f"[DIAG slice_{idx}] flags={slice_.flags} "
-                    f"start_sample={slice_.start_sample} num_samples={slice_.num_samples} "
-                    f"channels={slice_.channels} peak={peak:.4f} mean_abs={mabs:.4f} "
-                    f"first10={slice_.pcm[:10].tolist()}"
+        # Optional debug: log first 3 slices + dump WAVs. Gated.
+        if self._debug_enabled:
+            idx = getattr(self, "_debug_slice_count", 0)
+            if idx < 3:
+                try:
+                    peak = float(np.max(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
+                    mabs = float(np.mean(np.abs(slice_.pcm))) if slice_.pcm.size > 0 else 0.0
+                    self.log(
+                        f"[DIAG slice_{idx}] flags={slice_.flags} "
+                        f"start_sample={slice_.start_sample} num_samples={slice_.num_samples} "
+                        f"channels={slice_.channels} peak={peak:.4f} mean_abs={mabs:.4f}"
+                    )
+                except Exception:
+                    pass
+                self._dump_wav(
+                    os.path.join(DEBUG_DUMP_DIR, f"slice_{idx}.wav"),
+                    slice_.pcm[: n * ch], ch,
                 )
-            except Exception:
-                pass
-            self._dump_wav(
-                os.path.join(DEBUG_DUMP_DIR, f"slice_{idx}.wav"),
-                slice_.pcm[: n * ch], ch,
-            )
-            self._debug_slice_count = idx + 1
+                self._debug_slice_count = idx + 1
 
         if slice_.flags == wire.SLICE_FLAG_DELTA:
             self._ring.add_delta(slice_.start_sample, slice_.pcm[: n * ch])
@@ -1696,13 +1714,10 @@ class DemonExt:
             self.log("_send_text: no WS client")
             return
         ok = wsc.send_text(payload)
-        # Don't log every single send — at 60 Hz this floods the textport.
-        # Only log failures + sample 1 in 600 to keep visibility for debugging.
-        self._n_send_text = getattr(self, "_n_send_text", 0) + 1
+        # Only log on failure. The sampled-every-600 success log was just
+        # confirmation during debugging and adds nothing operationally.
         if not ok:
             self.log(f"_send_text: {len(payload)} chars FAILED")
-        elif self._n_send_text % 600 == 1:
-            self.log(f"_send_text #{self._n_send_text}: {len(payload)} chars ok (sampled)")
 
     def _send_bytes(self, payload: bytes) -> None:
         """Send a binary frame via the Python WS client."""
@@ -1711,7 +1726,10 @@ class DemonExt:
             self.log("_send_bytes: no WS client")
             return
         ok = wsc.send_binary(payload)
-        self.log(f"_send_bytes: {len(payload)} B {'ok' if ok else 'FAILED'}")
+        if not ok:
+            self.log(f"_send_bytes: {len(payload)} B FAILED")
+        elif self._debug_enabled:
+            self.log(f"_send_bytes: {len(payload)} B ok")
 
     def _snapshot_audio(self, chop) -> np.ndarray | None:
         """Grab the current samples from a CHOP (param-reference, op-path, or
@@ -1841,17 +1859,14 @@ class DemonExt:
         scriptOp.appendChan("dummy")
 
     def OnCookRecv(self, scriptOp) -> None:
-        """audio_out Script CHOP cook callback. Reads from the loop buffer.
+        """audio_out Script CHOP cook callback.
 
-        FRAME-PUMP mode (Time Slice = False):
-          - Called from frame_exec onFrameStart at frame rate (~60 Hz).
-          - We produce a frame-sized block of samples each cook.
-          - 60 cooks/sec × 800 samples = 48000 samples/sec = audio rate.
-
-        The loop buffer wraps automatically: when position reaches end,
-        it continues reading from frame 0. That's DEMON's intended model
-        — the track loops forever as the server keeps patching the loop
-        content via slices.
+        IMPORTANT: this is NOT the audio playback path — SpeakerOut owns
+        the actual play head via LoopBuffer.read(). This callback only
+        exists to populate the Script CHOP for visual reactivity (waveform
+        viewers, FFTs, anything users wire downstream of out_chop). It
+        uses `peek()`, which does NOT advance the play head, so it can't
+        race the audio thread.
         """
         self._n_cook_recv = getattr(self, "_n_cook_recv", 0) + 1
         if self._n_cook_recv == 1:
@@ -1861,14 +1876,8 @@ class DemonExt:
             except Exception:
                 pass
 
-        # HONOR TD's cook context. When audiodevout1's audio thread pulls
-        # audio_out at audio rate (Time Slice = True), TD sets
-        # scriptOp.numSamples to the requested block (e.g. 256, 1024).
-        # Returning a different size produces garbled audio downstream.
-        #
-        # Fallback default = one frame's worth at 48 kHz / 60 fps = 800.
-        # Used only when frame_exec force-cooks audio_out outside any
-        # audio-rate pull context (TD then sets numSamples=1).
+        # Honor TD's cook context: if an audio-rate consumer set
+        # numSamples, use that. Otherwise emit one frame's worth.
         n_td = 0
         try:
             n_td = int(scriptOp.numSamples)
@@ -1885,43 +1894,18 @@ class DemonExt:
                 fps = 60.0
             n = max(1, int(wire.SAMPLE_RATE / fps))
 
-        pos_before = self._ring.position
-        pcm = self._ring.read(n)
-
-        # Track playback position from the loop. _playback_pos is the
-        # current play head in frames (= samples per channel). Sent to
-        # the server as `playback_pos` in params messages, in seconds.
+        # peek() reads at the current play head WITHOUT advancing it.
+        # SpeakerOut's audio thread advances the head; this is just a
+        # snapshot for visual consumers.
+        pcm = self._ring.peek(n)
         self._playback_pos = self._ring.position
 
-        # Diagnose every Nth cook: did we read real audio, or silence?
-        if self._n_cook_recv % 600 == 0:
-            try:
-                peak = float(np.max(np.abs(pcm))) if pcm.size > 0 else 0.0
-                self.log(
-                    f"OnCookRecv #{self._n_cook_recv}: n={n} "
-                    f"loop_pos_before={pos_before} loop_pos_after={self._ring.position} "
-                    f"loop_frames={self._ring.frames} peak={peak:.4f}"
-                )
-            except Exception:
-                pass
-
-        # POST-COOK DIAGNOSTIC: log what TD actually thinks the Script
-        # CHOP contains AFTER our write. Sampling every 600th cook
-        # matches the existing peak/loop_pos log cadence.
         scriptOp.clear()
         try:
             scriptOp.rate = wire.SAMPLE_RATE
         except Exception:
             pass
-        # Use copyNumpyArray for direct (channels, samples) ndarray transfer.
-        # The previous appendChan('chan1').vals = list approach was producing
-        # a step-function in the CHOP viewer (flat segments jumping at frame
-        # rate) — TD seems not to honor multi-sample assignment via vals
-        # when the Script CHOP is the audio source for an Audio Device Out.
-        # copyNumpyArray is the canonical high-sample-count API.
         try:
-            # Ensure contiguous float32 (channels, samples). pcm is already
-            # (2, n) float32 from the LoopBuffer.
             arr = np.ascontiguousarray(pcm, dtype=np.float32)
             scriptOp.copyNumpyArray(arr)
         except AttributeError:
@@ -1934,33 +1918,3 @@ class DemonExt:
                 self.log(f"OnCookRecv write failed (fallback): {e}")
         except Exception as e:
             self.log(f"OnCookRecv copyNumpyArray failed: {e}")
-
-        # POST-WRITE DIAGNOSTIC: every 600th cook, log what TD now thinks
-        # the Script CHOP actually contains. If numSamples=800 / rate=48000
-        # / numChans=2 then our data is in TD correctly and the bug is
-        # downstream (out_chop / COMP boundary / audiodevout1).
-        if self._n_cook_recv % 600 == 0:
-            try:
-                post = (
-                    f"[POST] scriptOp.numSamples={scriptOp.numSamples} "
-                    f"rate={scriptOp.rate} numChans={scriptOp.numChans} "
-                    f"input_arr_shape={arr.shape} input_arr_peak="
-                    f"{float(np.max(np.abs(arr))):.4f}"
-                )
-                # Also sample 3 widely-spaced values from chan1 of the
-                # Script CHOP itself, post-write, to confirm samples
-                # actually landed (not just the metadata).
-                try:
-                    ns = int(scriptOp.numSamples)
-                    if ns > 0:
-                        i_mid = ns // 2
-                        i_last = ns - 1
-                        v0 = scriptOp[0][0]
-                        vm = scriptOp[0][i_mid]
-                        vl = scriptOp[0][i_last]
-                        post += f"  chan0[0,{i_mid},{i_last}]=({v0:.4f}, {vm:.4f}, {vl:.4f})"
-                except Exception as e2:
-                    post += f"  chan-read-failed: {e2}"
-                self.log(post)
-            except Exception as e:
-                self.log(f"[POST] log failed: {e}")
