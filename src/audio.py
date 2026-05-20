@@ -37,8 +37,20 @@ class LoopBuffer:
     Reads return silence on uninitialized buffer rather than blocking.
     """
 
-    def __init__(self, channels: int = 2):
+    def __init__(self, channels: int = 2, sample_rate: int = 48000,
+                 seam_seconds: float = 0.05):
         self.channels = channels
+        self._sample_rate = int(sample_rate)
+        # Seam crossfade length (frames) — last N frames of the loop are
+        # blended with the first N frames as the playhead approaches end-
+        # of-buffer. Mirrors demon-public-demo/public/audio-worklet.js
+        # `SEAM_FADE_SECONDS = 0.05` (50 ms at 48 kHz = 2400 frames).
+        # On wrap we jump to position=_seam_frames (NOT 0) so the leading
+        # samples that were folded into the crossfade aren't replayed.
+        # This is what stops the "source flash every loop wrap" you'd
+        # otherwise hear: the first ~50 ms of the buffer (which the
+        # server's slice positions don't typically cover) plays only once.
+        self._seam_frames = max(0, int(self._sample_rate * seam_seconds))
         self._buffer: np.ndarray | None = None  # shape (channels, frames)
         self._frames: int = 0
         self._position: int = 0  # next read frame
@@ -173,7 +185,20 @@ class LoopBuffer:
         """Read `num_frames` frames at the playback position; advance head.
 
         Returns shape (channels, num_frames) float32. Wraps the loop
-        automatically. If the buffer is uninitialized, returns silence.
+        automatically with a seam crossfade. If the buffer is
+        uninitialized, returns silence.
+
+        Seam crossfade: as the playhead approaches end-of-buffer, the
+        last `_seam_frames` (50 ms by default) are blended with the
+        FIRST `_seam_frames` of the buffer. On wrap, the playhead jumps
+        to `_seam_frames` (NOT 0) so the leading samples aren't
+        replayed verbatim. Mirrors the AudioWorklet at
+        `demon-public-demo/public/audio-worklet.js` lines 191–239.
+
+        Per-frame loop (not numpy-vectorized) because the seam crossfade
+        is a different computation than the bulk-copy path. For our
+        block size (~2048 frames) and the worklet's existing approach
+        the cost is fine — called once per audio block.
 
         IMPORTANT: This is the AUTHORITATIVE play head. Only one consumer
         (the actual audio output thread — SpeakerOut._pa_callback) should
@@ -192,14 +217,29 @@ class LoopBuffer:
             if buf is None or frames == 0:
                 return out
 
+            seam = min(self._seam_frames, frames // 4)
             pos = self._position
-            written = 0
-            while written < num_frames:
-                end_in_buf = frames - pos
-                take = min(end_in_buf, num_frames - written)
-                out[:, written:written + take] = buf[:, pos:pos + take]
-                written += take
-                pos = (pos + take) % frames
+
+            for i in range(num_frames):
+                if seam > 0 and (frames - pos) <= seam:
+                    # Inside the tail-seam crossfade region: blend tail
+                    # sample with head sample. Identical math to the
+                    # JS worklet (lines 192-200).
+                    dist_from_end = frames - pos
+                    t = (seam - dist_from_end) / seam
+                    head_pos = seam - dist_from_end
+                    # buf is (channels, frames); index per channel.
+                    tail = buf[:, pos]
+                    head = buf[:, head_pos]
+                    out[:, i] = tail * (1.0 - t) + head * t
+                else:
+                    out[:, i] = buf[:, pos]
+
+                pos += 1
+                if pos >= frames:
+                    # Wrap to `seam`, NOT 0 — the first `seam` frames
+                    # were already folded into the crossfade above.
+                    pos = seam if seam > 0 else 0
 
             self._position = pos
             return out

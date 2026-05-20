@@ -2,6 +2,53 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.3] — 2026-05-20
+
+Single fix: loop seam crossfade.
+
+### Bug
+
+User reported occasional "flashes" of source audio mixed into the
+generated output. This did NOT happen in `demon-public-demo`'s web
+client. Hours of speculation about delta math and server-side
+behavior were red herrings.
+
+### Root cause
+
+`LoopBuffer.read()` was hard-wrapping the playhead from
+`frames - 1` to `0`. The web client's `AudioWorklet` doesn't — it
+crossfades the last 50 ms of the loop with the FIRST 50 ms, then
+wraps the playhead to `position = seam` (= 2400 frames at 48 kHz)
+so those leading frames aren't replayed verbatim.
+
+The DEMON server's slice positions don't start at frame 0 (first
+slices land around start_sample = 3840, 107520, 211200…). So the
+first ~80 ms of the loop tend to remain unpatched source content
+for a long time. Hard-wrapping replayed that source content on
+every 24-second loop boundary — exactly the "occasional flash"
+cadence.
+
+### Fix
+
+Ported the worklet's seam crossfade into `LoopBuffer.read()`:
+- New `seam_seconds=0.05` parameter on `LoopBuffer.__init__`
+  (default 50 ms; matches `SEAM_FADE_SECONDS` in
+  `demon-public-demo/public/audio-worklet.js`).
+- `read()` now does a per-frame loop with two paths: bulk copy in
+  the middle of the loop, crossfade math in the tail-seam region.
+- On wrap, jumps to `position = seam_frames`, not 0.
+
+Bonus: this also smooths the small audio discontinuity that hard
+wraps were producing on every loop boundary, even when the leading
+samples weren't audibly source.
+
+### Files changed
+- `src/audio.py` — `LoopBuffer.__init__` and `LoopBuffer.read`.
+- `src/demon_ext.py` — pass `sample_rate=wire.SAMPLE_RATE` to the
+  LoopBuffer constructor. Bump `BUILD_MARKER` to `seam-crossfade-v1`.
+
+BUILD_MARKER → seam-crossfade-v1.
+
 ## [0.1.2] — 2026-05-20
 
 Polish + Windows build. No behavior changes for working flows.

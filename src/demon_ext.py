@@ -180,7 +180,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.1.2-polish"
+BUILD_MARKER = "seam-crossfade-v1"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -232,7 +232,9 @@ class DemonExt:
         # full loop. Subsequent slices PATCH specific positions in the loop
         # via their `start_sample` field. Playback wraps continuously.
         # See src/audio.py for the LoopBuffer implementation.
-        self._ring = audio_mod.LoopBuffer(channels=2)
+        self._ring = audio_mod.LoopBuffer(
+            channels=2, sample_rate=wire.SAMPLE_RATE,
+        )
         self._epoch: int = 0  # bumped on swap_ready; used to drop stale slices
 
         # Python-side audio playback (bypasses TD's CHOP audio chain via
