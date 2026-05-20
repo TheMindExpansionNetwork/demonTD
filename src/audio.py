@@ -195,10 +195,16 @@ class LoopBuffer:
         replayed verbatim. Mirrors the AudioWorklet at
         `demon-public-demo/public/audio-worklet.js` lines 191–239.
 
-        Per-frame loop (not numpy-vectorized) because the seam crossfade
-        is a different computation than the bulk-copy path. For our
-        block size (~2048 frames) and the worklet's existing approach
-        the cost is fine — called once per audio block.
+        Vectorized: the read is divided into runs of (a) bulk-copy
+        from a contiguous region of the buffer, and (b) crossfade
+        over the tail-seam region. Each run is a couple of numpy
+        operations — no per-sample Python loop. Important: this
+        function is called from the PortAudio audio callback thread,
+        so it MUST be fast. The previous per-frame implementation
+        was ~2k Python iterations per callback at audio rate; when
+        TD's main thread held the GIL for >40 ms (network panel
+        render, GPU sync, big cook, GC), the audio thread missed
+        its deadline and you'd hear a stutter.
 
         IMPORTANT: This is the AUTHORITATIVE play head. Only one consumer
         (the actual audio output thread — SpeakerOut._pa_callback) should
@@ -218,28 +224,42 @@ class LoopBuffer:
                 return out
 
             seam = min(self._seam_frames, frames // 4)
+            seam_start = frames - seam  # first frame inside the tail seam
             pos = self._position
+            written = 0
 
-            for i in range(num_frames):
-                if seam > 0 and (frames - pos) <= seam:
-                    # Inside the tail-seam crossfade region: blend tail
-                    # sample with head sample. Identical math to the
-                    # JS worklet (lines 192-200).
-                    dist_from_end = frames - pos
-                    t = (seam - dist_from_end) / seam
-                    head_pos = seam - dist_from_end
-                    # buf is (channels, frames); index per channel.
-                    tail = buf[:, pos]
-                    head = buf[:, head_pos]
-                    out[:, i] = tail * (1.0 - t) + head * t
+            while written < num_frames:
+                need = num_frames - written
+                if pos < seam_start:
+                    # Pre-seam: bulk copy contiguous range from buf.
+                    take = min(seam_start - pos, need)
+                    out[:, written:written + take] = buf[:, pos:pos + take]
+                    pos += take
+                    written += take
                 else:
-                    out[:, i] = buf[:, pos]
-
-                pos += 1
-                if pos >= frames:
-                    # Wrap to `seam`, NOT 0 — the first `seam` frames
-                    # were already folded into the crossfade above.
-                    pos = seam if seam > 0 else 0
+                    # In seam: vectorized crossfade over [pos, pos+take).
+                    # t goes from (seam - (frames-pos))/seam at the first
+                    # frame to (seam - (frames-(pos+take-1)))/seam at the
+                    # last; tail samples come from buf[:, pos:pos+take]
+                    # and head samples come from
+                    # buf[:, seam-(frames-pos) : seam-(frames-pos)+take].
+                    max_take = frames - pos
+                    take = min(max_take, need)
+                    tail_indices = np.arange(pos, pos + take)
+                    dist_from_end = frames - tail_indices  # shape (take,)
+                    t_vals = (seam - dist_from_end).astype(np.float32) / seam
+                    head_indices = seam - dist_from_end
+                    tail = buf[:, tail_indices]
+                    head = buf[:, head_indices]
+                    out[:, written:written + take] = (
+                        tail * (1.0 - t_vals) + head * t_vals
+                    )
+                    pos += take
+                    written += take
+                    if pos >= frames:
+                        # Wrap to `seam`, NOT 0 — the first seam frames
+                        # were folded into the crossfade above.
+                        pos = seam if seam > 0 else 0
 
             self._position = pos
             return out
