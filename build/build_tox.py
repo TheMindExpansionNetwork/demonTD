@@ -690,15 +690,18 @@ def onFrameStart(frame):
         pass
     except Exception as e:
         print(f"[frame_exec] drain failed: {e}")
-    # Force-cook audio_out every frame so OnCookRecv produces a fresh
-    # block of audio samples regardless of whether anything downstream
-    # is actually pulling. This is the FRAME-PUMP that drives audio
-    # output, because TD's Time Slice propagation doesn't work
-    # reliably across our Base COMP boundary in TD 2025.
-    try:
-        parent().op('audio_out').cook(force=True)
-    except Exception:
-        pass
+    # Audio playback runs in SpeakerOut's PortAudio thread reading the
+    # LoopBuffer directly — it doesn't need audio_out to cook. If the
+    # user wires an external Audio Device Out / Analyze CHOP / FFT etc.
+    # to the COMP's output, THAT consumer will pull audio_out at its
+    # own rate (audio rate for audiodevout, frame rate for visualizers)
+    # via Time Slice propagation, and OnCookRecv -> LoopBuffer.peek()
+    # gives them a current snapshot.
+    #
+    # No force-cook here. The earlier force-cook defeated Time Slice
+    # propagation (audio_out was always "freshly cooked at frame rate"
+    # in TD's eyes, so audio-rate consumers got cached frame-rate
+    # samples = static).
 
 def onFrameEnd(frame): pass
 def onPlayStateChange(state): pass
