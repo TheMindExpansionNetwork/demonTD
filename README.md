@@ -1,5 +1,8 @@
 # demon-td
 
+> **THIS OPERATOR IS A WORK-IN-PROGRESS.**
+> Today, you may see slight differences in performance between DEMON and the TD op. Those are not intrinsic limitations and we're working to improve the op. We welcome feedback, ideas, and contributions.
+
 TouchDesigner operator for **DEMON** — real-time AI music generation.
 
 Drop a single `.tox` into any TouchDesigner project, point it at a DEMON server,
