@@ -146,7 +146,13 @@ _prepend_vendor_paths()
 try:
     import zstandard as zstd
     _ZSTD_DEC = zstd.ZstdDecompressor()
-except Exception:
+except Exception as _zstd_err:
+    # If we can't load zstd, we'll send compression:"none" in SessionConfig
+    # so the server emits raw float16 slices instead of zstd-compressed.
+    # ~1.5× more bandwidth but doesn't require a working binary in vendor/.
+    print(f"[demon_ext] zstandard load failed: "
+          f"{type(_zstd_err).__name__}: {_zstd_err} -- will request "
+          f"compression:none from server")
     _ZSTD_DEC = None
 
 import numpy as np
@@ -180,7 +186,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "4k-buffer-v1"
+BUILD_MARKER = "v0.1.5-demon-compat"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -743,7 +749,16 @@ class DemonExt:
                 par.val = prior
             except Exception:
                 pass
-            self._set_status("Reconnect to apply Init changes")
+            # Setting par.val above fires another OnParChange, which fires
+            # this status set again, which logs `status:` to textport.
+            # And the user may touch several Init pars in rapid succession.
+            # Dedupe by current Status value so we don't spam the same line.
+            msg = "Reconnect to apply Init changes"
+            try:
+                if (self._read_par("Status", "") or "") != msg:
+                    self._set_status(msg)
+            except Exception:
+                self._set_status(msg)
             return
 
         # 3. Continuous param -> batch
@@ -1385,6 +1400,14 @@ class DemonExt:
             "lora_strengths": self._lora_strengths(),
             "fixture_name": str(init_val("Fixturename", "")),
         }
+        # If we don't have a working zstd decompressor (TD's bundled Python
+        # can't load our vendored zstandard binary, etc.), ask the server
+        # to emit raw float16 slices instead. Without this, every slice
+        # would land with flags=SLICE_FLAG_DELTA and be rejected by
+        # decode_slice → no generated audio plays. Trade-off is ~1.5×
+        # more bandwidth on the receive path.
+        if _ZSTD_DEC is None:
+            cfg["compression"] = "none"
         return cfg
 
     @staticmethod
@@ -1461,8 +1484,23 @@ class DemonExt:
         elif kind in ("timbre_failed", "structure_failed", "swap_failed", "error"):
             self.log(f"server {kind}: {data.get('error') or data.get('message')}")
             self._set_status(f"Error: {kind}")
+        elif kind in ("stem_assets", "stem_ready"):
+            # Server's new stem-separation feature. Two big binary blobs
+            # follow (one per stem channel pair, ~13 MB each, marked
+            # with new flag bits we don't decode). Quiet ack — we don't
+            # offer stem playback in v0.1.
+            self._expecting_stem_blobs = int(data.get("count", 2) or 2)
+            if self._debug_enabled:
+                self.log(f"stem_assets (skipping {self._expecting_stem_blobs} blobs)")
         else:
-            self.log(f"unknown server message: {kind}")
+            # Other unrecognized message types — known-unknowns the server
+            # may emit but we don't yet handle. Logged once per kind so
+            # the textport doesn't spam.
+            seen = getattr(self, "_unknown_kinds_seen", set())
+            if kind not in seen:
+                self.log(f"unknown server message: {kind}")
+                seen.add(kind)
+                self._unknown_kinds_seen = seen
 
     def _dump_wav(self, path: str, pcm: np.ndarray, channels: int,
                   sample_rate: int = 48000) -> None:
@@ -1548,10 +1586,41 @@ class DemonExt:
         # Streaming slice (23-byte header + raw/zstd float16). Each slice
         # PATCHES the loop at slice.start_sample. Flag bit 1 = delta (mix),
         # otherwise overwrite. Mirrors useStartSession.ts.
+        #
+        # Skip-ahead for two server-side features we don't yet handle:
+        #   - stem blobs: large binary frames with flag bits we don't
+        #     recognize (e.g. 0x07). The server announces these with a
+        #     `stem_assets` JSON message ahead of time; we consume them
+        #     silently here so they don't spam the textport.
+        #   - any future slice-shape changes: log ONCE per unknown flag
+        #     value, not per slice.
+        flag_byte = buf[0] if len(buf) > 0 else 0
+        expecting_stems = getattr(self, "_expecting_stem_blobs", 0)
+        if expecting_stems > 0:
+            self._expecting_stem_blobs = expecting_stems - 1
+            return
+        if flag_byte & ~0x01:
+            # Any flag bit outside the documented {RAW=0, DELTA=1} set —
+            # treat as a server feature we don't decode (stems, etc.).
+            seen = getattr(self, "_unknown_slice_flags_seen", set())
+            if flag_byte not in seen:
+                self.log(
+                    f"slice flags=0x{flag_byte:02x} unknown ({len(buf)}B) "
+                    f"— ignoring (future server feature, e.g. stems)"
+                )
+                seen.add(flag_byte)
+                self._unknown_slice_flags_seen = seen
+            return
         try:
             slice_ = wire.decode_slice(buf, zstd_dec=_ZSTD_DEC)
         except Exception as e:
-            self.log(f"Bad slice ({len(buf)}B, flags=0x{buf[0]:02x}): {e}")
+            # One log per error message — don't spam.
+            seen = getattr(self, "_slice_err_seen", set())
+            key = type(e).__name__ + ":" + str(e)[:80]
+            if key not in seen:
+                self.log(f"slice rejected ({len(buf)}B, flags=0x{flag_byte:02x}): {e}")
+                seen.add(key)
+                self._slice_err_seen = seen
             return
 
         ch = max(1, slice_.channels)

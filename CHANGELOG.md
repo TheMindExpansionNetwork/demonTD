@@ -2,6 +2,56 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.5] — 2026-05-27
+
+Compatibility update for the current DEMON server build. Reports of
+"no generated audio plays, just the source loops, textport is flooded
+with error spam" trace to three server-side changes since v0.1.4 shipped.
+
+### What broke
+
+The server now:
+1. **Always emits zstd-compressed slices** (flag=0x01). v0.1.4 had a
+   try/except around `import zstandard` that silently swallowed errors;
+   if TD's bundled Python couldn't load the vendored binary, `_ZSTD_DEC`
+   was None and every slice failed `decode_slice` with "no decompressor
+   was provided" — no generated audio audible.
+2. **Emits a `stem_assets` JSON message** followed by two large
+   binary blobs with new flag bits (e.g. 0x07). Server-side stem
+   separation feature. We don't handle stems, but were logging "Bad
+   slice" for each blob.
+3. **Sends slices with future-feature flag bits** beyond {0,1}. Decoded
+   as "Bad slice" with the same spam.
+
+### What's fixed
+
+- **`SessionConfig.compression = "none"` fallback.** If our vendored
+  `zstandard` fails to load, we ask the server to emit raw float16
+  slices instead of zstd-compressed. ~1.5× more bandwidth on the recv
+  path, but works without depending on a binary load that the user's
+  TD bundle may not support. The actual zstd load failure now logs
+  its specific reason at boot.
+- **`stem_assets` recognized.** The two binary blobs that follow are
+  consumed silently (counter-tracked). No textport spam.
+- **Slice flags > 1 silently skipped.** Logged ONCE per unknown flag
+  value per session, then quiet. Future server features won't flood
+  the textport.
+- **`Reconnect to apply Init changes` deduped.** The status string is
+  only set when it differs from the current Status value, so touching
+  multiple Init pars in rapid succession doesn't produce 14 identical
+  status lines.
+
+### Files changed
+- `src/demon_ext.py`:
+  - zstd load failure now logs reason; SessionConfig compression
+    fallback.
+  - `_on_text`: `stem_assets` ack; unknown-message dedupe.
+  - `_on_binary`: skip stem blobs (announced by `stem_assets`),
+    skip unknown-flag slices, dedupe slice-decode errors.
+  - `OnParChange`: dedupe Reconnect status set.
+
+BUILD_MARKER → v0.1.5-demon-compat.
+
 ## [0.1.4] — 2026-05-20
 
 Two audio-thread improvements landing the playback path at zero
