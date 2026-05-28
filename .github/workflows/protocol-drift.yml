@@ -9,6 +9,11 @@ name: Protocol drift
 # This workflow runs the static drift script. On detection it files (or
 # updates) a single labeled GitHub issue. PR runs post a non-blocking
 # warning annotation. No merge or release is ever blocked.
+#
+# Setup (one-time, in repo settings):
+#   * Secret: DEMON_DEMO_PAT — a fine-grained PAT with read access to
+#     daydreamlive/demon-public-demo (Contents: Read). The default
+#     GITHUB_TOKEN can't reach the private demo repo.
 
 on:
   schedule:
@@ -37,11 +42,21 @@ jobs:
         with:
           path: demonTD
 
+      - name: Refuse if DEMON_DEMO_PAT is missing
+        env:
+          PAT: ${{ secrets.DEMON_DEMO_PAT }}
+        run: |
+          if [[ -z "$PAT" ]]; then
+            echo "::error::DEMON_DEMO_PAT secret is not set. Create a fine-grained PAT with Contents:Read on daydreamlive/demon-public-demo and add it under Settings > Secrets > Actions."
+            exit 2
+          fi
+
       - name: Checkout demon-public-demo
         uses: actions/checkout@v4
         with:
           repository: daydreamlive/demon-public-demo
           path: demon-public-demo
+          token: ${{ secrets.DEMON_DEMO_PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
