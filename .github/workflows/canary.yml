@@ -1,0 +1,58 @@
+name: Canary
+
+# On-demand live test against a real DEMON server on vast.ai.
+#
+# Costs ~$0.10/run (RTX 5090 for ~5 minutes). Never scheduled — only
+# triggered manually from the Actions tab. Use cases:
+#   * Pre-release smoke test (after `bash scripts/release.sh` passes
+#     and before tagging).
+#   * Validation after a known DEMON server update (the protocol-drift
+#     workflow filed a fix, you patched, you want behavioral proof).
+#
+# Setup (one-time, in repo settings):
+#   * Secret: VASTAI_API_KEY  — your vast.ai API key
+#
+# The canary will refuse to run without that secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds to listen on the WS after sending audio (default 30)"
+        required: false
+        default: "30"
+      keep_pod:
+        description: "Leave the pod running on failure (default false)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse if VASTAI_API_KEY is missing
+        run: |
+          if [[ -z "$VASTAI_API_KEY" ]]; then
+            echo "::error::VASTAI_API_KEY secret is not set on this repo. Add it under Settings > Secrets > Actions."
+            exit 2
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet vastai websocket-client numpy zstandard
+
+      - name: Run canary
+        run: |
+          python scripts/canary.py \
+              --duration "${{ inputs.duration }}" \
+              ${{ inputs.keep_pod && '--keep-pod' || '' }}
