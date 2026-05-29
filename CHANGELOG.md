@@ -2,6 +2,43 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.10] — 2026-05-29
+
+**Real root cause of the v0.2.x audio failure**, after `scripts/probe_portaudio.py`
+confirmed PortAudio + the user's device open fine outside TouchDesigner:
+
+> TouchDesigner holds the default output device's Core Audio AudioUnit
+> whenever its **Edit > Preferences > Audio > Audio Device** preference
+> points at a real device. Once TD has the AudioUnit bound, Core Audio
+> refuses to let our PortAudio thread call
+> `AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)` on the same
+> device — the result is `kAudioUnitErr_InvalidPropertyValue (-10851)`
+> wrapped as PortAudio's `paInternalError`.
+
+The v0.2.9 lazy-probe fix didn't help because the eager probe wasn't
+the cause; TD owning the device was.
+
+### What's actually fixed in v0.2.10
+
+* **Failure path now points at the real cause.** The "no usable combo"
+  log line and the user-facing Status par both lead with "Set TD's
+  Audio Device pref to None (Edit > Prefs > Audio) and re-pulse
+  Connect" before the other workarounds. No more telling the user to
+  fiddle with Audio MIDI Setup as the first thing to try.
+* **README troubleshooting section rewritten** to put the TD-preference
+  fix front and center with a concrete walkthrough, plus a pointer at
+  `scripts/probe_portaudio.py` for users who want to verify.
+* **`scripts/probe_portaudio.py` ships** as the diagnostic users can
+  run from a terminal: same Pa_OpenDefaultStream call demonTD's v0.1.5
+  made, against the bundled dylib, without TD in the picture.
+
+The previous v0.2.6 / v0.2.8 / v0.2.9 fallback layers stay in place —
+they cover edge cases where TD's preference is already None AND the
+device still refuses our format (rare but real). The failure log just
+explains which case fires first.
+
+BUILD_MARKER bumped to v0.2.10-td-holds-device-msg.
+
 ## [0.2.9] — 2026-05-29
 
 **Regression fix.** v0.2.4 added an eager `Pa_GetDefaultOutputDevice` +

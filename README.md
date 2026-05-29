@@ -192,29 +192,65 @@ plays through speakers.
 
 ### Audio output troubleshooting
 
-If you see `[speaker_out] no usable rate / buffer / format / open-mode combination`
-in the textport on Connect, your default output device refused PortAudio's
-open request. The session itself is still alive — you just can't hear it
-through `Python Audio Out`. Three workarounds in increasing order of cost:
+If you see `[speaker_out] direct Pa_OpenDefaultStream@... failed: Internal
+PortAudio error (err=-9986) hostErr code=-10851 text='Audio Unit: Invalid
+Property Value'` in the textport on Connect, **TouchDesigner is holding
+your output device's Core Audio AudioUnit**, and our Python audio thread
+can't open it.
 
-1. **Switch the macOS default output to a different device.** System
-   Settings → Sound → Output → MacBook Speakers (or a USB / Bluetooth
-   device that's known to work). PortAudio negotiates the built-in speakers
-   path reliably.
-2. **Fix the device format in Audio MIDI Setup.** Open Audio MIDI Setup
-   (search Spotlight), select the device that's failing, set Format to
+The fix is one click:
+
+> **Edit → Preferences → Audio → Audio Device → None**
+
+Save Preferences. TD releases the device immediately; no restart needed.
+Re-pulse Connect and audio plays.
+
+#### Why this happens
+
+TD has a global "Audio Device" preference. When it's set to anything
+other than `None`, TD opens that device's Core Audio output AudioUnit at
+startup — independent of whether you have any `Audio Device In/Out
+CHOPs` in your network. Once TD has the AudioUnit bound, Core Audio
+refuses to let a second client (our `SpeakerOut` via PortAudio) call
+`AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)` on the same
+device. The result is `kAudioUnitErr_InvalidPropertyValue` (-10851)
+inside PortAudio, which surfaces as the "Internal PortAudio error" line.
+
+You can verify your bundled PortAudio + device are otherwise fine by
+running `python3 scripts/probe_portaudio.py` from a terminal — it makes
+the same call demonTD makes, without TouchDesigner in the picture. If
+the probe prints "OK", TD is the culprit.
+
+#### Alternative: keep TD's Audio Device set, bypass `Python Audio Out`
+
+If you need TD to own the device (because you have other audio ops in
+your project), leave the TD preference alone and route demonTD's audio
+through TD's chain instead:
+
+1. Toggle the **Python Audio Out** par OFF on the Session page.
+2. Wire the COMP's `out_chop` output port to a TD-native
+   `Audio Device Out CHOP` placed outside the COMP.
+
+TD's audio chain has cook-rate quirks across COMP boundaries (documented
+in `src/audio.py`), but for a single output device with no upstream
+processing it generally works.
+
+#### Other rarer causes
+
+Two other things can make `Pa_OpenDefaultStream` fail with -10851, both
+much rarer than the TD-holds-the-device case above:
+
+1. **Default macOS output device is in a weird state.** Try System
+   Settings → Sound → Output → switch to MacBook Speakers (or any other
+   device), then back. Forces Core Audio to reconfigure.
+2. **Device hardware format mismatch.** Open Audio MIDI Setup (Spotlight),
+   select the device that's failing, set Format to
    `Stereo 48000 Hz, 32-bit Float`, then re-pulse Connect.
-3. **Bypass `Python Audio Out`.** Toggle the **Python Audio Out** par OFF
-   on the Session page, then wire the COMP's `out_chop` output port to a
-   TD-native `Audio Device Out CHOP` placed outside the COMP. TD's audio
-   chain has cook-rate quirks across COMP boundaries (documented in
-   `src/audio.py`), but for a single output device with no upstream
-   processing it generally works.
 
 The textport log lines starting with `[speaker_out]` will show what
-PortAudio actually tried (rate × buffer size × float32/int16 × open-mode)
-and the underlying Core Audio error code on each failure — that's enough
-to file a precise bug if none of the workarounds help.
+PortAudio tried and the underlying Core Audio error code on each
+failure — that's enough to file a precise bug if none of the
+workarounds help.
 
 ## Debug toggle
 

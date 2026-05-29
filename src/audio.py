@@ -878,14 +878,22 @@ class SpeakerOut:
         if err != 0:
             self._log(
                 "[speaker_out] no usable rate / buffer / format / open-mode "
-                "combination. Workarounds (any of):\n"
-                "  1. System Settings > Sound > Output: switch to MacBook "
-                "Speakers (or another device).\n"
-                "  2. Audio MIDI Setup: set your default output Format to "
-                "'Stereo 48000 Hz, 32-bit Float'.\n"
-                "  3. On the DEMON Session page: toggle 'Python Audio Out' "
-                "OFF and wire `out_chop` to your own Audio Device Out CHOP "
-                "downstream of the COMP."
+                "combination.\n"
+                "  >>> Most likely cause: TouchDesigner is holding the "
+                "output device's Core Audio AudioUnit. Fix: "
+                "Edit > Preferences > Audio > Audio Device > None (save; "
+                "no restart needed). Then re-pulse Connect.\n"
+                "  Confirm by running `python3 scripts/probe_portaudio.py` "
+                "from a terminal — if it succeeds outside TD, TD is the "
+                "culprit.\n"
+                "  Other workarounds:\n"
+                "    * Toggle 'Python Audio Out' OFF and wire `out_chop` "
+                "to your own Audio Device Out CHOP outside the COMP "
+                "(lets TD keep ownership of the device).\n"
+                "    * macOS System Settings > Sound > Output: switch to "
+                "a different device.\n"
+                "    * Audio MIDI Setup: set the device's Format to "
+                "'Stereo 48000 Hz, 32-bit Float'."
             )
             return False
 

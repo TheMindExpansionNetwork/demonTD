@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.9-no-eager-probe"
+BUILD_MARKER = "v0.2.10-td-holds-device-msg"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1874,11 +1874,12 @@ class DemonExt:
                         ok = self._speaker_out.start()
                         if not ok:
                             self._set_status(
-                                "Audio output failed — see textport. "
-                                "Toggle 'Python Audio Out' off and wire "
-                                "your own Audio Device Out CHOP, or fix "
-                                "your default device and pulse Connect "
-                                "again."
+                                "Audio output failed. Set TD's Audio "
+                                "Device pref to None (Edit > Prefs > "
+                                "Audio) and re-pulse Connect, or toggle "
+                                "'Python Audio Out' off and wire your "
+                                "own Audio Device Out CHOP. Details in "
+                                "textport."
                             )
                 except Exception as e:
                     self.log(f"speaker_out start raised: {e}")
