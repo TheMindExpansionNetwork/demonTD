@@ -66,6 +66,51 @@ def test_join_active_immediately(mock_urlopen):
 
 
 @patch("queue_client.urlrequest.urlopen")
+def test_join_with_device_id(mock_urlopen):
+    mock_urlopen.return_value = FakeResponse({"status": "active", "sessionId": "x"})
+    queue_mod.QueueClient("http://h").join(device_id="dev-uuid-1")
+    req = mock_urlopen.call_args.args[0]
+    assert json.loads(req.data.decode()) == {"deviceId": "dev-uuid-1"}
+
+
+@patch("queue_client.urlrequest.urlopen")
+def test_join_with_pod_id(mock_urlopen):
+    mock_urlopen.return_value = FakeResponse({"status": "active", "sessionId": "x"})
+    queue_mod.QueueClient("http://h").join(pod_id="pod-7")
+    req = mock_urlopen.call_args.args[0]
+    assert "pod=pod-7" in req.full_url
+
+
+@patch("queue_client.urlrequest.urlopen")
+def test_claim(mock_urlopen):
+    mock_urlopen.return_value = FakeResponse({})
+    queue_mod.QueueClient("http://h").claim("sess-42")
+    req = mock_urlopen.call_args.args[0]
+    assert req.method == "POST"
+    assert req.full_url == "http://h/api/queue/claim"
+    assert json.loads(req.data.decode()) == {"sessionId": "sess-42"}
+
+
+@patch("queue_client.urlrequest.urlopen")
+def test_claim_swallows_errors(mock_urlopen):
+    mock_urlopen.side_effect = _make_http_error(500, "boom")
+    # Should not raise — claim is best-effort.
+    queue_mod.QueueClient("http://h").claim("sess-42")
+
+
+@patch("queue_client.urlrequest.urlopen")
+def test_status_over_budget(mock_urlopen):
+    mock_urlopen.return_value = FakeResponse({
+        "status": "over_budget",
+        "sessionId": "s1",
+        "denyReason": "Free trial exhausted",
+    })
+    resp = queue_mod.QueueClient("http://h").status("s1")
+    assert resp.status == "over_budget"
+    assert resp.deny_reason == "Free trial exhausted"
+
+
+@patch("queue_client.urlrequest.urlopen")
 def test_join_includes_bearer_when_api_key_set(mock_urlopen):
     mock_urlopen.return_value = FakeResponse({"status": "active", "sessionId": "x"})
     queue_mod.QueueClient("http://h", api_key="sk-test").join()

@@ -2,6 +2,60 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] — 2026-05-29
+
+**Hosted mode.** The operator can now connect to the Daydream queue at
+`music.daydream.live` and play on a managed pod — no more spinning up
+your own VAST instance to demo it. Direct mode (your own pod URL) keeps
+working unchanged.
+
+### What's new
+
+- **`Mode` menu** on the Session page (`Direct` / `Hosted`). Direct keeps
+  the existing `Server URL` flow. Hosted POSTs `/api/queue/join` against
+  the Daydream queue, polls until `active`, then connects to the
+  server-signed `wss://` URL — same flow the Daydream web app uses, and
+  the same protocol as the `rtmg-vst` plugin.
+- **Two ways to sign in** (Session page pulses):
+  - **Paste API Key** — opens `app.daydream.live` in your browser; paste
+    your key into the TD dialog. Validates against `/users/profile`
+    before saving.
+  - **Sign in via browser** — full OAuth flow. TD spins up a local
+    listener on a free port, your browser redirects there with the
+    one-time token, the key is fetched and saved.
+- **`Sign out`** wipes the stored key (preserves the device ID).
+- **Queue status surfacing** while connecting + heartbeat-driven while
+  active: `Queue Position`, `Expires in (s)`, `Deny reason` (for paywall
+  / over-budget responses).
+- **`Still playing?`** pulse hits `/api/queue/extend` to bump the
+  session lifetime.
+- **`POST /api/queue/claim` after WS open.** Cancels the server-side
+  reservation-eviction timer (added in the latest VST PR, now in TD).
+- **Stable device ID** persisted to `<prefs>/daydream_auth.json`. Sent
+  on every join for analytics + rate-limit attribution.
+
+### Persistence
+
+API key + profile + device ID live in a per-user file, NOT in the .toe:
+  - macOS: `~/Library/Application Support/derivative/daydream_auth.json`
+  - Windows: `%APPDATA%/Derivative/daydream_auth.json`
+  - Linux: `~/.local/share/derivative/daydream_auth.json`
+
+That matches the rtmg-vst PropertiesFile approach and avoids leaking
+your API key when you share a .toe.
+
+### What's NOT changed
+
+- Direct-mode flow is byte-for-byte identical to v0.1.5. If you've been
+  pointing demonTD at your own pod URL, nothing about that path moves.
+- Wire protocol is unchanged. v0.1.5's "log once per unknown kind"
+  defense-in-depth stays as-is.
+
+### Reference
+
+Mirrors the queue + auth surface from the new RTMG VST PR
+([daydreamlive/rtmg-vst#4](https://github.com/daydreamlive/rtmg-vst/pull/4)).
+
 ## [0.1.5] — 2026-05-27
 
 Compatibility update for the current DEMON server build. Reports of

@@ -83,11 +83,55 @@ SESSION_PARAMS: list[Param] = [
                "rate across a Base COMP boundary. Toggle off if you want "
                "to route the audio only via the COMP's out_chop port to "
                "your own external Audio Device Out CHOP."),
-    # Hosted-mode pars (Anonymous, Apikey, Queueposition, etc.) were
-    # removed for v0.1.1 to declutter the Session page. The supporting
-    # code in demon_ext.py is kept (anonymous=True, direct=True defaults
-    # via _read_par fallback) so a future v0.2 release can re-add these
-    # pars with enable=True and hosted mode just works.
+    # ---------- Hosted mode (v0.2+) ----------
+    # Mode toggles between Direct (a pod URL the user supplies) and
+    # Hosted (the Daydream queue at music.daydream.live). Connect()
+    # branches on this. OnParChange("Mode") greys out the unused-mode
+    # params for visual clarity.
+    Param("Mode", None, "Session", "Menu", "session", default="direct",
+          order=60, label="Mode",
+          menu_names=("direct", "hosted"),
+          menu_labels=("Direct (your pod)", "Hosted (Daydream queue)"),
+          help="Direct: connect to your own DEMON pod via Server URL. "
+               "Hosted: join the Daydream queue and play on a managed pod."),
+    Param("Baseurl", None, "Session", "Str", "session",
+          default="https://music.daydream.live", order=62, label="Hosted Base URL",
+          help="Daydream queue API root. Override only if you're testing "
+               "against a staging deployment."),
+    Param("Apikey", None, "Session", "Str", "session", default="",
+          order=64, label="API Key", secret=True,
+          help="Daydream API key. Sent as Authorization: Bearer <key>. "
+               "Set via the Paste API Key or Sign in via browser pulses; "
+               "stored in <prefs>/daydream_auth.json, not in the .toe."),
+    Param("Signedinas", None, "Session", "Str", "session", default="",
+          order=66, label="Signed in as", readonly=True,
+          help="Daydream account email/username, populated after sign-in."),
+    Param("Pasteapikey", None, "Session", "Pulse", "session", order=68,
+          label="Paste API Key",
+          help="Opens app.daydream.live in your browser and prompts for "
+               "your API key. Validates against /users/profile before saving."),
+    Param("Signinbrowser", None, "Session", "Pulse", "session", order=70,
+          label="Sign in via browser",
+          help="Open the Daydream sign-in flow in your browser. On success, "
+               "the browser tab redirects to a local listener and your "
+               "session is signed in automatically."),
+    Param("Signout", None, "Session", "Pulse", "session", order=72,
+          label="Sign out",
+          help="Wipe the stored API key + profile. Device ID is preserved."),
+    Param("Queueposition", None, "Session", "Int", "session", default=0,
+          order=74, label="Queue Position", readonly=True,
+          help="1-based queue position while waiting. 0 once active."),
+    Param("Expiresin", None, "Session", "Float", "session", default=0.0,
+          order=76, label="Expires in (s)", readonly=True,
+          help="Seconds until the hosted session expires. Hit Still Playing "
+               "to extend."),
+    Param("Denyreason", None, "Session", "Str", "session", default="",
+          order=78, label="Deny reason", readonly=True,
+          help="Populated when the server returns over_budget / paywall."),
+    Param("Stillplaying", None, "Session", "Pulse", "session", order=80,
+          label="Still playing?",
+          help="POST /api/queue/extend — bumps the session by one duration."),
+
     Param("Debug", None, "Session", "Toggle", "session", default=False,
           order=999, label="Debug Logging",
           help="When on, the extension prints verbose textport diagnostics "

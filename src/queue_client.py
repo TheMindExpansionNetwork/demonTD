@@ -23,14 +23,23 @@ from urllib import request as urlrequest
 
 @dataclass
 class QueueResponse:
-    status: str                      # "active" | "queued" | "unknown"
+    # Status values observed from the server:
+    #   "active"       - session has a wsUrl; play
+    #   "queued"       - waiting; position / estimated_wait_ms populated
+    #   "over_budget"  - paywall; deny_reason populated
+    #   "unknown"      - default fallback for missing/unparseable bodies
+    status: str
     session_id: str | None = None
     position: int | None = None      # 1-based when queued
     estimated_wait_ms: int | None = None
     session_duration_ms: int | None = None
     ws_url: str | None = None        # server-signed; only set when active
+    pod_id: str | None = None
     expires_at: int | None = None    # absolute ms timestamp
     extensions_used: int | None = None
+    deny_reason: str | None = None   # populated when status == "over_budget"
+    soft_warning: str | None = None
+    trial_seconds_remaining: int | None = None
     raw: dict[str, Any] = None       # type: ignore[assignment]
 
     @classmethod
@@ -42,8 +51,12 @@ class QueueResponse:
             estimated_wait_ms=d.get("estimatedWaitMs"),
             session_duration_ms=d.get("sessionDurationMs"),
             ws_url=d.get("wsUrl"),
+            pod_id=d.get("podId"),
             expires_at=d.get("expiresAt"),
             extensions_used=d.get("extensionsUsed"),
+            deny_reason=d.get("denyReason"),
+            soft_warning=d.get("softWarning"),
+            trial_seconds_remaining=d.get("trialSecondsRemaining"),
             raw=d,
         )
 
@@ -111,15 +124,43 @@ class QueueClient:
 
     # ----- public API ---------------------------------------------------------
 
-    def join(self) -> QueueResponse:
-        """POST /api/queue/join. Allocates or queues a session."""
-        d = self._request("POST", "/api/queue/join", body={})
+    def join(self, device_id: str | None = None,
+             pod_id: str | None = None) -> QueueResponse:
+        """POST /api/queue/join. Allocates or queues a session.
+
+        Parameters
+        ----------
+        device_id
+            Stable per-machine UUID. The server uses it for analytics and
+            rate-limiting. Mirrors the RTMG VST's RTMGSession::start.
+        pod_id
+            Optional admin override — pins the join to a specific pod via
+            the `?pod=` query string. Same semantics as the webapp's
+            ?pod= URL override.
+        """
+        body: dict[str, Any] = {}
+        if device_id:
+            body["deviceId"] = device_id
+        query = {"pod": pod_id} if pod_id else None
+        d = self._request("POST", "/api/queue/join", body=body, query=query)
         return QueueResponse.from_dict(d)
 
     def status(self, session_id: str) -> QueueResponse:
         """GET /api/queue/status?token=<sessionId>. Also bumps server heartbeat."""
         d = self._request("GET", "/api/queue/status", query={"token": session_id})
         return QueueResponse.from_dict(d)
+
+    def claim(self, session_id: str) -> None:
+        """POST /api/queue/claim with {sessionId}. Best-effort.
+
+        Called once after the WS opens in active state — cancels the
+        server-side reservation-eviction timer. The RTMG VST does this
+        in RTMGSession::applyResult when transitioning to Active.
+        """
+        try:
+            self._request("POST", "/api/queue/claim", body={"sessionId": session_id})
+        except QueueError:
+            pass
 
     def extend(self, session_id: str) -> QueueResponse:
         """POST /api/queue/extend with {sessionId}. The 'Still playing?' button."""

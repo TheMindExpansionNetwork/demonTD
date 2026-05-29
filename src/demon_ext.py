@@ -39,6 +39,9 @@ import queue
 import sys
 import threading
 import time
+import uuid
+import webbrowser
+from pathlib import Path
 from typing import Any
 
 # --- vendored dependencies -----------------------------------------------------
@@ -186,7 +189,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.1.5-demon-compat"
+BUILD_MARKER = "v0.2.0-hosted"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -223,6 +226,7 @@ class DemonExt:
 
         # Auth
         self._api_key: str = ""
+        self._device_id: str = ""        # populated by _load_auth (UUID4)
         self._oauth_state: str | None = None
         self._oauth_port: int | None = None
 
@@ -297,6 +301,24 @@ class DemonExt:
         # a par on every log call.
         self._debug_enabled: bool = bool(self._read_par("Debug", False))
 
+        # Auth state: load persisted apiKey + deviceId from
+        # <prefs>/daydream_auth.json (created lazily on first persist). This
+        # populates self._device_id (UUID4) and may pre-fill self._api_key
+        # + Signedinas par when the user already signed in on a previous
+        # TD launch.
+        try:
+            self._load_auth()
+        except Exception as e:
+            self.log(f"_load_auth failed (continuing): {type(e).__name__}: {e}")
+            if not self._device_id:
+                self._device_id = str(uuid.uuid4())
+
+        # Reflect persisted Mode into the visible/greyed-out hosted pars.
+        try:
+            self._apply_mode_visibility(self._read_par("Mode", "direct"))
+        except Exception as e:
+            self.log(f"_apply_mode_visibility failed (continuing): {e}")
+
         self.log(f"DemonExt initialized — BUILD={BUILD_MARKER}")
 
     # -------- properties (public read-only) ----------------------------------
@@ -319,27 +341,33 @@ class DemonExt:
 
     # -------- session lifecycle ----------------------------------------------
 
-    def Connect(self, anonymous: bool | None = None,
-                direct: bool | None = None) -> bool:
+    def Connect(self, mode: str | None = None) -> bool:
         """Open a session.
 
-        Two modes:
-          - Direct pod (default for localhost): skip queue, open WS straight
-            at <serverurl> with the scheme swapped to ws://.
-          - Queue: POST /api/queue/join, wait for active, open the returned wsUrl.
+        Two modes (selected by the `Mode` par):
+          * `direct` — open WS straight at `Server URL` (scheme normalised
+            to ws://). Same path demonTD has shipped since v0.1.
+          * `hosted` — POST /api/queue/join against the Hosted Base URL
+            (default: music.daydream.live), wait for `active`, open the
+            returned signed wss:// URL. Calls /api/queue/claim once active
+            so the server cancels the reservation-eviction timer (matches
+            rtmg-vst's RTMGSession::applyResult).
         """
         with self._lock:
             if self._connected:
                 self.log("Connect: already connected")
                 return True
 
-            if anonymous is None:
-                anonymous = bool(self._read_par("Anonymous", True))
-            if direct is None:
-                direct = bool(self._read_par("Directpod", True))
+            if mode is None:
+                mode = self._read_par("Mode", "direct")
+            mode = (mode or "direct").lower()
 
-            base = self._read_par("Serverurl", "ws://localhost:8765/")
-            api_key = None if anonymous else (self._read_par("Apikey", "") or None)
+            # Direct-mode endpoint.
+            direct_url = self._read_par("Serverurl", "ws://localhost:8765/")
+            # Hosted-mode endpoint.
+            hosted_base = self._read_par(
+                "Baseurl", "https://music.daydream.live")
+            api_key = (self._read_par("Apikey", "") or "").strip() or None
             self._api_key = api_key or ""
 
             # Pre-flight: source audio is required. Bail loudly BEFORE any
@@ -356,32 +384,36 @@ class DemonExt:
                     pass
                 return False
 
-            if direct:
-                ws_url = self._http_to_ws(base)
+            # --- Direct mode --------------------------------------------------
+            if mode == "direct":
+                ws_url = self._http_to_ws(direct_url)
                 self._session_id = None
                 self._ws_url = ws_url
                 self._expires_at_ms = None
                 self._extensions_used = 0
                 self._write_par("Queueposition", 0)
+                self._write_par("Expiresin", 0.0)
+                self._write_par("Denyreason", "")
                 self._set_status(f"Connecting to {ws_url}...")
                 self._open_ws(ws_url)
                 return True
 
-            # Queue mode
+            # --- Hosted mode --------------------------------------------------
+            self._write_par("Denyreason", "")
             self._set_status("Joining queue...")
-            client = queue_mod.QueueClient(base, api_key=api_key)
+            client = queue_mod.QueueClient(hosted_base, api_key=api_key)
             try:
-                resp = client.join()
+                resp = client.join(device_id=self._device_id)
             except queue_mod.QueueError as e:
                 self._set_status(f"Join failed: {e}")
-                self.log(f"Connect error: {e}")
+                self.log(f"Connect/join error: {e}")
                 return False
 
             self._session_id = resp.session_id
 
             poll_start = time.time()
             while resp.status == "queued":
-                self._set_status(f"Queued (position {resp.position})")
+                self._set_status(f"Queued (position {resp.position or '?'})")
                 self._write_par("Queueposition", resp.position or 0)
                 if time.time() - poll_start > 300:
                     self._set_status("Queue timeout")
@@ -393,6 +425,12 @@ class DemonExt:
                     self._set_status(f"Status poll failed: {e}")
                     return False
 
+            if resp.status == "over_budget":
+                deny = resp.deny_reason or "(no reason)"
+                self._set_status(f"Paywall: {deny}")
+                self._write_par("Denyreason", deny)
+                return False
+
             if resp.status != "active":
                 self._set_status(f"Unexpected status: {resp.status}")
                 return False
@@ -401,11 +439,28 @@ class DemonExt:
             self._expires_at_ms = resp.expires_at
             self._extensions_used = resp.extensions_used or 0
             self._write_par("Queueposition", 0)
+            if resp.expires_at:
+                now_ms = time.time() * 1000.0
+                self._write_par(
+                    "Expiresin",
+                    max(0.0, (resp.expires_at - now_ms) / 1000.0),
+                )
 
             if not self._ws_url:
                 self._set_status("No wsUrl from server")
                 return False
 
+            # Fire-and-forget claim in parallel with WS open. Cancels the
+            # server-side reservation eviction so we don't race the WS
+            # handshake against it.
+            sid = self._session_id or ""
+            threading.Thread(
+                target=lambda: client.claim(sid),
+                name=f"queue-claim-{sid[:8]}",
+                daemon=True,
+            ).start()
+
+            self._set_status(f"Connecting to hosted pod...")
             self._open_ws(self._ws_url)
             return True
 
@@ -456,8 +511,13 @@ class DemonExt:
             except Exception as e:
                 self.log(f"Disconnect: close failed: {e}")
 
+        # In hosted mode we have a server-side session row that needs to
+        # be released so the pod is returned to the pool. (Direct mode has
+        # no session_id so this is skipped.) Use Baseurl, not Serverurl —
+        # Serverurl is the local-pod ws:// in direct mode and has no
+        # /api/queue/* surface.
         if session_id:
-            base = self._read_par("Serverurl", "http://localhost:1318")
+            base = self._read_par("Baseurl", "https://music.daydream.live")
             try:
                 queue_mod.QueueClient(base, api_key=self._api_key or None).leave(
                     session_id
@@ -465,6 +525,8 @@ class DemonExt:
             except queue_mod.QueueError:
                 pass
 
+        self._write_par("Queueposition", 0)
+        self._write_par("Expiresin", 0.0)
         self._set_status("Idle")
 
     # --- TD lifecycle hooks ---------------------------------------------------
@@ -497,10 +559,129 @@ class DemonExt:
 
     # -------- auth -----------------------------------------------------------
 
-    def Authenticate(self) -> None:
-        """Daydream OAuth — coming soon. This release supports local pod only."""
-        self._set_status("Hosted mode coming soon — use a local pod for now")
-        self.log("Authenticate(): hosted/Daydream auth is disabled in this release.")
+    def _auth_file(self) -> Path:
+        """Per-user persistence path for the Daydream apiKey + deviceId.
+
+        macOS:    ~/Library/Application Support/derivative/daydream_auth.json
+        Windows:  %APPDATA%/Derivative/daydream_auth.json
+        Linux:    ~/.local/share/derivative/daydream_auth.json
+
+        Storing OUTSIDE the .toe project matches the rtmg-vst's PropertiesFile
+        approach and avoids leaking the apiKey when a user shares the .toe.
+        """
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA", str(Path.home()))) / "Derivative"
+        elif sys.platform.startswith("linux"):
+            base = Path.home() / ".local" / "share" / "derivative"
+        else:  # darwin or unknown — fall through to macOS path
+            base = Path.home() / "Library" / "Application Support" / "derivative"
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "daydream_auth.json"
+
+    def _load_auth(self) -> None:
+        """Populate self._device_id and (optionally) self._api_key from disk.
+
+        Always sets self._device_id — minting a fresh UUID4 if the file is
+        absent or corrupt. The apiKey + display name only land if a prior
+        sign-in persisted them.
+        """
+        try:
+            data = json.loads(self._auth_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+
+        self._device_id = data.get("deviceId") or str(uuid.uuid4())
+
+        api_key = data.get("apiKey") or ""
+        if api_key:
+            self._api_key = api_key
+            self._write_par("Apikey", api_key)
+            self._write_par(
+                "Signedinas",
+                data.get("displayName") or data.get("email") or "",
+            )
+
+        # First-boot: persist the freshly-minted deviceId so the next run
+        # sees it. Wrapping in try keeps boot resilient if the fs is
+        # read-only (rare TD installs from a network drive).
+        if "deviceId" not in data:
+            try:
+                self._persist_auth(api_key, data if isinstance(data, dict) else {})
+            except Exception as e:
+                self.log(f"_load_auth: persist new deviceId failed: {e}")
+
+    def _persist_auth(self, api_key: str, profile: dict) -> None:
+        """Write apiKey + profile + deviceId to <prefs>/daydream_auth.json.
+
+        Profile dict shape matches what /users/profile returns:
+            { id|userId, email, name|username, isAdmin, cohortParticipant, ... }
+
+        We keep the same key names that rtmg-vst uses so manual inspection of
+        the file is consistent across plugins.
+        """
+        if not self._device_id:
+            self._device_id = str(uuid.uuid4())
+        blob = {
+            "apiKey": api_key or "",
+            "deviceId": self._device_id,
+            "userId": (profile.get("id") or profile.get("userId")
+                       or profile.get("user_id") or ""),
+            "email": profile.get("email") or "",
+            "displayName": (profile.get("email") or profile.get("name")
+                            or profile.get("username") or ""),
+            "isAdmin": bool(profile.get("isAdmin")),
+            "cohortParticipant": bool(profile.get("cohortParticipant")),
+        }
+        self._auth_file().write_text(
+            json.dumps(blob, indent=2), encoding="utf-8")
+
+    def SignInBrowser(self) -> None:
+        """Launch the Daydream OAuth flow in the system browser.
+
+        Flow (mirrors demon-public-demo/lib/auth/daydream.ts):
+          1. Pick a free local port + a CSRF state nonce.
+          2. Configure the COMP's oauth_server WebServer DAT to listen on
+             that port.
+          3. Open app.daydream.live/sign-in/local?redirect_url=...&state=...
+             in the user's default browser.
+          4. The browser POSTs ?token=...&state=... to /cb on our listener,
+             which routes into OnHTTPRequest -> OnAuthCallback.
+
+        The browser side does all the actual work. This method is a
+        glorified launcher.
+        """
+        try:
+            port = oauth.find_free_port()
+        except oauth.OAuthError as e:
+            self._set_status(f"OAuth port pick failed: {e}")
+            return
+
+        server = self._oauth_server()
+        if server is None:
+            self._set_status("oauth_server DAT missing — rebuild .tox")
+            self.log("SignInBrowser: oauth_server DAT not found in COMP")
+            return
+
+        state = oauth.generate_state()
+        self._oauth_port = port
+        self._oauth_state = state
+        try:
+            server.par.port = port
+            server.par.active = True
+        except Exception as e:
+            self._set_status(f"Failed to start OAuth listener: {e}")
+            self.log(f"SignInBrowser: WebServer DAT config failed: {e}")
+            return
+
+        url = oauth.build_signin_url(port, state)
+        if not oauth.open_browser(url):
+            self._set_status(f"Open in browser: {url}")
+            self.log(f"SignInBrowser: no system browser; sign in via: {url}")
+            return
+        self._set_status("Sign in via your browser, then return here")
+
+    # Back-compat alias for any user scripts that still call Authenticate.
+    Authenticate = SignInBrowser
 
     def OnAuthCallback(self, query_string: str) -> tuple[int, str, str]:
         """Called by the Web Server DAT's onHTTPRequest handler with the
@@ -529,10 +710,22 @@ class DemonExt:
                 reason=str(e)
             )
 
-        # Persist
-        self.SetApiKey(profile.api_key)
+        # Pull the raw profile so we can persist all the same fields the
+        # paste-key path persists. fetch_profile is idempotent and returns
+        # {} on failure — safe to call here.
+        raw_profile = oauth.fetch_profile(profile.api_key)
+        self._persist_auth(profile.api_key, raw_profile)
+
+        # In-memory + visible par updates.
+        self._api_key = profile.api_key
+        self._write_par("Apikey", profile.api_key)
+        self._write_par(
+            "Signedinas",
+            profile.display_name or profile.email or "",
+        )
         self._set_status(
-            f"Authenticated{(' as ' + profile.display_name) if profile.display_name else ''}"
+            f"Signed in"
+            + (f" as {profile.display_name}" if profile.display_name else ""),
         )
 
         # Shut down the listener.
@@ -548,24 +741,104 @@ class DemonExt:
         return 200, "text/html", oauth.CALLBACK_OK_HTML
 
     def SetApiKey(self, key: str) -> None:
-        """Store a Daydream API key (also called by Paste API Key pulse)."""
+        """Store a Daydream API key without validation. Used for the
+        callback-from-OAuth path and the legacy Pasteapikey caller.
+
+        For the user-facing paste flow, prefer PromptForApiKey which
+        validates against /users/profile before persisting.
+        """
         with self._lock:
             self._api_key = key or ""
         self._write_par("Apikey", self._api_key)
+        # Keep the on-disk blob in sync (preserves deviceId etc).
+        try:
+            self._persist_auth(self._api_key, {})
+        except Exception as e:
+            self.log(f"SetApiKey: persist failed: {e}")
 
     def PromptForApiKey(self) -> None:
-        """Open a modal asking the user to paste an API key."""
+        """Open a modal asking the user to paste an API key, validate it
+        against Daydream, then persist on success.
+
+        Validation: GET https://api.daydream.live/users/profile with the
+        pasted key as Bearer. 401/403 -> reject with a clear message.
+        Anything else with a userId in the response body -> accept.
+        Mirrors rtmg-vst's RTMGAuth::signInWithApiKey.
+        """
         try:
             import ui  # type: ignore[name-defined]  # noqa: F401
-            value = ui.messageBox(  # type: ignore[name-defined]
-                "Paste Daydream API key",
-                "Paste your Daydream API key:",
-                buttons=["OK", "Cancel"],
-            )
-            if value:
-                self.SetApiKey(value)
         except Exception:
             self.log("PromptForApiKey: 'ui' unavailable; paste into the API Key par directly")
+            return
+
+        # Nudge the user to the right page so they can copy a key.
+        try:
+            webbrowser.open("https://app.daydream.live")
+        except Exception:
+            pass
+
+        try:
+            value = ui.messageBox(  # type: ignore[name-defined]
+                "Paste Daydream API key",
+                "Copy your key from app.daydream.live, then paste below:",
+                buttons=["OK", "Cancel"],
+            )
+        except Exception as e:
+            self.log(f"PromptForApiKey: dialog failed: {e}")
+            return
+        if not value:
+            return
+        key = (value or "").strip()
+        if not key:
+            return
+
+        self._set_status("Validating API key...")
+        try:
+            profile = oauth.fetch_profile(key)
+        except oauth.OAuthError as e:
+            msg = str(e)
+            self._set_status(f"Key rejected: {msg}")
+            try:
+                ui.messageBox("Sign-in failed", msg)  # type: ignore[name-defined]
+            except Exception:
+                pass
+            return
+
+        if not profile or not (profile.get("id") or profile.get("userId")
+                               or profile.get("user_id")):
+            self._set_status("Key rejected by Daydream")
+            try:
+                ui.messageBox(  # type: ignore[name-defined]
+                    "Sign-in failed",
+                    "That API key was rejected. Check it and try again.",
+                )
+            except Exception:
+                pass
+            return
+
+        # Accepted — persist + reflect into the UI.
+        with self._lock:
+            self._api_key = key
+        self._persist_auth(key, profile)
+        self._write_par("Apikey", key)
+        display = (profile.get("email") or profile.get("name")
+                   or profile.get("username") or "")
+        self._write_par("Signedinas", display)
+        self._set_status(f"Signed in as {display or '(unknown)'}")
+
+    def SignOut(self) -> None:
+        """Wipe the stored API key + profile. Preserves deviceId."""
+        with self._lock:
+            self._api_key = ""
+        self._write_par("Apikey", "")
+        self._write_par("Signedinas", "")
+        # Re-persist with empty key so the file still carries deviceId
+        # for the next sign-in.
+        try:
+            self._persist_auth("", {})
+        except Exception as e:
+            self.log(f"SignOut: persist failed: {e}")
+        self._set_status("Signed out")
 
     # -------- continuous param push ------------------------------------------
 
@@ -737,6 +1010,16 @@ class DemonExt:
             self.log(f"Debug logging {'enabled' if self._debug_enabled else 'disabled'}")
             return
 
+        # 0a. Mode toggle — grey out the irrelevant set of hosted/direct pars
+        # so the Session page makes visual sense. We can't conditionally
+        # hide pars in TD; greying them is the closest equivalent.
+        if name == "Mode":
+            try:
+                self._apply_mode_visibility(par.eval())
+            except Exception as e:
+                self.log(f"OnParChange(Mode) visibility update failed: {e}")
+            return
+
         # 1. Pulse actions
         if schema.type == "Pulse":
             self._handle_pulse(name)
@@ -817,24 +1100,52 @@ class DemonExt:
             self.log(f"OnTick send error: {e}")
 
     def OnHeartbeat(self) -> None:
-        """Called by the 5s heartbeat Timer CHOP. Polls /api/queue/status."""
-        if not self._connected or not self._session_id:
+        """Called by the 5s heartbeat Timer CHOP. Polls /api/queue/status
+        and honors server-side state transitions.
+
+        Only runs in hosted mode (direct mode has no sessionId). Mirrors
+        rtmg-vst's RTMGSession::applyResult for the active/queued/over_budget
+        state machine — the server can demote us from active to queued
+        (lost reservation) or over_budget (paywall) and we surface that
+        in the UI even if the WS is still notionally open.
+        """
+        mode = (self._read_par("Mode", "direct") or "direct").lower()
+        if mode != "hosted" or not self._connected or not self._session_id:
             return
-        base = self._read_par("Serverurl", "http://localhost:1318")
+        base = self._read_par("Baseurl", "https://music.daydream.live")
         try:
             resp = queue_mod.QueueClient(base, api_key=self._api_key or None).status(
                 self._session_id
             )
         except queue_mod.QueueError as e:
+            # Transient — keep the WS alive, retry on the next 5 s tick.
             self.log(f"Heartbeat poll failed: {e}")
             return
 
-        if resp.expires_at:
-            self._expires_at_ms = resp.expires_at
-            now_ms = time.time() * 1000
-            self._write_par("Expiresin", max(0.0, (resp.expires_at - now_ms) / 1000))
-
-        if resp.status != "active":
+        if resp.status == "active":
+            if resp.expires_at:
+                self._expires_at_ms = resp.expires_at
+                now_ms = time.time() * 1000
+                self._write_par(
+                    "Expiresin",
+                    max(0.0, (resp.expires_at - now_ms) / 1000),
+                )
+            self._extensions_used = (
+                resp.extensions_used or self._extensions_used
+            )
+        elif resp.status == "queued":
+            # Reservation lost server-side. Surface for awareness; leave
+            # the WS alone — the server will close it if it actually
+            # evicted us. (Same defensive posture as the RTMG VST.)
+            self._write_par("Queueposition", resp.position or 0)
+            self._set_status(
+                f"Server requeued us (position {resp.position or '?'})"
+            )
+        elif resp.status == "over_budget":
+            deny = resp.deny_reason or "(no reason)"
+            self._write_par("Denyreason", deny)
+            self._set_status(f"Paywall: {deny}")
+        else:
             self.log(f"Heartbeat saw status={resp.status}; disconnecting")
             self.Disconnect()
 
@@ -1785,8 +2096,13 @@ class DemonExt:
         dispatch = {
             "Connect": lambda: self.Connect(),
             "Disconnect": lambda: self.Disconnect(),
-            "Authenticate": lambda: self.Authenticate(),
+            # Hosted-mode auth pulses. `Authenticate` is kept as a back-compat
+            # alias for the old (stub) pulse name; the new pulses are
+            # Signinbrowser + Signout.
+            "Authenticate": lambda: self.SignInBrowser(),
+            "Signinbrowser": lambda: self.SignInBrowser(),
             "Pasteapikey": lambda: self.PromptForApiKey(),
+            "Signout": lambda: self.SignOut(),
             "Stillplaying": lambda: self._extend_session(),
             "Sendprompt": lambda: self.SendPrompt(),
             "Setpromptblend": lambda: self.SetPromptBlend(),
@@ -1806,19 +2122,32 @@ class DemonExt:
                 self.log(f"Pulse {name} failed: {e}")
 
     def _extend_session(self) -> None:
+        """Bump the hosted session's lifetime via POST /api/queue/extend.
+
+        No-op in direct mode (no sessionId). Reads Baseurl (the hosted API
+        root), not Serverurl, so this works after the WS is already open
+        to a signed wss:// URL.
+        """
         if not self._session_id:
+            self.log("_extend_session: no session id (not in hosted mode?)")
             return
-        base = self._read_par("Serverurl", "http://localhost:1318")
+        base = self._read_par("Baseurl", "https://music.daydream.live")
         try:
             resp = queue_mod.QueueClient(base, api_key=self._api_key or None).extend(
                 self._session_id
             )
             if resp.expires_at:
                 self._expires_at_ms = resp.expires_at
+                now_ms = time.time() * 1000.0
+                self._write_par(
+                    "Expiresin",
+                    max(0.0, (resp.expires_at - now_ms) / 1000.0),
+                )
             self._extensions_used = resp.extensions_used or self._extensions_used
             self._set_status("Extended")
         except queue_mod.QueueError as e:
             self.log(f"Extend failed: {e}")
+            self._set_status(f"Extend failed: {e}")
 
     # -------- helpers --------------------------------------------------------
 
@@ -1941,6 +2270,42 @@ class DemonExt:
             return self.ownerComp.op("oauth_server")
         except Exception:
             return None
+
+    # Pars that only make sense in one Mode. Used by _apply_mode_visibility
+    # to grey out the unused set whenever the Mode menu changes.
+    _DIRECT_ONLY_PARS = ("Serverurl",)
+    _HOSTED_ONLY_PARS = (
+        "Baseurl", "Apikey", "Signedinas",
+        "Pasteapikey", "Signinbrowser", "Signout",
+        "Queueposition", "Expiresin", "Denyreason",
+        "Stillplaying",
+    )
+
+    def _apply_mode_visibility(self, mode: Any) -> None:
+        """Grey out the inactive-mode pars on the Session page.
+
+        TD's custom pars don't support `display=False` based on another par;
+        the next best thing is toggling `enable`. Greying preserves the
+        ability for the user to *see* both layouts (so they know there's
+        another mode to switch to) while making it obvious which pars are
+        currently live.
+        """
+        mode_norm = (str(mode) or "direct").lower()
+        is_hosted = (mode_norm == "hosted")
+        for name in self._DIRECT_ONLY_PARS:
+            p = self._par_by_name(name)
+            if p is not None:
+                try:
+                    p.enable = not is_hosted
+                except Exception:
+                    pass
+        for name in self._HOSTED_ONLY_PARS:
+            p = self._par_by_name(name)
+            if p is not None:
+                try:
+                    p.enable = is_hosted
+                except Exception:
+                    pass
 
     def _par_by_name(self, name: str):
         try:

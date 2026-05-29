@@ -10,15 +10,20 @@ hit Connect, and you'll hear AI-generated audio playing through your speakers.
 Every public DEMON parameter is exposed through native TD parameter pages, and
 the whole thing is scriptable from Python.
 
-> **Status:** v0.1 — end-to-end audio playback working on macOS. Tested against
-> a hosted DEMON pod (Vast.ai) and a local pod. Windows build pending.
+> **Status:** v0.2 — end-to-end audio playback working on macOS, both against
+> your own DEMON pod and against the hosted Daydream queue at
+> `music.daydream.live`. Windows build pending.
 
 ---
 
 ## What it does
 
-- Connects to a DEMON backend over WebSocket (direct-pod mode by default; hosted
-  Daydream queue mode is coming).
+- Connects to a DEMON backend over WebSocket. Two modes (`Mode` menu on the
+  Session page):
+  - **Direct** — your own pod URL (local or Vast.ai).
+  - **Hosted** — joins the Daydream queue at `music.daydream.live` and plays on
+    a managed pod. Paste your API key from app.daydream.live (or sign in via
+    browser), then hit Connect.
 - Exposes ~70 parameters across 7 pages — every DEMON public param, plus
   session and operational controls.
 - Plays generated audio out of your Mac's default audio device via Python +
@@ -309,11 +314,17 @@ can still import it.
 `.tox` artifacts are attached to GitHub releases:
 [demonTD releases](https://github.com/daydreamlive/demonTD/releases).
 
-## Out of scope (v0.1, deferred to v0.2+)
+## Out of scope (v0.2, deferred to v0.2.x+)
 
-- **Hosted Daydream mode** — queue join/status/leave + OAuth (code is in
-  `src/queue_client.py` and `src/oauth.py`; UI controls return in v0.2).
-  v0.1 is direct-pod only.
+- **Auto-reconnect on WS drop.** v0.2 keeps the explicit Connect /
+  Disconnect model. Transient WS errors will surface in the Status par
+  rather than retrying silently.
+- **Encrypted apiKey on disk.** The persisted `daydream_auth.json` is
+  plaintext JSON, matching the rtmg-vst PropertiesFile pattern. Lock
+  down access via your OS user perms.
+- **Admin `?pod=` override.** The queue client supports it via
+  `QueueClient.join(pod_id=...)` but no UI surface yet. Add an
+  `Adminpod` Str par if needed.
 - **Internal `audiodeviceoutCHOP`** — a Session-page device picker that
   embeds a TD-native `Audio Device Out` inside the COMP. Currently
   unnecessary since SpeakerOut handles playback; useful for users who want
