@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.11-drop-signout"
+BUILD_MARKER = "v0.2.12-no-audio-alloc"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -974,6 +974,34 @@ class DemonExt:
                 buffered = self._ring.available
                 buf_s = buffered / wire.SAMPLE_RATE
                 self.log(f"buffered={buffered} samples ({buf_s:.2f}s)")
+
+        # Audio-thread latency telemetry (~1 s cadence, Debug-gated).
+        # Lets us confirm the zero-alloc pa_callback is actually fast
+        # in the user's environment — if max_ms ever creeps near the
+        # PortAudio deadline (frames_per_buffer / sr * 1000), we have
+        # evidence to chase the next contention source (lock with WS
+        # thread, system audio interrupt, etc.). The drain itself is
+        # cheap (a few int reads + resets) and tolerates a tiny race
+        # with the audio thread; worst case is one sample skewed.
+        if self._debug_enabled and self._connected:
+            now = time.time()
+            last_lat = getattr(self, "_last_lat_log", 0.0)
+            if now - last_lat > 1.0:
+                self._last_lat_log = now
+                try:
+                    stats = self._speaker_out.drain_latency_stats()
+                except Exception:
+                    stats = None
+                if stats:
+                    warn = " (OVER max_block_frames!)" if stats[
+                        "over_max_block"] else ""
+                    self.log(
+                        f"[speaker_out] cb_latency "
+                        f"n={stats['n']} "
+                        f"mean={stats['mean_ms']:.2f}ms "
+                        f"max={stats['max_ms']:.2f}ms "
+                        f"underruns_total={stats['underruns_total']}{warn}"
+                    )
 
         if not self._connected:
             return

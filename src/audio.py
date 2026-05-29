@@ -22,6 +22,7 @@ No TD dependencies.
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 
@@ -55,6 +56,45 @@ class LoopBuffer:
         self._frames: int = 0
         self._position: int = 0  # next read frame
         self._lock = threading.Lock()
+        # Pre-allocated scratch for the seam crossfade weights. Each seam
+        # span needs a (1.0 - t_vals) and t_vals coefficient array. Both
+        # are derived from a single ramp [0, 1/seam, 2/seam, ..., (seam-1)/seam]
+        # that's fixed for the life of the buffer — caching it lets
+        # `read_into` skip ~3 numpy allocations per crossfade run, which
+        # is the difference between a clean audio thread and one that
+        # triggers gen-0 GC pauses on the PortAudio callback.
+        # Shape (seam_frames,) float32. `_seam_one_minus_t_scratch` holds
+        # (1.0 - t_vals) which the read_into hot path multiplies against
+        # the tail samples.
+        self._seam_t_scratch: np.ndarray | None = None
+        self._seam_one_minus_t_scratch: np.ndarray | None = None
+        if self._seam_frames > 0:
+            self._init_seam_scratch()
+
+    def _init_seam_scratch(self) -> None:
+        """Recompute the cached seam-crossfade coefficient arrays. Called
+        once at construction and whenever the buffer is re-`init()`'d (in
+        case the channel count changed; seam_frames itself doesn't move
+        but keeping the recompute path safe lets us extend later)."""
+        s = self._seam_frames
+        if s <= 0:
+            self._seam_t_scratch = None
+            self._seam_one_minus_t_scratch = None
+            return
+        # t_vals[k] = k/s for k in 0..s-1. Matches how `read` used to
+        # compute it inline as (seam - dist_from_end)/seam where
+        # dist_from_end = frames - tail_indices. As tail_indices walks
+        # from (frames-s) up to (frames-1), dist_from_end goes from s
+        # down to 1, so t = (s - dist)/s walks from 0 up to (s-1)/s.
+        t = np.arange(s, dtype=np.float32) / float(s)
+        self._seam_t_scratch = t
+        self._seam_one_minus_t_scratch = (1.0 - t).astype(np.float32)
+        # Scratch for the "head * t" partial product in the crossfade.
+        # Pre-allocated at full seam width so `read_into` never has to
+        # allocate, regardless of how many seam frames a given call
+        # ends up touching. Sized as (channels, seam_frames) float32.
+        self._seam_blend_scratch = np.zeros(
+            (self.channels, s), dtype=np.float32)
 
     @property
     def frames(self) -> int:
@@ -109,10 +149,19 @@ class LoopBuffer:
             raise ValueError(f"unsupported pcm.ndim={pcm.ndim}")
 
         with self._lock:
+            channels_changed = (ch != self.channels)
             self.channels = ch
             self._buffer = np.ascontiguousarray(buf, dtype=np.float32)
             self._frames = frames
             self._position = 0
+            # Re-size the seam blend scratch if channel count changed —
+            # the read_into hot path indexes it as
+            # `_seam_blend_scratch[:, :take]` and broadcasts a (take,)
+            # weight against (channels, take). If we kept a stale
+            # channel count, the broadcast would fail.
+            if channels_changed and self._seam_frames > 0:
+                self._seam_blend_scratch = np.zeros(
+                    (ch, self._seam_frames), dtype=np.float32)
 
     def swap(self, pcm: np.ndarray, channels: int | None = None) -> None:
         """Replace the entire loop buffer (server `swap_ready` path).
@@ -184,76 +233,113 @@ class LoopBuffer:
     def read(self, num_frames: int) -> np.ndarray:
         """Read `num_frames` frames at the playback position; advance head.
 
-        Returns shape (channels, num_frames) float32. Wraps the loop
-        automatically with a seam crossfade. If the buffer is
-        uninitialized, returns silence.
+        Allocates a fresh `(channels, num_frames)` float32 array and
+        delegates to `read_into`. Kept for non-audio-thread callers
+        (tests, `peek`-style helpers). **Audio-thread callers should use
+        `read_into(out)` with a pre-allocated buffer** to avoid GC
+        pressure that causes intermittent stutters; see `read_into`
+        docstring for the why.
+        """
+        out = np.zeros((self.channels, max(0, num_frames)), dtype=np.float32)
+        if num_frames > 0:
+            self.read_into(out)
+        return out
 
-        Seam crossfade: as the playhead approaches end-of-buffer, the
-        last `_seam_frames` (50 ms by default) are blended with the
-        FIRST `_seam_frames` of the buffer. On wrap, the playhead jumps
-        to `_seam_frames` (NOT 0) so the leading samples aren't
-        replayed verbatim. Mirrors the AudioWorklet at
+    def read_into(self, out: np.ndarray) -> None:
+        """Fill `out` with the next `out.shape[1]` frames; advance head.
+
+        `out` must be shape (channels, num_frames) float32. Allocation-
+        free in steady state — all temporaries come from the cached
+        `_seam_t_scratch` / `_seam_one_minus_t_scratch` arrays plus
+        views into the buffer.
+
+        Why: the audio thread's PortAudio callback runs every ~85 ms
+        (4096 frames @ 48 kHz). Each numpy allocation pushes CPython's
+        gen-0 heap closer to a collection, and a gen-0 GC that fires
+        on the audio thread is a ~10-30 ms pause — half our deadline.
+        The "audio stutters, then resolves, then stutters again"
+        pattern matches GC quiesce/spike cycles exactly. Removing the
+        allocations from this hot path is the difference between
+        clean audio and intermittent dropouts.
+
+        Behavior is otherwise identical to `read`: wraps the loop with
+        a seam crossfade (last `_seam_frames` blended with first
+        `_seam_frames`; on wrap, playhead jumps to `_seam_frames`,
+        not 0). Mirrors the AudioWorklet at
         `demon-public-demo/public/audio-worklet.js` lines 191–239.
 
-        Vectorized: the read is divided into runs of (a) bulk-copy
-        from a contiguous region of the buffer, and (b) crossfade
-        over the tail-seam region. Each run is a couple of numpy
-        operations — no per-sample Python loop. Important: this
-        function is called from the PortAudio audio callback thread,
-        so it MUST be fast. The previous per-frame implementation
-        was ~2k Python iterations per callback at audio rate; when
-        TD's main thread held the GIL for >40 ms (network panel
-        render, GPU sync, big cook, GC), the audio thread missed
-        its deadline and you'd hear a stutter.
-
-        IMPORTANT: This is the AUTHORITATIVE play head. Only one consumer
-        (the actual audio output thread — SpeakerOut._pa_callback) should
-        call this. Other consumers (e.g. the Script CHOP cook callback,
-        for visual reactivity) must use `peek()` so they don't race the
-        head forward and cause the audio thread to skip samples.
+        IMPORTANT: This is the AUTHORITATIVE play head. Only one
+        consumer (`SpeakerOut._pa_callback`) should call this. Other
+        consumers (the Script CHOP cook callback for visual reactivity)
+        must use `peek()` so they don't race the head forward and cause
+        the audio thread to skip samples.
         """
         ch = self.channels
-        out = np.zeros((ch, num_frames), dtype=np.float32)
+        num_frames = out.shape[1]
         if num_frames <= 0:
-            return out
+            return
 
         with self._lock:
             buf = self._buffer
             frames = self._frames
             if buf is None or frames == 0:
-                return out
+                # Caller's `out` may be uninitialized — explicitly silence.
+                out.fill(0.0)
+                return
 
             seam = min(self._seam_frames, frames // 4)
             seam_start = frames - seam  # first frame inside the tail seam
             pos = self._position
             written = 0
+            # Cached crossfade weights — same shape as the full seam.
+            # We slice into them per crossfade run; no allocation.
+            t_full = self._seam_t_scratch
+            one_minus_t_full = self._seam_one_minus_t_scratch
 
             while written < num_frames:
                 need = num_frames - written
                 if pos < seam_start:
-                    # Pre-seam: bulk copy contiguous range from buf.
+                    # Pre-seam: bulk copy contiguous range from buf into
+                    # out. Already allocation-free — numpy slicing into
+                    # an existing destination just memmoves.
                     take = min(seam_start - pos, need)
                     out[:, written:written + take] = buf[:, pos:pos + take]
                     pos += take
                     written += take
                 else:
-                    # In seam: vectorized crossfade over [pos, pos+take).
-                    # t goes from (seam - (frames-pos))/seam at the first
-                    # frame to (seam - (frames-(pos+take-1)))/seam at the
-                    # last; tail samples come from buf[:, pos:pos+take]
-                    # and head samples come from
-                    # buf[:, seam-(frames-pos) : seam-(frames-pos)+take].
+                    # In-seam crossfade. Walk position pos..pos+take-1;
+                    # the corresponding "distance from end" is
+                    # (frames - pos), (frames - pos - 1), ... down to 1.
+                    # t_vals[k] = (seam - dist_from_end[k]) / seam, which
+                    # is the same ramp as t_full[seam - dist_from_end]
+                    # for k = 0..take-1.
                     max_take = frames - pos
                     take = min(max_take, need)
-                    tail_indices = np.arange(pos, pos + take)
-                    dist_from_end = frames - tail_indices  # shape (take,)
-                    t_vals = (seam - dist_from_end).astype(np.float32) / seam
-                    head_indices = seam - dist_from_end
-                    tail = buf[:, tail_indices]
-                    head = buf[:, head_indices]
-                    out[:, written:written + take] = (
-                        tail * (1.0 - t_vals) + head * t_vals
-                    )
+                    # The t ramp inside the seam starts at index
+                    # `seam - (frames - pos)` and runs for `take`
+                    # consecutive entries of t_full.
+                    seam_offset = seam - (frames - pos)
+                    t_slice = t_full[seam_offset:seam_offset + take]
+                    one_minus_t_slice = one_minus_t_full[
+                        seam_offset:seam_offset + take]
+                    # tail comes from buf[:, pos:pos+take] (contiguous);
+                    # head comes from buf[:, seam_offset:seam_offset+take]
+                    # (also contiguous — these are the first `seam`
+                    # frames of the buffer being folded back).
+                    tail = buf[:, pos:pos + take]
+                    head = buf[:, seam_offset:seam_offset + take]
+                    # out[:, w:w+take] = tail*(1-t) + head*t, zero temps.
+                    # Two products into pre-allocated buffers:
+                    #   dst       <- tail * (1-t)        (broadcast)
+                    #   blend     <- head * t            (broadcast)
+                    #   dst      += blend
+                    # `_seam_blend_scratch` is (channels, seam_frames)
+                    # so a take-wide slice into it is always valid.
+                    dst = out[:, written:written + take]
+                    blend = self._seam_blend_scratch[:, :take]
+                    np.multiply(tail, one_minus_t_slice, out=dst)
+                    np.multiply(head, t_slice, out=blend)
+                    np.add(dst, blend, out=dst)
                     pos += take
                     written += take
                     if pos >= frames:
@@ -262,7 +348,6 @@ class LoopBuffer:
                         pos = seam if seam > 0 else 0
 
             self._position = pos
-            return out
 
     def peek(self, num_frames: int,
              position: int | None = None) -> np.ndarray:
@@ -603,6 +688,50 @@ class SpeakerOut:
         # device. The pa_callback reads this to decide which dtype to
         # write into PortAudio's output buffer.
         self._sample_format_pa: int = _paFloat32
+
+        # --- audio-thread scratch buffers (zero-alloc callback path) ----
+        # The PortAudio callback runs ~12 times/sec at 4096 frames @
+        # 48 kHz. If we allocate numpy arrays on the audio thread,
+        # CPython's gen-0 GC can fire there and pause us long enough
+        # to blow the 85 ms deadline → stutter. Pre-allocating means
+        # zero allocations per callback in steady state.
+        #
+        # `_max_block_frames` is the largest block size we expect from
+        # PortAudio. 4096 is our request (frames_per_buffer); when we
+        # open with paFramesPerBufferUnspecified the device decides and
+        # sometimes uses larger blocks. 16384 frames @ 48 kHz = ~340 ms
+        # which is comfortably above anything macOS Core Audio emits in
+        # practice. If a callback ever exceeds this we fall back to
+        # per-call allocation (rare, logged).
+        self._max_block_frames = max(self._frames_per_buffer * 4, 16384)
+        # (channels, max_block_frames) float32 — LoopBuffer.read_into
+        # writes here.
+        self._scratch_pcm = np.zeros(
+            (self._channels, self._max_block_frames), dtype=np.float32)
+        # Interleaved float32 destination for memmove — same total
+        # samples but laid out (frame0_L, frame0_R, frame1_L, ...).
+        self._scratch_interleaved_f32 = np.zeros(
+            self._max_block_frames * self._channels, dtype=np.float32)
+        # Interleaved int16 for the degraded fallback open path. Only
+        # touched when self._sample_format_pa == paInt16. Pre-allocating
+        # both means we don't have to grow a scratch on a format change.
+        self._scratch_interleaved_i16 = np.zeros(
+            self._max_block_frames * self._channels, dtype=np.int16)
+
+        # --- audio-thread latency telemetry --------------------------
+        # Counts since the last reporter drain (in _pa_callback's sense
+        # of "since"). The main thread reads + resets these via
+        # `drain_latency_stats()`. Plain ints — Python's GIL serializes
+        # reads/writes on small builtins, so no extra locking needed
+        # here for the orders-of-magnitude correct numbers we want.
+        self._cb_count_since_drain: int = 0
+        self._cb_latency_sum_ns: int = 0
+        self._cb_latency_max_ns: int = 0
+        # Underrun-by-rate-mismatch hint — set True if a callback ever
+        # asks for more frames than _max_block_frames. Visible in the
+        # next telemetry report.
+        self._cb_over_max_block: bool = False
+
         # Keep a strong reference to the bound CFUNCTYPE so it doesn't get
         # garbage-collected while the audio thread is calling into it.
         self._c_callback = self._CB_TYPE(self._pa_callback)
@@ -945,47 +1074,129 @@ class SpeakerOut:
                      user_data) -> int:
         """PortAudio callback (audio thread).
 
-        Kept minimal: read N frames from LoopBuffer, write to PortAudio's
-        output pointer in whatever sample format we managed to open with.
-        No allocations beyond what numpy does inside LoopBuffer.read.
+        Zero allocations in the steady-state path:
+          * `_scratch_pcm[:, :n]` is filled by `LoopBuffer.read_into`
+            (no allocation — see LoopBuffer.read_into docstring).
+          * For float32 output, we view `_scratch_interleaved_f32` as
+            `(n, channels)` and `np.copyto` from the transposed pcm
+            view (transpose is a strided view, free; copyto memcpy's
+            into the contiguous interleaved buffer).
+          * For int16 output, we clip + multiply in place inside
+            `_scratch_pcm[:, :n]`, then cast into the interleaved
+            int16 scratch.
+          * memmove copies the interleaved scratch into PortAudio's
+            output buffer.
+        No `np.zeros`, no `np.ascontiguousarray`, no implicit numpy
+        temporaries → no GC pressure on the audio thread.
 
-        `self._sample_format_pa` records the format we negotiated (set by
-        `start()` after a successful open). float32 is the preferred path;
-        int16 is the degraded fallback when Core Audio refuses float32.
+        `self._sample_format_pa` records the format we negotiated by
+        `start()`. float32 is the preferred path; int16 is the degraded
+        fallback when Core Audio refuses float32.
         """
+        # Microsecond-resolution latency measurement. `perf_counter_ns`
+        # is a C-level call, no allocation, and the audio thread can
+        # call it freely.
+        t0 = time.perf_counter_ns()
         self._callback_count += 1
+        self._cb_count_since_drain += 1
+
         if status_flags & _paOutputUnderflow:
             self._underrun_count += 1
-            # Periodically log underruns so we know if the GIL is starving us.
-            if self._underrun_count <= 3 or self._underrun_count % 50 == 0:
-                try:
-                    self._log(f"[speaker_out] underrun "
-                              f"(count={self._underrun_count}, "
-                              f"cb={self._callback_count}, "
-                              f"frames={frames})")
-                except Exception:
-                    pass
+            # Always-on log so every stutter shows up immediately in the
+            # textport (we used to gate this every 50, which hid them).
+            try:
+                self._log(
+                    f"[speaker_out] underrun "
+                    f"(count={self._underrun_count}, "
+                    f"cb={self._callback_count}, frames={frames})"
+                )
+            except Exception:
+                pass
+
         n = int(frames)
         is_int16 = (self._sample_format_pa == _paInt16)
         bytes_per_sample = 2 if is_int16 else 4
         n_bytes = n * self._channels * bytes_per_sample
+
         try:
-            pcm = self._loop.read(n)  # (channels, frames) float32
+            if n > self._max_block_frames:
+                # Outsized callback — flag for telemetry and fall back
+                # to a per-call alloc. Shouldn't happen with our open
+                # parameters but the audio thread can never fail to
+                # produce output, so we accept the one-time alloc.
+                self._cb_over_max_block = True
+                pcm_view = self._loop.read(n)  # (channels, n) float32
+            else:
+                pcm_view = self._scratch_pcm[:, :n]
+                self._loop.read_into(pcm_view)
+
             if is_int16:
-                # Soft-clip then scale to int16 range. Clip floor matters —
-                # raw multiply of an out-of-range float by 32767 wraps
-                # negative on overflow, generating loud noise.
-                clipped = np.clip(pcm, -1.0, 1.0)
-                interleaved = np.ascontiguousarray(
-                    (clipped * 32767.0).T.astype(np.int16)
+                # In-place clip + scale → pcm_view holds float32 values
+                # in [-32768, 32767] range.
+                np.clip(pcm_view, -1.0, 1.0, out=pcm_view)
+                np.multiply(pcm_view, 32767.0, out=pcm_view)
+                # Interleave + cast to int16. The 2D reshape view into
+                # the pre-allocated 1D scratch is free. `np.copyto` with
+                # `casting="unsafe"` does an in-place float32→int16
+                # truncation; the explicit clip above is what makes
+                # truncation safe (no wraparound on out-of-range floats).
+                view_i16 = self._scratch_interleaved_i16[
+                    :n * self._channels].reshape(n, self._channels)
+                np.copyto(view_i16, pcm_view.T, casting="unsafe")
+                _ctypes.memmove(
+                    out_buf,
+                    self._scratch_interleaved_i16.ctypes.data,
+                    n_bytes,
                 )
             else:
-                interleaved = np.ascontiguousarray(pcm.T, dtype=np.float32)
-            _ctypes.memmove(out_buf, interleaved.ctypes.data, n_bytes)
+                # float32 interleave: copy pcm_view.T (a non-contiguous
+                # strided view) into the contiguous interleaved scratch.
+                view_f32 = self._scratch_interleaved_f32[
+                    :n * self._channels].reshape(n, self._channels)
+                np.copyto(view_f32, pcm_view.T)
+                _ctypes.memmove(
+                    out_buf,
+                    self._scratch_interleaved_f32.ctypes.data,
+                    n_bytes,
+                )
         except Exception:
             # Any failure: write silence so the audio thread doesn't break.
             try:
                 _ctypes.memset(out_buf, 0, n_bytes)
             except Exception:
                 pass
+
+        elapsed_ns = time.perf_counter_ns() - t0
+        self._cb_latency_sum_ns += elapsed_ns
+        if elapsed_ns > self._cb_latency_max_ns:
+            self._cb_latency_max_ns = elapsed_ns
         return _paContinue
+
+    def drain_latency_stats(self) -> dict | None:
+        """Read + reset the audio-thread latency counters. Called by the
+        main TD thread (~once per second) to publish a telemetry line.
+
+        Returns None if no callbacks have fired since the last drain —
+        avoids spamming idle ticks. Otherwise returns a dict with
+        sample count, mean / max latency in milliseconds, and any
+        over-max-block warning state.
+        """
+        n = self._cb_count_since_drain
+        if n == 0:
+            return None
+        sum_ns = self._cb_latency_sum_ns
+        max_ns = self._cb_latency_max_ns
+        over = self._cb_over_max_block
+        # Reset before computing — short race window with the audio
+        # thread but the worst case is one missed sample per drain.
+        self._cb_count_since_drain = 0
+        self._cb_latency_sum_ns = 0
+        self._cb_latency_max_ns = 0
+        self._cb_over_max_block = False
+        return {
+            "n": n,
+            "mean_ms": (sum_ns / n) / 1_000_000.0,
+            "max_ms": max_ns / 1_000_000.0,
+            "over_max_block": over,
+            "underruns_total": self._underrun_count,
+        }

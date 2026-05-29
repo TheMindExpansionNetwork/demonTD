@@ -2,6 +2,58 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.12] — 2026-05-29
+
+**Audio stutter fix.** User reported a longstanding intermittent
+stutter that comes and goes — survives across versions, doesn't
+exist in `demon-public-demo`'s web client. Hot-path audit revealed
+the PortAudio callback (`SpeakerOut._pa_callback`) was allocating
+~10 numpy arrays per call (~100-200 KB), running at ~12 callbacks/sec
+→ ~1-2 MB/sec of allocation churn on the audio thread. CPython's
+gen-0 GC fires on whatever thread allocates; a GC pause on the
+audio thread of even ~30 ms blows our 85 ms deadline → stutter. The
+"resolves itself, then recurs" pattern matches GC quiesce/spike
+cycles exactly.
+
+### Changes
+
+* **`LoopBuffer.read_into(out)`** — new method that fills a caller-
+  provided buffer instead of allocating. Cached seam-crossfade scratch
+  on the buffer instance (`_seam_t_scratch`, `_seam_one_minus_t_scratch`,
+  `_seam_blend_scratch`). The existing `read()` stays as a thin
+  alloc-and-delegate wrapper for non-audio-thread callers.
+* **`SpeakerOut` pre-allocated scratch** — `_scratch_pcm`,
+  `_scratch_interleaved_f32`, `_scratch_interleaved_i16`, sized at
+  `_max_block_frames = max(frames_per_buffer * 4, 16384)` so a
+  surprise PortAudio block size doesn't force a fallback alloc.
+* **`_pa_callback` rewritten** to use the scratches + `np.copyto` +
+  `out=` keyword args on every numpy op. Zero allocations in steady
+  state. int16 path does in-place `np.clip` + `np.multiply` + a
+  single `np.copyto` cast (no `astype` temp).
+* **Audio-thread latency telemetry** — per-callback elapsed time
+  measured via `time.perf_counter_ns()`; mean + max published once
+  per second through `SpeakerOut.drain_latency_stats()`. `OnTick`
+  reads + logs them under the Debug toggle. Lets the user confirm
+  the fix worked (max << 85 ms) or, if not, prove the stutter is
+  something else.
+* **Always-on underrun log** — dropped the every-50th gate; every
+  audio underrun now lands in the textport immediately.
+* **`tests/test_audio.py` rewritten** — the obsolete RingBuffer-name
+  tests were replaced with LoopBuffer-equivalents (init, read,
+  read_into, patch / add_delta, seam crossfade, swap, clear) plus a
+  new `test_loop_buffer_read_into_is_allocation_free` that uses
+  `tracemalloc` to enforce zero hot-path allocations going forward.
+
+### Measured improvement (local)
+
+Before refactor: 200 calls of `_pa_callback` → ~tens of MB allocated.
+After refactor: 200 calls → ~1372 bytes attributed to audio.py,
+most of which is `tracemalloc` / lock-context-manager bookkeeping.
+Per-callback latency: mean 0.058 ms, max 0.315 ms (PortAudio deadline
+at 4096 frames / 48 kHz is ~85 ms — we use ~0.07% of available time).
+
+BUILD_MARKER bumped to v0.2.12-no-audio-alloc.
+
 ## [0.2.11] — 2026-05-29
 
 * Removed the **Sign out** pulse from the Session page. The paste-key

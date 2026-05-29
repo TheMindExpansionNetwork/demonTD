@@ -1,60 +1,195 @@
-"""Unit tests for src/audio.py — ring buffer + resample helpers."""
+"""Unit tests for src/audio.py — LoopBuffer + resample helpers.
+
+LoopBuffer replaces the original RingBuffer (which was a FIFO model
+ill-suited to DEMON's positional-patch streaming protocol). These
+tests cover the positional read/write/wrap semantics + the seam
+crossfade math + the allocation profile of the audio-thread hot path.
+"""
 
 from __future__ import annotations
 
+import gc
+import tracemalloc
+
 import numpy as np
-import pytest
 
 import audio as audio_mod
 
 
-def test_ring_buffer_basic_write_read():
-    rb = audio_mod.RingBuffer(channels=2, max_samples=10_000)
-    chunk = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float32)
-    rb.write(chunk)
-    assert rb.available == 4
-    out = rb.read(4)
-    assert out.shape == (2, 4)
-    np.testing.assert_array_equal(out, chunk)
-    assert rb.available == 0
+def test_loop_buffer_init_and_read_2d():
+    """init() with a 2D (channels, frames) array sets up the loop and
+    a subsequent read returns the same data starting at frame 0."""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    pcm = np.array([[1, 2, 3, 4, 5, 6, 7, 8],
+                    [9, 10, 11, 12, 13, 14, 15, 16]], dtype=np.float32)
+    lb.init(pcm)
+    assert lb.frames == 8
+    out = lb.read(4)
+    np.testing.assert_array_equal(out, pcm[:, :4])
+    assert lb.position == 4
 
 
-def test_ring_buffer_underrun_returns_silence():
-    rb = audio_mod.RingBuffer(channels=2, max_samples=10_000)
-    rb.write(np.array([[1, 2], [3, 4]], dtype=np.float32))
-    out = rb.read(5)
-    assert out.shape == (2, 5)
-    np.testing.assert_array_equal(out[:, :2], [[1, 2], [3, 4]])
-    np.testing.assert_array_equal(out[:, 2:], np.zeros((2, 3), dtype=np.float32))
+def test_loop_buffer_init_and_read_interleaved():
+    """init() with a 1D interleaved array de-interleaves to (channels,
+    frames) and a subsequent read returns the de-interleaved data."""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    interleaved = np.array([1, 9, 2, 10, 3, 11, 4, 12], dtype=np.float32)
+    lb.init(interleaved)
+    out = lb.read(4)
+    np.testing.assert_array_equal(out, [[1, 2, 3, 4], [9, 10, 11, 12]])
 
 
-def test_ring_buffer_multiple_chunks_partial_read():
-    rb = audio_mod.RingBuffer(channels=1, max_samples=10_000)
-    rb.write(np.array([[1, 2, 3]], dtype=np.float32))
-    rb.write(np.array([[4, 5]], dtype=np.float32))
-    rb.write(np.array([[6, 7, 8, 9]], dtype=np.float32))
-    assert rb.available == 9
-    np.testing.assert_array_equal(rb.read(4)[0], [1, 2, 3, 4])
-    np.testing.assert_array_equal(rb.read(4)[0], [5, 6, 7, 8])
-    np.testing.assert_array_equal(rb.read(1)[0], [9])
+def test_loop_buffer_read_advances_position():
+    """Sequential read calls advance the play head; data stitches
+    together without gaps."""
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000)
+    lb.init(np.arange(20, dtype=np.float32).reshape(1, 20))
+    np.testing.assert_array_equal(lb.read(5)[0], [0, 1, 2, 3, 4])
+    np.testing.assert_array_equal(lb.read(5)[0], [5, 6, 7, 8, 9])
+    assert lb.position == 10
 
 
-def test_ring_buffer_max_samples_trims_head():
-    rb = audio_mod.RingBuffer(channels=1, max_samples=10)
-    rb.write(np.array([list(range(8))], dtype=np.float32))
-    rb.write(np.array([list(range(8, 16))], dtype=np.float32))  # over cap of 10
-    assert rb.available <= 10
-    tail = rb.read(rb.available)[0]
-    # Tail is some contiguous suffix of the written sequence
-    assert tail[-1] == 15.0
+def test_loop_buffer_uninitialized_read_returns_silence():
+    """Read against a buffer that's been cleared (or never init'd) must
+    not raise — return a zero-filled (channels, num_frames) array."""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    out = lb.read(16)
+    assert out.shape == (2, 16)
+    np.testing.assert_array_equal(out, np.zeros((2, 16), dtype=np.float32))
 
 
-def test_ring_buffer_interleaved_write():
-    rb = audio_mod.RingBuffer(channels=2, max_samples=10_000)
-    interleaved = np.array([1, 5, 2, 6, 3, 7, 4, 8], dtype=np.float32)
-    rb.write(interleaved)
-    out = rb.read(4)
-    np.testing.assert_array_equal(out, [[1, 2, 3, 4], [5, 6, 7, 8]])
+def test_loop_buffer_patch_and_add_delta():
+    """patch() overwrites a region; add_delta() additively blends. Read
+    only the pre-seam region so we don't entangle the patch test with
+    the wrap/crossfade math."""
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000,
+                              seam_seconds=0.0)  # disable seam for this test
+    lb.init(np.zeros((1, 10), dtype=np.float32))
+    lb.patch(2, np.array([[1, 2, 3]], dtype=np.float32))
+    lb.add_delta(2, np.array([[10, 20, 30]], dtype=np.float32))
+    out = lb.read(10)[0]
+    # frames 2,3,4 = (1+10), (2+20), (3+30). Rest are zero.
+    np.testing.assert_array_equal(
+        out, [0, 0, 11, 22, 33, 0, 0, 0, 0, 0])
+
+
+def test_loop_buffer_wrap_with_seam_crossfade():
+    """The wrap path blends the last `seam_frames` of the loop with
+    the first `seam_frames` and jumps the playhead to `seam_frames`
+    (NOT 0) so the leading samples aren't replayed verbatim.
+
+    Verifies the crossfade math against the explicit reference formula:
+        t       = k / seam      for k in 0..seam-1
+        tail[k] = buf[:, frames - seam + k]
+        head[k] = buf[:, k]
+        out[k]  = tail[k]*(1-t) + head[k]*t
+    """
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000,
+                              seam_seconds=0.0)
+    # Manually install a small seam for the test.
+    lb._seam_frames = 100
+    lb._init_seam_scratch()
+    frames = 1000
+    pcm = np.stack([
+        np.arange(frames, dtype=np.float32),
+        np.arange(frames, dtype=np.float32) * -1.0,
+    ])
+    lb.init(pcm)
+
+    out = lb.read(1200)
+    # Frames 0..899 are pre-seam, identical to source.
+    np.testing.assert_array_equal(out[:, :900], pcm[:, :900])
+    # Frames 900..999 are the seam crossfade.
+    for k in range(100):
+        t = k / 100.0
+        expected = pcm[:, 900 + k] * (1.0 - t) + pcm[:, k] * t
+        np.testing.assert_allclose(
+            out[:, 900 + k], expected, rtol=1e-5, atol=1e-5)
+    # After the wrap, the head is at `seam` (=100), so the next 200
+    # frames are pcm[:, 100:300].
+    np.testing.assert_array_equal(out[:, 1000:1200], pcm[:, 100:300])
+
+
+def test_loop_buffer_read_into_writes_into_caller_buffer():
+    """read_into(out) must fill the caller's buffer in place; the data
+    must match what read() would have returned."""
+    lb_a = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    lb_b = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    pcm = np.random.randn(2, 4096).astype(np.float32)
+    lb_a.init(pcm)
+    lb_b.init(pcm)
+
+    via_read = lb_a.read(1024)
+    via_into = np.empty((2, 1024), dtype=np.float32)
+    lb_b.read_into(via_into)
+    np.testing.assert_array_equal(via_read, via_into)
+    assert lb_a.position == lb_b.position
+
+
+def test_loop_buffer_read_into_is_allocation_free():
+    """The whole point of read_into. Calling it in a tight loop must
+    not grow CPython's tracked heap by more than a noise threshold —
+    no per-call numpy temporaries, no per-call lists. (If a future
+    refactor sneaks in a `np.zeros(...)` inside the hot loop, this
+    test catches it.)"""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    pcm = np.tile(
+        np.linspace(-0.5, 0.5, 48000, dtype=np.float32), (2, 1))
+    lb.init(pcm)
+    out = np.zeros((2, 4096), dtype=np.float32)
+    # Warm up to settle any first-call lazy state.
+    for _ in range(10):
+        lb.read_into(out)
+
+    gc.collect()
+    tracemalloc.start()
+    snap0 = tracemalloc.take_snapshot()
+    for _ in range(500):
+        lb.read_into(out)
+    snap1 = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    # Only count allocations attributed to audio.py — tracemalloc
+    # itself + the lock context manager produce some noise that's
+    # unrelated to our hot path. Threshold tuned to "any single
+    # numpy allocation would blow this away" (~1 KB allocated per
+    # `np.zeros`/`np.ascontiguousarray` call) but accommodating a
+    # few bytes per call for incidental CPython bookkeeping.
+    diff = snap1.compare_to(snap0, 'filename')
+    audio_bytes = sum(
+        s.size_diff for s in diff
+        if s.size_diff > 0 and 'audio.py' in str(s.traceback))
+    assert audio_bytes < 2048, (
+        f"read_into allocated {audio_bytes} bytes over 500 calls — "
+        f"a numpy temp slipped back into the hot path"
+    )
+
+
+def test_loop_buffer_clear_resets_state():
+    """clear() drops the buffer + zeroes frame count + resets position.
+    Subsequent read returns silence."""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    lb.init(np.ones((2, 100), dtype=np.float32))
+    lb.read(10)  # advance the head
+    assert lb.position == 10
+    lb.clear()
+    assert lb.frames == 0
+    assert lb.position == 0
+    out = lb.read(8)
+    np.testing.assert_array_equal(out, np.zeros((2, 8), dtype=np.float32))
+
+
+def test_loop_buffer_swap_replaces_loop():
+    """swap() (used by the server's swap_ready path) replaces the loop
+    contents and resets the play head to 0."""
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000)
+    lb.init(np.arange(20, dtype=np.float32).reshape(1, 20))
+    lb.read(15)
+    assert lb.position == 15
+    lb.swap(np.arange(100, 110, dtype=np.float32).reshape(1, 10))
+    assert lb.frames == 10
+    assert lb.position == 0
+    np.testing.assert_array_equal(lb.read(5)[0], [100, 101, 102, 103, 104])
 
 
 def test_linear_resample_passthrough_when_equal_rate():
