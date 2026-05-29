@@ -22,8 +22,9 @@ the whole thing is scriptable from Python.
   Session page):
   - **Direct** — your own pod URL (local or Vast.ai).
   - **Hosted** — joins the Daydream queue at `music.daydream.live` and plays on
-    a managed pod. Paste your API key from app.daydream.live (or sign in via
-    browser), then hit Connect.
+    a managed pod. Paste your API key from
+    [app.daydream.live/dashboard/api-keys](https://app.daydream.live/dashboard/api-keys),
+    then hit Connect.
 - Exposes ~70 parameters across 7 pages — every DEMON public param, plus
   session and operational controls.
 - Plays generated audio out of your Mac's default audio device via Python +

@@ -108,13 +108,9 @@ SESSION_PARAMS: list[Param] = [
           help="Daydream account email/username, populated after sign-in."),
     Param("Pasteapikey", None, "Session", "Pulse", "session", order=68,
           label="Paste API Key",
-          help="Opens app.daydream.live in your browser and prompts for "
-               "your API key. Validates against /users/profile before saving."),
-    Param("Signinbrowser", None, "Session", "Pulse", "session", order=70,
-          label="Sign in via browser",
-          help="Open the Daydream sign-in flow in your browser. On success, "
-               "the browser tab redirects to a local listener and your "
-               "session is signed in automatically."),
+          help="Opens app.daydream.live/dashboard/api-keys in your browser "
+               "and prompts you to paste an API key into TD. Validates the "
+               "key against /users/profile before saving."),
     Param("Signout", None, "Session", "Pulse", "session", order=72,
           label="Sign out",
           help="Wipe the stored API key + profile. Device ID is preserved."),

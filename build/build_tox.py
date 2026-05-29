@@ -104,7 +104,6 @@ TOPOLOGY = [
     # (op_name, OPClass-string, init params dict, position tuple)
     ("extension1",     "textDAT",       {}, (-600, 400)),
     ("ws1",            "websocketDAT",  {}, (-600, 200)),
-    ("oauth_server",   "webserverDAT",  {}, (-600, 100)),
     ("param_exec1",    "parameterexecuteDAT", {}, (-600, 0)),
     ("frame_exec",     "executeDAT",    {}, (-600,-50)),
     ("tick8ms",        "timerCHOP",     {}, (-400, 0)),
@@ -173,7 +172,6 @@ def get_opclass_lookup():
         "textDAT":             textDAT,
         "tableDAT":            tableDAT,
         "websocketDAT":        websocketDAT,
-        "webserverDAT":        webserverDAT,
         "parameterexecuteDAT": parameterexecuteDAT,
         "executeDAT":          executeDAT,
         "timerCHOP":           timerCHOP,
@@ -630,14 +628,6 @@ def wire_callbacks(demon):
         except Exception:
             pass
 
-    ws_server = demon.op("oauth_server")
-    if ws_server is not None:
-        try:
-            ws_server.par.callbacks = "callbacks"
-            ws_server.par.active = False  # only on during Auth
-        except Exception:
-            pass
-
     # Script CHOP callbacks live in a sibling DAT (same as WS/Timer pattern).
     # The Script CHOP's `callbacks` par holds the reference; the DAT contains
     # onCook(scriptOp) which dispatches into ext.DemonExt by op name.
@@ -764,15 +754,6 @@ def onConnect(dat):
 
 def onDisconnect(dat):
     pass
-
-def onHTTPRequest(webServerDAT, request, response):
-    uri = request.get("uri", "")
-    status, ctype, body = _ext().OnHTTPRequest(uri)
-    response["statusCode"] = status
-    response["statusReason"] = "OK" if status == 200 else "Error"
-    response["data"] = body
-    response["content-type"] = ctype
-    return response
 
 # Script CHOP cook hook. TD calls onCook(scriptOp) on the configured DAT.
 # We dispatch by the calling op's name.

@@ -2,6 +2,37 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.5] — 2026-05-29
+
+Trim hosted-mode sign-in to paste-only. The browser-OAuth flow was
+fragile (Web Server DAT rebind quirks, port-binding races, hangs when
+the system browser launch failed silently) for a use case that's one
+extra click to do manually: open the dashboard, copy the key, paste it
+in.
+
+### Removed
+
+- `Sign in via browser` pulse on the Session page
+- `SignInBrowser` + `Authenticate` extension methods
+- `OnAuthCallback` + `OnHTTPRequest` extension methods
+- `_oauth_server`, `_oauth_state`, `_oauth_port` internal state
+- `oauth_server` WebServer DAT from the COMP topology (built-in TD op)
+- Everything in `src/oauth.py` except `fetch_profile` + `OAuthError`
+  (the paste-key validation path still uses these)
+- `onHTTPRequest` callback function in the COMP's callbacks DAT
+
+### Changed
+
+- `Paste API Key` pulse now deep-links to
+  https://app.daydream.live/dashboard/api-keys instead of the
+  dashboard root — one less click for the user.
+- `tests/test_oauth.py` rewritten around `fetch_profile`. 3 tests pass
+  (down from 6, all of which tested removed surface).
+
+BUILD_MARKER bumped to v0.2.5-paste-only. Note: rebuilding the .tox
+removes the `oauth_server` op from the COMP. Old .tox files keep the
+op but it's dormant and harmless.
+
 ## [0.2.1] — 2026-05-29
 
 Catch-up sync with `demon-public-demo` since the v0.1.5 protocol pass.

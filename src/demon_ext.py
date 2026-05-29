@@ -11,7 +11,6 @@ Internal operators expected inside the COMP
 - ws1            : WebSocket DAT (Receive Binary on)
 - http_queue     : Web Client DAT (queue API calls; we mostly use src/queue.py
                    for HTTP, so http_queue is optional/legacy)
-- oauth_server   : Web Server DAT (OAuth callback listener; started on demand)
 - param_exec1    : Parameter Execute DAT pointing at this COMP's custom pages
 - tick8ms        : Timer CHOP, segment 0.008s, cycles infinite
 - heartbeat      : Timer CHOP, segment 5s, cycles infinite
@@ -208,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.4-pa-fallback-ws-ping"
+BUILD_MARKER = "v0.2.5-paste-only"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -246,8 +245,6 @@ class DemonExt:
         # Auth
         self._api_key: str = ""
         self._device_id: str = ""        # populated by _load_auth (UUID4)
-        self._oauth_state: str | None = None
-        self._oauth_port: int | None = None
 
         # Param fanout
         self._dirty: dict[str, Any] = {}
@@ -654,175 +651,6 @@ class DemonExt:
         self._auth_file().write_text(
             json.dumps(blob, indent=2), encoding="utf-8")
 
-    def SignInBrowser(self) -> None:
-        """Launch the Daydream OAuth flow in the system browser.
-
-        Flow (mirrors demon-public-demo/lib/auth/daydream.ts):
-          1. Pick a free local port + a CSRF state nonce.
-          2. Configure the COMP's oauth_server WebServer DAT to listen on
-             that port.
-          3. Open app.daydream.live/sign-in/local?redirect_url=...&state=...
-             in the user's default browser.
-          4. The browser POSTs ?token=...&state=... to /cb on our listener,
-             which routes into OnHTTPRequest -> OnAuthCallback.
-
-        The browser side does all the actual work. This method is a
-        glorified launcher.
-
-        Robustness notes
-        ----------------
-        * We force `active=False` first, then set the port, then activate.
-          Just flipping `port` while `active=True` doesn't rebind in TD.
-        * `callbacks` is re-pinned in case the user is running with a stale
-          .tox where the wiring drifted.
-        * After activating we read `par.port` + `par.active` back and log
-          the resolved values — that's the only way to verify TD actually
-          bound to the port we asked for (vs silently falling back).
-        * A short sleep gives the listener thread time to start accepting
-          before the browser races to it; without this on cold-start the
-          first request can land before the socket is up.
-        """
-        try:
-            port = oauth.find_free_port()
-        except oauth.OAuthError as e:
-            self._set_status(f"OAuth port pick failed: {e}")
-            return
-
-        server = self._oauth_server()
-        if server is None:
-            self._set_status("oauth_server DAT missing — rebuild .tox")
-            self.log("SignInBrowser: oauth_server DAT not found in COMP")
-            return
-
-        state = oauth.generate_state()
-        self._oauth_port = port
-        self._oauth_state = state
-
-        # Restart the listener cleanly. Setting `active=True` while it's
-        # already True doesn't rebind to the new port — TD treats it as
-        # a no-op. Force False first.
-        try:
-            server.par.active = False
-        except Exception as e:
-            self.log(f"SignInBrowser: pre-deactivate failed (continuing): {e}")
-
-        # Re-pin the callbacks DAT defensively. build_tox.py sets this at
-        # build time but a stale .tox may have it missing or pointing
-        # somewhere broken.
-        try:
-            server.par.callbacks = "callbacks"
-        except Exception as e:
-            self.log(f"SignInBrowser: set callbacks failed (continuing): {e}")
-
-        try:
-            server.par.port = int(port)
-        except Exception as e:
-            self._set_status(f"Failed to set OAuth port: {e}")
-            self.log(f"SignInBrowser: WebServer DAT port set failed: {e}")
-            return
-
-        try:
-            server.par.active = True
-        except Exception as e:
-            self._set_status(f"Failed to start OAuth listener: {e}")
-            self.log(f"SignInBrowser: WebServer DAT activate failed: {e}")
-            return
-
-        # Verify the listener actually came up and let the bind complete
-        # before the browser races to it. Without a small sleep, the
-        # browser's first GET can land before the socket is accept()'ing.
-        try:
-            resolved_port = int(server.par.port.eval())
-            resolved_active = bool(server.par.active.eval())
-            self.log(
-                f"SignInBrowser: oauth_server port={resolved_port} "
-                f"active={resolved_active} (requested port={port})"
-            )
-            if resolved_port != port:
-                self._set_status(
-                    f"OAuth listener bound to {resolved_port}, not {port}"
-                )
-                return
-            if not resolved_active:
-                self._set_status("OAuth listener failed to activate")
-                return
-        except Exception as e:
-            self.log(f"SignInBrowser: state readback failed: {e}")
-
-        # Give the listener a moment to actually bind. 200 ms is plenty
-        # for TD to spin up the WebServer DAT's accept thread.
-        time.sleep(0.2)
-
-        url = oauth.build_signin_url(port, state)
-        self.log(f"SignInBrowser: opening {url}")
-        if not oauth.open_browser(url):
-            self._set_status(f"Open in browser: {url}")
-            self.log(f"SignInBrowser: no system browser; sign in via: {url}")
-            return
-        self._set_status(
-            f"Sign in via your browser (listener on :{port})..."
-        )
-
-    # Back-compat alias for any user scripts that still call Authenticate.
-    Authenticate = SignInBrowser
-
-    def OnAuthCallback(self, query_string: str) -> tuple[int, str, str]:
-        """Called by the Web Server DAT's onHTTPRequest handler with the
-        query portion of /cb?token=...&state=...
-
-        Returns (http_status, content_type, body) for the response page.
-        """
-        params = oauth.parse_callback_query(query_string)
-        token = params.get("token")
-        state = params.get("state")
-
-        if not token or not state:
-            return 400, "text/html", oauth.CALLBACK_ERR_HTML.format(
-                reason="Missing token or state"
-            )
-
-        if state != (self._oauth_state or ""):
-            return 400, "text/html", oauth.CALLBACK_ERR_HTML.format(
-                reason="CSRF state mismatch"
-            )
-
-        try:
-            profile = oauth.complete_auth(token)
-        except oauth.OAuthError as e:
-            return 500, "text/html", oauth.CALLBACK_ERR_HTML.format(
-                reason=str(e)
-            )
-
-        # Pull the raw profile so we can persist all the same fields the
-        # paste-key path persists. fetch_profile is idempotent and returns
-        # {} on failure — safe to call here.
-        raw_profile = oauth.fetch_profile(profile.api_key)
-        self._persist_auth(profile.api_key, raw_profile)
-
-        # In-memory + visible par updates.
-        self._api_key = profile.api_key
-        self._write_par("Apikey", profile.api_key)
-        self._write_par(
-            "Signedinas",
-            profile.display_name or profile.email or "",
-        )
-        self._set_status(
-            f"Signed in"
-            + (f" as {profile.display_name}" if profile.display_name else ""),
-        )
-
-        # Shut down the listener.
-        try:
-            server = self._oauth_server()
-            if server is not None:
-                server.par.active = False
-        except Exception:
-            pass
-
-        self._oauth_state = None
-        self._oauth_port = None
-        return 200, "text/html", oauth.CALLBACK_OK_HTML
-
     def SetApiKey(self, key: str) -> None:
         """Store a Daydream API key without validation. Used for the
         callback-from-OAuth path and the legacy Pasteapikey caller.
@@ -854,16 +682,18 @@ class DemonExt:
             self.log("PromptForApiKey: 'ui' unavailable; paste into the API Key par directly")
             return
 
-        # Nudge the user to the right page so they can copy a key.
+        # Nudge the user to the API-keys page so they can create / copy a
+        # key. This deep-links past the dashboard so it's one click less.
         try:
-            webbrowser.open("https://app.daydream.live")
+            webbrowser.open("https://app.daydream.live/dashboard/api-keys")
         except Exception:
             pass
 
         try:
             value = ui.messageBox(  # type: ignore[name-defined]
                 "Paste Daydream API key",
-                "Copy your key from app.daydream.live, then paste below:",
+                "Copy a key from app.daydream.live/dashboard/api-keys, "
+                "then paste it below:",
                 buttons=["OK", "Cancel"],
             )
         except Exception as e:
@@ -1252,17 +1082,6 @@ class DemonExt:
                 self._on_text(message)
         except Exception as e:
             self.log(f"OnReceive error: {type(e).__name__}: {e}")
-
-    def OnHTTPRequest(self, request_uri: str) -> tuple[int, str, str]:
-        """Called by oauth_server (Web Server DAT) onHTTPRequest hook.
-
-        Returns (status, content_type, body).
-        """
-        # request_uri looks like '/cb?token=...&state=...'
-        path, _, query = request_uri.partition("?")
-        if path.rstrip("/") == "/cb":
-            return self.OnAuthCallback(query)
-        return 404, "text/plain", "Not found"
 
     # -------- WS open + I/O --------------------------------------------------
 
@@ -2235,11 +2054,11 @@ class DemonExt:
         dispatch = {
             "Connect": lambda: self.Connect(),
             "Disconnect": lambda: self.Disconnect(),
-            # Hosted-mode auth pulses. `Authenticate` is kept as a back-compat
-            # alias for the old (stub) pulse name; the new pulses are
-            # Signinbrowser + Signout.
-            "Authenticate": lambda: self.SignInBrowser(),
-            "Signinbrowser": lambda: self.SignInBrowser(),
+            # Hosted-mode auth pulses. Sign-in is paste-only — we deep-link
+            # the user to app.daydream.live/dashboard/api-keys and prompt
+            # for the resulting key. The browser-OAuth flow was removed in
+            # v0.2.5 (fewer moving parts; the dashboard URL is a one-click
+            # copy anyway).
             "Pasteapikey": lambda: self.PromptForApiKey(),
             "Signout": lambda: self.SignOut(),
             "Stillplaying": lambda: self._extend_session(),
@@ -2404,18 +2223,12 @@ class DemonExt:
         except Exception:
             return None
 
-    def _oauth_server(self):
-        try:
-            return self.ownerComp.op("oauth_server")
-        except Exception:
-            return None
-
     # Pars that only make sense in one Mode. Used by _apply_mode_visibility
     # to grey out the unused set whenever the Mode menu changes.
     _DIRECT_ONLY_PARS = ("Serverurl",)
     _HOSTED_ONLY_PARS = (
         "Baseurl", "Apikey", "Signedinas",
-        "Pasteapikey", "Signinbrowser", "Signout",
+        "Pasteapikey", "Signout",
         "Queueposition", "Expiresin", "Denyreason",
         "Stillplaying",
     )
