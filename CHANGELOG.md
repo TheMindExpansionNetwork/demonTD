@@ -2,6 +2,52 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] — 2026-05-29
+
+Catch-up sync with `demon-public-demo` since the v0.1.5 protocol pass.
+The drift script (`scripts/check_protocol_drift.py`) flagged four new
+server message types, two new client encoders, and four new
+`SessionConfig` fields. v0.1.5's "log once per unknown kind"
+defense-in-depth meant the textport stayed quiet, but the actual
+handshakes are tightened up here.
+
+### Server messages now recognized
+
+- **`depth_applied`** — server ack of a runtime depth retune
+  (`set_depth`). Logged for visibility; no UI surface (depth is
+  Init-only in TD).
+- **`params_echo`** — MCP-driven param mirror. Logged under Debug only,
+  since TD has no MCP integration.
+- **`prompt_blend_echo`** — MCP-driven prompt-blend update. Now mirrors
+  the value back into the `Promptblend` continuous par so the TD UI
+  reflects external control bus changes.
+- **`stem_failed`** — surfaced as a visible log line (was hitting the
+  unknown-kind dedupe).
+
+### SessionConfig fields now sent
+
+- **`prompt_b`** — secondary prompt for A/B blending. Wired to a new
+  `Initpromptb` par on the Init page (default empty).
+- **`client_id`** — per-machine identifier. Reuses the queue
+  `deviceId` we already generate. Server stashes it into loguru
+  contextvars so pod logs can be filtered by demonTD instance.
+- **`use_server_fixture: false`** — sent explicitly. The JS client
+  capability-probes `/api/server-info` before flipping this to true;
+  TD sends false unconditionally to use the unchanged upload path.
+
+### Out of scope (intentional, not drift)
+
+- **`set_depth`** client encoder — runtime depth retune is a UX
+  feature, not a protocol gap. Depth stays Init-only.
+- **`loop_band`** client encoder — TD's LoopBuffer does its own seam
+  crossfade locally; the band isn't a TD parameter.
+- **`stem_source_mode`** — only sent when the user uploads a custom
+  track and selects a stem mode in the web client. TD has no stems UX
+  in v0.2.
+
+The drift script now knows about the intentionally-omitted client
+encoders + config field so future runs stay green.
+
 ## [0.2.0] — 2026-05-29
 
 **Hosted mode.** The operator can now connect to the Daydream queue at

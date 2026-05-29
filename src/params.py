@@ -175,6 +175,11 @@ INIT_PARAMS: list[Param] = [
           order=100, multiline=True, label="Initial Prompt",
           help="Text prompt at session start (changeable later via Send Prompt). "
                "Default matches demon-public-demo."),
+    Param("Initpromptb", "prompt_b", "Init", "Str", "init", default="",
+          order=105, multiline=True, label="Initial Prompt B",
+          help="Secondary prompt for A/B blending. The Prompt+LoRA page's "
+               "Prompt Blend slider interpolates between Initial Prompt (A) "
+               "and Initial Prompt B (B). Empty = no B, always A."),
     Param("Fixturename", "fixture_name", "Init", "Str", "init", default="",
           order=110, label="Fixture Name",
           help="Known fixture name for sidecar lookup (BPM/key/latents). Optional."),

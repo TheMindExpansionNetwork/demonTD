@@ -189,7 +189,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.0-hosted"
+BUILD_MARKER = "v0.2.1-drift-catchup"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1708,8 +1708,30 @@ class DemonExt:
             "enabled_loras": self._enabled_loras(),
             "prompt":       str(init_val("Initprompt",
                 "heavy dubstep, deathstep, afxdump, growl heavy bass distortion")),
+            # Secondary prompt for A/B blending. The current Promptblend
+            # continuous param interpolates between `prompt` (A) and
+            # `prompt_b` (B). Empty string = no B side, equivalent to
+            # always-A. Matches demon-public-demo's `prompt_b: perf.promptB`.
+            "prompt_b":     str(init_val("Initpromptb", "")),
             "lora_strengths": self._lora_strengths(),
             "fixture_name": str(init_val("Fixturename", "")),
+            # Capability gate — when True the server loads the fixture from
+            # its own /fixtures cache and the client skips the audio frame
+            # upload. The JS client capability-probes via /api/server-info
+            # before flipping this to True; we send False unconditionally
+            # so the unchanged upload path is used. Sending the field
+            # explicitly (vs omitting) makes our intent clear to log
+            # readers and keeps demon-public-demo + demonTD on the same
+            # SessionConfig surface.
+            "use_server_fixture": False,
+            # Per-machine identifier the server stashes into loguru contextvars
+            # so every pod-side log record on this WS carries it. Makes it
+            # possible to grep pod logs by demonTD instance when triaging.
+            # demon-public-demo uses PostHog's distinct_id; we reuse the
+            # deviceId we already generated for hosted-mode queue joins.
+            # `or None` makes encode_config drop the field on the wire when
+            # _load_auth somehow didn't populate it.
+            "client_id":    self._device_id or None,
         }
         # If we don't have a working zstd decompressor (TD's bundled Python
         # can't load our vendored zstandard binary, etc.), ask the server
@@ -1803,6 +1825,40 @@ class DemonExt:
             self._expecting_stem_blobs = int(data.get("count", 2) or 2)
             if self._debug_enabled:
                 self.log(f"stem_assets (skipping {self._expecting_stem_blobs} blobs)")
+        elif kind == "stem_failed":
+            # Server-side stem extraction failed for an uploaded track.
+            # Since we don't have a stems UI, this is informational only —
+            # log it visibly so it doesn't hide behind the unknown-kind
+            # dedupe.
+            err = data.get("error") or "(no reason)"
+            fixture = data.get("fixture_name") or "(unknown)"
+            self.log(f"server stem_failed: fixture={fixture} error={err}")
+        elif kind == "depth_applied":
+            # Server ack of a set_depth request, carrying the actually-
+            # applied (server-side-clamped) value. We don't send set_depth
+            # from TD yet — depth is Init-only — so we'd only see this
+            # echo if an MCP client tweaked depth on a shared session.
+            # Log for visibility; no par to update.
+            self.log(f"server depth_applied: value={data.get('value')}")
+        elif kind == "params_echo":
+            # MCP-driven param updates. The server emits these when a
+            # control bus (not the browser/TD) changes continuous params,
+            # so the UI can mirror them. TD has no MCP integration today,
+            # so this is decorative — log under Debug only.
+            if self._debug_enabled:
+                raw = data.get("raw") or {}
+                self.log(f"params_echo: {len(raw)} key(s) mirrored from MCP")
+        elif kind == "prompt_blend_echo":
+            # MCP-driven prompt_blend slider update. Mirror back into the
+            # `Promptblend` continuous par so the TD UI reflects whatever
+            # an external control bus set. Cheap and useful.
+            try:
+                value = float(data.get("value", 0.0))
+                self._write_par("Promptblend", max(0.0, min(1.0, value)))
+                if self._debug_enabled:
+                    self.log(f"prompt_blend_echo: mirrored value={value}")
+            except Exception as e:
+                self.log(f"prompt_blend_echo apply failed: {e}")
         else:
             # Other unrecognized message types — known-unknowns the server
             # may emit but we don't yet handle. Logged once per kind so

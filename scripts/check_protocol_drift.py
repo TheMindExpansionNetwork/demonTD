@@ -195,12 +195,38 @@ PY_CONST_RE = re.compile(
 PY_CFG_KEY_RE = re.compile(r'^\s*"([a-z_][a-z0-9_]*)"\s*:', re.MULTILINE)
 
 # SessionConfig fields that demon-public-demo's TS interface lists but
-# the JS client deliberately does NOT send (server resolves them from
-# fixture sidecar / detection; sending stale dropdown values would
-# regress server-side detection). We follow the same convention.
+# the JS client deliberately does NOT send unconditionally (server
+# resolves them from fixture sidecar / detection; sending stale dropdown
+# values would regress server-side detection), or that the demonTD
+# operator has no UX for and chooses to omit.
 # Source: demon-public-demo/vendor/demon-ui/hooks/useStartSession.ts
-# buildConfig() docstring.
-_TS_SESSION_FIELDS_INTENTIONALLY_OMITTED = {"key", "time_signature"}
+# buildConfig() — see its docstrings for the per-field rationale.
+_TS_SESSION_FIELDS_INTENTIONALLY_OMITTED = {
+    # Server fills these from sidecar / CNN detection. Sending the TD
+    # dropdown's stale value would override that — same regression the
+    # JS client documents.
+    "key", "time_signature",
+    # Conditional in the JS client too: only sent when the user uploads
+    # a custom track and selects a stem mode. demonTD has no stems UX
+    # in v0.2; omit unconditionally to match the JS default-fixture
+    # path.
+    "stem_source_mode",
+}
+
+# Client-side `type` literals demonTD knowingly doesn't encode. These are
+# UX features in the web client that demonTD has no equivalent for yet;
+# the drift script would otherwise flag them every run.
+# Source: demon-public-demo/vendor/demon-ui/engine/protocol.ts
+_TS_CLIENT_TYPES_INTENTIONALLY_OMITTED = {
+    # Runtime depth retune. Depth is Init-only in TD (immutable while
+    # connected); adding live retune is a UX feature, not a parity gap.
+    "set_depth",
+    # Mirrors a UI-controlled loop band to the server. demonTD's
+    # LoopBuffer does its own seam crossfade locally; the band isn't
+    # exposed as a TD parameter. Add an encoder + Loopbandstart/end
+    # pars to revisit.
+    "loop_band",
+}
 
 
 def _slice_function_body(src: str, func_name: str) -> str:
@@ -306,8 +332,11 @@ def compute_drift(ts: dict, py: dict) -> list[DriftItem]:
             new_server,
         ))
 
-    # Client messages: TS sends, we don't.
-    new_client = sorted(ts["client_types"] - py["client_types_we_send"])
+    # Client messages: TS sends, we don't. Filter out the deliberately
+    # not-implemented set (see _TS_CLIENT_TYPES_INTENTIONALLY_OMITTED).
+    new_client = sorted(ts["client_types"]
+                        - py["client_types_we_send"]
+                        - _TS_CLIENT_TYPES_INTENTIONALLY_OMITTED)
     if new_client:
         drift.append(DriftItem(
             "client_message_types",
