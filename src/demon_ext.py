@@ -189,7 +189,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.1-drift-catchup"
+BUILD_MARKER = "v0.2.2-oauth-rebind"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -649,6 +649,19 @@ class DemonExt:
 
         The browser side does all the actual work. This method is a
         glorified launcher.
+
+        Robustness notes
+        ----------------
+        * We force `active=False` first, then set the port, then activate.
+          Just flipping `port` while `active=True` doesn't rebind in TD.
+        * `callbacks` is re-pinned in case the user is running with a stale
+          .tox where the wiring drifted.
+        * After activating we read `par.port` + `par.active` back and log
+          the resolved values — that's the only way to verify TD actually
+          bound to the port we asked for (vs silently falling back).
+        * A short sleep gives the listener thread time to start accepting
+          before the browser races to it; without this on cold-start the
+          first request can land before the socket is up.
         """
         try:
             port = oauth.find_free_port()
@@ -665,20 +678,71 @@ class DemonExt:
         state = oauth.generate_state()
         self._oauth_port = port
         self._oauth_state = state
+
+        # Restart the listener cleanly. Setting `active=True` while it's
+        # already True doesn't rebind to the new port — TD treats it as
+        # a no-op. Force False first.
         try:
-            server.par.port = port
+            server.par.active = False
+        except Exception as e:
+            self.log(f"SignInBrowser: pre-deactivate failed (continuing): {e}")
+
+        # Re-pin the callbacks DAT defensively. build_tox.py sets this at
+        # build time but a stale .tox may have it missing or pointing
+        # somewhere broken.
+        try:
+            server.par.callbacks = "callbacks"
+        except Exception as e:
+            self.log(f"SignInBrowser: set callbacks failed (continuing): {e}")
+
+        try:
+            server.par.port = int(port)
+        except Exception as e:
+            self._set_status(f"Failed to set OAuth port: {e}")
+            self.log(f"SignInBrowser: WebServer DAT port set failed: {e}")
+            return
+
+        try:
             server.par.active = True
         except Exception as e:
             self._set_status(f"Failed to start OAuth listener: {e}")
-            self.log(f"SignInBrowser: WebServer DAT config failed: {e}")
+            self.log(f"SignInBrowser: WebServer DAT activate failed: {e}")
             return
 
+        # Verify the listener actually came up and let the bind complete
+        # before the browser races to it. Without a small sleep, the
+        # browser's first GET can land before the socket is accept()'ing.
+        try:
+            resolved_port = int(server.par.port.eval())
+            resolved_active = bool(server.par.active.eval())
+            self.log(
+                f"SignInBrowser: oauth_server port={resolved_port} "
+                f"active={resolved_active} (requested port={port})"
+            )
+            if resolved_port != port:
+                self._set_status(
+                    f"OAuth listener bound to {resolved_port}, not {port}"
+                )
+                return
+            if not resolved_active:
+                self._set_status("OAuth listener failed to activate")
+                return
+        except Exception as e:
+            self.log(f"SignInBrowser: state readback failed: {e}")
+
+        # Give the listener a moment to actually bind. 200 ms is plenty
+        # for TD to spin up the WebServer DAT's accept thread.
+        time.sleep(0.2)
+
         url = oauth.build_signin_url(port, state)
+        self.log(f"SignInBrowser: opening {url}")
         if not oauth.open_browser(url):
             self._set_status(f"Open in browser: {url}")
             self.log(f"SignInBrowser: no system browser; sign in via: {url}")
             return
-        self._set_status("Sign in via your browser, then return here")
+        self._set_status(
+            f"Sign in via your browser (listener on :{port})..."
+        )
 
     # Back-compat alias for any user scripts that still call Authenticate.
     Authenticate = SignInBrowser
