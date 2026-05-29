@@ -141,6 +141,25 @@ def _prepend_vendor_paths() -> None:
                             capture_output=True, check=False)
             except Exception:
                 pass
+        # certifi CA bundle: TD's bundled Python has no system trust store,
+        # so every urllib HTTPS call raises SSL: CERTIFICATE_VERIFY_FAILED
+        # by default. Pointing SSL_CERT_FILE (and SSL_CERT_DIR for OpenSSL
+        # compatibility) at our vendored Mozilla bundle gets stdlib urllib
+        # — and websocket-client over wss:// — to trust commercial CAs.
+        # Read by ssl.create_default_context() at first HTTPS use.
+        cacert = os.path.join(vendor_root, "certifi", "cacert.pem")
+        if os.path.isfile(cacert):
+            os.environ["SSL_CERT_FILE"] = cacert
+            os.environ["SSL_CERT_DIR"]  = os.path.dirname(cacert)
+            # `requests` honors REQUESTS_CA_BUNDLE if anything in the
+            # vendor tree ever switches to it; harmless to set even when
+            # only stdlib is in use.
+            os.environ["REQUESTS_CA_BUNDLE"] = cacert
+            print(f"[demon_ext]   + SSL_CERT_FILE={cacert}")
+        else:
+            print(f"[demon_ext] WARNING: certifi bundle not at {cacert} "
+                  f"-- HTTPS to music.daydream.live will fail with "
+                  f"CERTIFICATE_VERIFY_FAILED")
     except Exception as e:
         print(f"[demon_ext] _prepend_vendor_paths failed: {e}")
 
@@ -189,7 +208,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.2-oauth-rebind"
+BUILD_MARKER = "v0.2.3-certifi"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
