@@ -108,9 +108,6 @@ SESSION_PARAMS: list[Param] = [
           help="Opens app.daydream.live/dashboard/api-keys in your browser "
                "and prompts you to paste an API key into TD. Validates the "
                "key against /users/profile before saving."),
-    Param("Signout", None, "Session", "Pulse", "session", order=72,
-          label="Sign out",
-          help="Wipe the stored API key + profile. Device ID is preserved."),
     Param("Queueposition", None, "Session", "Int", "session", default=0,
           order=74, label="Queue Position", readonly=True,
           help="1-based queue position while waiting. 0 once active."),

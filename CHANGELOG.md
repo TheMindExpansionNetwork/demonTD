@@ -2,6 +2,17 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.11] — 2026-05-29
+
+* Removed the **Sign out** pulse from the Session page. The paste-key
+  flow + on-disk persistence cover the relevant lifecycle without it.
+* README now has a dedicated **Quick start — Hosted mode** section with
+  step-by-step API-key + paste-key + Connect instructions, plus a
+  one-time setup note in the regular Quick Start about setting TD's
+  Audio Device preference to None.
+* The Session-page parameter-table entry in the README now reflects
+  the v0.2 layout (Mode menu, hosted controls, queue readouts).
+
 ## [0.2.10] — 2026-05-29
 
 **Real root cause of the v0.2.x audio failure**, after `scripts/probe_portaudio.py`

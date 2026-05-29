@@ -41,24 +41,72 @@ the whole thing is scriptable from Python.
 
 1. Download `demonTD.tox` from the latest [GitHub release](https://github.com/daydreamlive/demonTD/releases).
 2. Drag it into any TouchDesigner project. A Base COMP named `demon` appears.
-3. On the **Session** page:
-   - Set **Server URL** to your DEMON pod (e.g. `ws://81.183.231.113:44105/`
-     for a Vast.ai pod, or `ws://127.0.0.1:8765/` for a local pod).
-   - Set **Source Audio File** to any audio file (WAV, MP3, M4A — the operator
-     auto-converts via `afconvert` on Mac).
-4. Pulse **Connect**.
-5. Within ~3 seconds of `initial buffer: 1152000 frames` in the textport, you'll
-   hear your source audio looping. After another few seconds, DEMON's generated
-   audio begins patching the loop progressively.
-6. Change **Prompt** on the Prompt+LoRA page and pulse **Send Prompt**. Move
-   **Denoise**, channel gains, etc. — they stream to the server at the 8 ms tick.
+3. **One-time TD setup:** Edit → Preferences → Audio → Audio Device → **None**.
+   This stops TouchDesigner from holding your Mac's audio device, which would
+   otherwise prevent our Python audio thread from opening it. (Details in the
+   [Audio output troubleshooting](#audio-output-troubleshooting) section.)
+4. On the **Session** page, pick a mode:
+   - **Hosted** (Daydream queue, no pod to manage — see
+     [Quick start — Hosted mode](#quick-start--hosted-mode) below), OR
+   - **Direct** (your own pod). Set **Server URL** to your DEMON pod
+     (e.g. `ws://81.183.231.113:44105/` for a Vast.ai pod, or
+     `ws://127.0.0.1:8765/` for a local pod).
+5. Set **Source Audio File** to any audio file (WAV, MP3, M4A — the operator
+   auto-converts via `afconvert` on Mac).
+6. Pulse **Connect**.
+7. Within ~3 seconds of `initial buffer: 1152000 frames` in the textport,
+   you'll hear your source audio looping. After another few seconds, DEMON's
+   generated audio begins patching the loop progressively.
+8. Change **Prompt** on the Prompt+LoRA page and pulse **Send Prompt**. Move
+   **Denoise**, channel gains, etc. — they stream to the server at the 8 ms
+   tick.
+
+## Quick start — Hosted mode
+
+Hosted mode joins the Daydream queue at `music.daydream.live` and plays on a
+managed pod. You don't need to spin up your own DEMON instance.
+
+### 1. Get an API key
+
+1. Open [app.daydream.live/dashboard/api-keys](https://app.daydream.live/dashboard/api-keys)
+   in your browser.
+2. Sign in (Google, GitHub, or email).
+3. Create an API key on that page, give it a name like `demonTD`, and copy
+   the key. It looks something like `dd_...` and is shown to you once — keep
+   it somewhere safe.
+
+### 2. Sign in from TouchDesigner
+
+1. On the **Session** page, set **Mode** → **Hosted (Daydream queue)**.
+2. Pulse **Paste API Key**. TD opens `app.daydream.live/dashboard/api-keys`
+   in your browser (in case you don't have a key yet) and shows a paste
+   dialog.
+3. Paste your key, click OK.
+4. The Status par should read `Signed in as <your email>`. The key is
+   persisted to `~/Library/Application Support/derivative/daydream_auth.json`
+   (not into the .toe), so you only do this once per machine.
+
+### 3. Play
+
+1. Pick a **Source Audio File** (any WAV / MP3 / M4A).
+2. Pulse **Connect**. Status walks you through:
+   - `Joining queue...`
+   - `Queued (position N)` if there's a wait (rare during off-peak)
+   - `Connecting to hosted pod...`
+   - `server ready: ch=2 sr=48000`
+   - audio plays.
+3. After your session expires (`Expires in (s)` counts down), hit
+   **Still playing?** to extend.
+
+If `Connect` fails with `Paywall: …`, your Daydream account is out of trial
+credits — check the API-keys dashboard for billing info.
 
 ## Parameter pages
 
 | Page | What's there |
 |---|---|
-| **Session** | Connect / Disconnect, Server URL, Source Audio File, Status, **Python Audio Out** toggle, **Debug Logging** toggle |
-| **Init** | Session-start params (`sde`, `lora`, `depth`, `vae_window`, `crop`, `steps`, `fast_vae`, `walk_window`, `walk_window_s`, Initial Prompt, Fixture Name). Editing while connected reverts + prompts you to Reconnect. |
+| **Session** | Connect / Disconnect, **Mode** (Direct / Hosted), Server URL (direct), Hosted Base URL + API Key + Paste API Key (hosted), Queue Position / Expires in / Deny reason (hosted readouts), Still playing? pulse (hosted), Source Audio File, Status, **Python Audio Out** toggle, **Debug Logging** toggle. |
+| **Init** | Session-start params (`sde`, `lora`, `depth`, `vae_window`, `crop`, `steps`, `fast_vae`, `walk_window`, `walk_window_s`, Initial Prompt, Initial Prompt B, Fixture Name). Editing while connected reverts + prompts you to Reconnect. |
 | **Prompt+LoRA** | Send Prompt pulse, Prompt (multiline), Key (70-keyscale menu), Time Signature, Prompt Blend, LoRA Blend, dynamic per-LoRA enable + strength rows populated from the server's `lora_catalog`. |
 | **Synthesis** | Denoise, Seed, Feedback, Shift, Hint Strength, Timbre Strength, Guidance Scale, CFG Rescale, ODE Noise, Periodicity, 8× channel groups (`ch_g0..ch_g7`), 6× keystone channels (`ch13, ch14, ch19, ch23, ch29, ch56`). |
 | **RCFG+DCW** | RCFG Mode menu, DCW block (`enabled`, `mode`, `scaler`, `high_scaler`, `wavelet`, `mult_blend`, `mag_phase`, `soft_thresh`). |

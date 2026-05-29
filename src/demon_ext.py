@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.10-td-holds-device-msg"
+BUILD_MARKER = "v0.2.11-drop-signout"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -735,19 +735,6 @@ class DemonExt:
         display = (profile.get("email") or profile.get("name")
                    or profile.get("username") or "")
         self._set_status(f"Signed in as {display or '(unknown)'}")
-
-    def SignOut(self) -> None:
-        """Wipe the stored API key + profile. Preserves deviceId."""
-        with self._lock:
-            self._api_key = ""
-        self._write_par("Apikey", "")
-        # Re-persist with empty key so the file still carries deviceId
-        # for the next sign-in.
-        try:
-            self._persist_auth("", {})
-        except Exception as e:
-            self.log(f"SignOut: persist failed: {e}")
-        self._set_status("Signed out")
 
     # -------- continuous param push ------------------------------------------
 
@@ -2099,7 +2086,6 @@ class DemonExt:
             # v0.2.5 (fewer moving parts; the dashboard URL is a one-click
             # copy anyway).
             "Pasteapikey": lambda: self.PromptForApiKey(),
-            "Signout": lambda: self.SignOut(),
             "Stillplaying": lambda: self._extend_session(),
             "Sendprompt": lambda: self.SendPrompt(),
             "Setpromptblend": lambda: self.SetPromptBlend(),
@@ -2267,7 +2253,7 @@ class DemonExt:
     _DIRECT_ONLY_PARS = ("Serverurl",)
     _HOSTED_ONLY_PARS = (
         "Baseurl", "Apikey",
-        "Pasteapikey", "Signout",
+        "Pasteapikey",
         "Queueposition", "Expiresin", "Denyreason",
         "Stillplaying",
     )
