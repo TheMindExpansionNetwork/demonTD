@@ -2,6 +2,37 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.9] — 2026-05-29
+
+**Regression fix.** v0.2.4 added an eager `Pa_GetDefaultOutputDevice` +
+`Pa_GetDeviceInfo` probe right before `Pa_OpenDefaultStream` so we
+could log device info and feed the sample-rate fallback. PortAudio's
+API documents `Pa_GetDeviceInfo` as a getter, but on macOS Sequoia it
+triggers a Core Audio device-list refresh that touches the default-
+output AudioUnit's stream-format property. After that touch, the
+subsequent `AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)` is
+rejected with `kAudioUnitErr_InvalidPropertyValue` (-10851) — even
+though it's the same call that succeeded in v0.1.5.
+
+The fix is one move, no API changes: the device-info probe is now
+**lazy**. `start()` calls `Pa_OpenDefaultStream` immediately (the
+v0.1.5 known-good code path); only on failure does it probe device
+info and run the v0.2.4–v0.2.8 fallback matrix (alternate rates,
+buffer sizes, `Pa_OpenStream`+`PaStreamParameters`, `paInt16`).
+
+For users where v0.1.5 worked: audio comes right back. For users on
+genuinely-incompatible devices: same fallback coverage as v0.2.8, just
+deferred until needed.
+
+If you saw `[speaker_out] no usable rate / buffer / format / open-mode
+combination` in v0.2.6–v0.2.8 logs on a device that previously worked,
+v0.2.9 should restore it. If it doesn't, please file an issue with the
+new `[speaker_out] direct Pa_OpenDefaultStream ... failed` line —
+that's the v0.1.5-equivalent attempt failing for a genuinely different
+reason, and we'll need a vendored libportaudio.dylib bump to fix it.
+
+BUILD_MARKER bumped to v0.2.9-no-eager-probe.
+
 ## [0.2.8] — 2026-05-29
 
 PortAudio compatibility expansion. User report: on macOS Sequoia with

@@ -617,7 +617,29 @@ class SpeakerOut:
 
     def start(self) -> bool:
         """Open the default output stream and start playback. Returns True
-        on success, False on any error (already logged)."""
+        on success, False on any error (already logged).
+
+        Order of operations
+        -------------------
+        1. **Direct open** — Pa_OpenDefaultStream at the requested
+           (sample_rate, frames_per_buffer, paFloat32). This is the
+           v0.1.5 known-good code path; for most users it succeeds and
+           we return immediately.
+        2. **Only on failure**: probe the default device's metadata
+           (sample rate, defaultHighOutputLatency), then run the
+           v0.2.4 - v0.2.8 fallback matrix (alternate rates / buffer
+           sizes, Pa_OpenStream with explicit PaStreamParameters,
+           paInt16 sample format).
+
+        The eager probe used to run BEFORE step 1; that introduced a
+        regression on macOS Sequoia where Pa_GetDeviceInfo touches the
+        default-output AudioUnit's stream-format property and the
+        subsequent AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)
+        is rejected with kAudioUnitErr_InvalidPropertyValue (-10851).
+        Deferring the probe to the failure branch restores the v0.1.5
+        path while keeping the fallbacks available for devices that
+        actually need them.
+        """
         if self._stream is not None:
             return True
         lib = self._load_lib(self._dylib_path, log=self._log)
@@ -632,42 +654,6 @@ class SpeakerOut:
                           f"{msg.decode(errors='replace')}")
                 return False
             SpeakerOut._lib_initialized = True
-        # Build the (rate, framesPerBuffer) retry matrix. We try the
-        # requested rate first, then fall back to the device's native
-        # rate. For each rate we try our preferred big block (less GIL
-        # pressure) first, then paFramesPerBufferUnspecified (=0), which
-        # lets PortAudio pick. The unspecified path is the magic that
-        # gets some Core Audio devices to open at all — they reject
-        # 4096-frame requests with paInternalError but accept whatever
-        # natural block PortAudio negotiates.
-        device_rate: float | None = None
-        device_index: int = -1
-        device_high_latency: float = 0.020   # 20 ms — safe default
-        device_max_out: int = self._channels
-        try:
-            dev = int(lib.Pa_GetDefaultOutputDevice())
-            if dev >= 0:
-                device_index = dev
-                info_ptr = lib.Pa_GetDeviceInfo(dev)
-                if info_ptr:
-                    info = info_ptr.contents
-                    device_rate = float(info.defaultSampleRate)
-                    device_high_latency = float(info.defaultHighOutputLatency)
-                    device_max_out = int(info.maxOutputChannels)
-                    self._log(
-                        f"[speaker_out] default output: "
-                        f"dev={dev} name={(info.name or b'?').decode(errors='replace')} "
-                        f"maxOut={device_max_out} "
-                        f"defaultSampleRate={device_rate} "
-                        f"defaultHighOutputLatency={device_high_latency:.4f}s"
-                    )
-        except Exception as e:
-            self._log(f"[speaker_out] device-info probe failed: {e}")
-
-        rates = [self._sample_rate]
-        if device_rate and abs(device_rate - self._sample_rate) > 1.0:
-            rates.append(device_rate)
-        bufsizes = [self._frames_per_buffer, _paFramesPerBufferUnspecified]
 
         def _host_error_detail() -> str:
             """Read Pa_GetLastHostErrorInfo for the OS-level reason."""
@@ -683,6 +669,65 @@ class SpeakerOut:
                 )
             except Exception:
                 return ""
+
+        # --- Step 1: direct v0.1.5-style open ---------------------------------
+        # Do this BEFORE any device probe so Pa_GetDeviceInfo doesn't
+        # poison the AudioUnit state on Sequoia. On success we short-
+        # circuit out and never run the fallback matrix.
+        stream_ptr = _ctypes.c_void_p()
+        chosen_rate = self._sample_rate
+        chosen_buf = self._frames_per_buffer
+        chosen_format = _paFloat32
+        err = lib.Pa_OpenDefaultStream(
+            _ctypes.byref(stream_ptr),
+            0,                              # no input
+            self._channels,
+            _paFloat32,
+            self._sample_rate,
+            self._frames_per_buffer,
+            _ctypes.cast(self._c_callback, _ctypes.c_void_p),
+            None,
+        )
+        if err != 0:
+            msg = (lib.Pa_GetErrorText(err) or b"unknown").decode(
+                errors="replace")
+            self._log(
+                f"[speaker_out] direct Pa_OpenDefaultStream@"
+                f"{self._sample_rate}Hz buf={self._frames_per_buffer} "
+                f"failed: {msg} (err={err}){_host_error_detail()} "
+                f"— running fallback matrix"
+            )
+
+        # --- Step 2: only on failure, probe + run fallback matrix --------------
+        device_rate: float | None = None
+        device_index: int = -1
+        device_high_latency: float = 0.020   # 20 ms — safe default
+        device_max_out: int = self._channels
+        if err != 0:
+            try:
+                dev = int(lib.Pa_GetDefaultOutputDevice())
+                if dev >= 0:
+                    device_index = dev
+                    info_ptr = lib.Pa_GetDeviceInfo(dev)
+                    if info_ptr:
+                        info = info_ptr.contents
+                        device_rate = float(info.defaultSampleRate)
+                        device_high_latency = float(info.defaultHighOutputLatency)
+                        device_max_out = int(info.maxOutputChannels)
+                        self._log(
+                            f"[speaker_out] default output: "
+                            f"dev={dev} name={(info.name or b'?').decode(errors='replace')} "
+                            f"maxOut={device_max_out} "
+                            f"defaultSampleRate={device_rate} "
+                            f"defaultHighOutputLatency={device_high_latency:.4f}s"
+                        )
+            except Exception as e:
+                self._log(f"[speaker_out] device-info probe failed: {e}")
+
+        rates = [self._sample_rate]
+        if device_rate and abs(device_rate - self._sample_rate) > 1.0:
+            rates.append(device_rate)
+        bufsizes = [self._frames_per_buffer, _paFramesPerBufferUnspecified]
 
         def _try_open(sample_format: int, fmt_label: str
                       ) -> tuple[int, _ctypes.c_void_p, float, int]:
@@ -794,42 +839,41 @@ class SpeakerOut:
         # every float32 attempt fails. Some Core Audio devices reject
         # float32 even though PortAudio's docs say it should auto-convert.
         # int16 is the workaround; we convert in the pa_callback.
-        formats = [
-            (_paFloat32, "float32"),
-            (_paInt16,   "int16"),
-        ]
-        err = -1
-        stream_ptr = _ctypes.c_void_p()
-        chosen_rate = self._sample_rate
-        chosen_buf = self._frames_per_buffer
-        chosen_format = _paFloat32
-        for sample_format, fmt_label in formats:
-            err, stream_ptr, chosen_rate, chosen_buf = _try_open(
-                sample_format, fmt_label)
-            if err == 0:
-                chosen_format = sample_format
-                if sample_format == _paInt16:
-                    self._log(
-                        "[speaker_out] WARNING: opened with paInt16 "
-                        "(float32 rejected by Core Audio). Headroom "
-                        "drops ~3 dB; clipping is now hard at \xb11.0."
-                    )
-                if chosen_rate != self._sample_rate:
-                    self._log(
-                        f"[speaker_out] WARNING: opened at {chosen_rate} Hz "
-                        f"instead of {self._sample_rate} Hz. Audio will "
-                        f"pitch by "
-                        f"~{(chosen_rate / self._sample_rate - 1.0) * 100:+.2f}%. "
-                        f"Set your default output to "
-                        f"{int(self._sample_rate)} Hz in Audio MIDI "
-                        f"Setup to fix."
-                    )
-                if chosen_buf == _paFramesPerBufferUnspecified:
-                    self._log(
-                        "[speaker_out] using paFramesPerBufferUnspecified "
-                        "(device negotiated its own block size)"
-                    )
-                break
+        # Gated on `err != 0` from step 1 — if the direct open already
+        # succeeded, stream_ptr / chosen_* are already correctly set and
+        # we skip the matrix entirely.
+        if err != 0:
+            formats = [
+                (_paFloat32, "float32"),
+                (_paInt16,   "int16"),
+            ]
+            for sample_format, fmt_label in formats:
+                err, stream_ptr, chosen_rate, chosen_buf = _try_open(
+                    sample_format, fmt_label)
+                if err == 0:
+                    chosen_format = sample_format
+                    if sample_format == _paInt16:
+                        self._log(
+                            "[speaker_out] WARNING: opened with paInt16 "
+                            "(float32 rejected by Core Audio). Headroom "
+                            "drops ~3 dB; clipping is now hard at \xb11.0."
+                        )
+                    if chosen_rate != self._sample_rate:
+                        self._log(
+                            f"[speaker_out] WARNING: opened at {chosen_rate} Hz "
+                            f"instead of {self._sample_rate} Hz. Audio will "
+                            f"pitch by "
+                            f"~{(chosen_rate / self._sample_rate - 1.0) * 100:+.2f}%. "
+                            f"Set your default output to "
+                            f"{int(self._sample_rate)} Hz in Audio MIDI "
+                            f"Setup to fix."
+                        )
+                    if chosen_buf == _paFramesPerBufferUnspecified:
+                        self._log(
+                            "[speaker_out] using paFramesPerBufferUnspecified "
+                            "(device negotiated its own block size)"
+                        )
+                    break
 
         if err != 0:
             self._log(
