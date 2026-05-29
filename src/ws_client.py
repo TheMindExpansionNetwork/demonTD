@@ -53,6 +53,7 @@ class WSClient:
         on_close: Callable[[int | None, str | None], None] | None = None,
         log: Callable[[str], None] = print,
         timeout: float = 30.0,
+        ping_interval: float = 25.0,
     ):
         self.url = url
         self._on_open = on_open
@@ -61,6 +62,13 @@ class WSClient:
         self._on_close = on_close
         self._log = log
         self._timeout = timeout
+        # Periodic client-side ping. Defaults to 25 s because cloud
+        # WS termination points (Cloudflare in particular, which fronts
+        # `music.daydream.live`) drop idle connections at ~100 s with no
+        # client-initiated keepalive. 25 s is the same cadence the web
+        # client uses. Set to 0 to disable.
+        self._ping_interval = float(ping_interval)
+        self._last_ping = 0.0
 
         self._ws: websocket.WebSocket | None = None
         self._thread: threading.Thread | None = None
@@ -107,11 +115,40 @@ class WSClient:
             except Exception as e:
                 self._log(f"[ws_client] on_open raised: {e}")
 
+        # Use a shortish socket timeout so the recv loop wakes regularly
+        # and can run the periodic ping side-task without a separate
+        # timer thread. 5 s gives us four ping windows per ping_interval
+        # to detect close vs. send-keepalive.
+        try:
+            self._ws.settimeout(5.0)
+        except Exception:
+            pass
+        self._last_ping = time.monotonic()
+
         # Recv loop
         close_code: int | None = None
         close_reason: str | None = None
         try:
             while not self._closing:
+                # Client-initiated keepalive. Cloudflare et al. close idle
+                # TCP connections at ~100 s; the server may not ping us
+                # spontaneously, so we ping out periodically. `ws.ping()`
+                # writes a control frame; the server's pong is consumed
+                # silently by recv_data(control_frame=False) and never
+                # reaches our handler.
+                if self._ping_interval > 0:
+                    now = time.monotonic()
+                    if now - self._last_ping >= self._ping_interval:
+                        try:
+                            with self._send_lock:
+                                self._ws.ping(b"td")
+                            self._last_ping = now
+                        except Exception as e:
+                            close_reason = (
+                                f"ping failed: {type(e).__name__}: {e}"
+                            )
+                            break
+
                 try:
                     opcode, data = self._ws.recv_data(control_frame=False)
                 except websocket.WebSocketConnectionClosedException as e:
@@ -119,6 +156,7 @@ class WSClient:
                     break
                 except websocket.WebSocketTimeoutException:
                     # Timeout on recv is normal during quiet periods; loop
+                    # back to the top so we can run the ping check.
                     continue
                 except Exception as e:
                     close_reason = f"recv error: {type(e).__name__}: {e}"

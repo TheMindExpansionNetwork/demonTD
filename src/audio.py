@@ -381,6 +381,28 @@ _paFloat32 = 0x00000001
 _paNoFlag = 0
 _paContinue = 0
 _paOutputUnderflow = 4
+_paNoDevice = -1
+_paFormatIsSupported = 0
+_paInvalidSampleRate = -9997   # PaError code from Pa_OpenDefaultStream
+_paUnanticipatedHostError = -9999
+
+# Mirror of PortAudio's PaDeviceInfo struct so we can read device-config
+# metadata for diagnostic logging when Pa_OpenDefaultStream fails.
+# Field order per portaudio.h (struct version 2). Field types match the
+# ABI — sizeof(PaTime)==8 (double), int==4, char*==8 on 64-bit.
+class _PaDeviceInfo(_ctypes.Structure):
+    _fields_ = [
+        ("structVersion",            _ctypes.c_int),
+        ("name",                     _ctypes.c_char_p),
+        ("hostApi",                  _ctypes.c_int),
+        ("maxInputChannels",         _ctypes.c_int),
+        ("maxOutputChannels",        _ctypes.c_int),
+        ("defaultLowInputLatency",   _ctypes.c_double),
+        ("defaultLowOutputLatency",  _ctypes.c_double),
+        ("defaultHighInputLatency",  _ctypes.c_double),
+        ("defaultHighOutputLatency", _ctypes.c_double),
+        ("defaultSampleRate",        _ctypes.c_double),
+    ]
 
 
 class SpeakerOut:
@@ -474,6 +496,16 @@ class SpeakerOut:
         lib.Pa_StopStream.restype = _ctypes.c_int
         lib.Pa_CloseStream.argtypes = [_ctypes.c_void_p]
         lib.Pa_CloseStream.restype = _ctypes.c_int
+        # Device-inspection APIs — used for diagnostic dumps when
+        # Pa_OpenDefaultStream fails. Pa_GetDeviceInfo returns a pointer
+        # into Pa's internal table; we read it as a struct (declared
+        # below as PaDeviceInfo).
+        lib.Pa_GetDefaultOutputDevice.restype = _ctypes.c_int
+        lib.Pa_GetDeviceCount.restype = _ctypes.c_int
+        lib.Pa_GetDeviceInfo.argtypes = [_ctypes.c_int]
+        lib.Pa_GetDeviceInfo.restype = _ctypes.POINTER(_PaDeviceInfo)
+        lib.Pa_GetHostApiInfo.argtypes = [_ctypes.c_int]
+        lib.Pa_GetHostApiInfo.restype = _ctypes.c_void_p
 
     # ctypes callback type. Kept as class-level to avoid recreating the
     # CFUNCTYPE on every instance (which would trigger libffi closure
@@ -540,22 +572,74 @@ class SpeakerOut:
                           f"{msg.decode(errors='replace')}")
                 return False
             SpeakerOut._lib_initialized = True
+        # Try the requested sample rate first; if PortAudio bounces us
+        # (usually because the user's macOS default output device is set
+        # to e.g. 44100 in Audio MIDI Setup and isn't aggregable for
+        # 48000), retry once at the device's defaultSampleRate so the
+        # user at least gets audio out. We log the fallback loudly so
+        # the user knows their playback rate doesn't match the wire
+        # 48000 — audio will pitch up/down ~8.8% on a 44.1k device.
+        # The proper fix is to either resample in software or have the
+        # user set their device to 48 kHz in Audio MIDI Setup.
+        candidates = [self._sample_rate]
+        try:
+            dev = int(lib.Pa_GetDefaultOutputDevice())
+            if dev >= 0:
+                info_ptr = lib.Pa_GetDeviceInfo(dev)
+                if info_ptr:
+                    info = info_ptr.contents
+                    device_rate = float(info.defaultSampleRate)
+                    if abs(device_rate - self._sample_rate) > 1.0:
+                        candidates.append(device_rate)
+                    self._log(
+                        f"[speaker_out] default output: "
+                        f"dev={dev} name={(info.name or b'?').decode(errors='replace')} "
+                        f"maxOut={info.maxOutputChannels} "
+                        f"defaultSampleRate={device_rate}"
+                    )
+        except Exception as e:
+            self._log(f"[speaker_out] device-info probe failed: {e}")
+
         stream_ptr = _ctypes.c_void_p()
-        err = lib.Pa_OpenDefaultStream(
-            _ctypes.byref(stream_ptr),
-            0,                              # no input
-            self._channels,
-            _paFloat32,
-            self._sample_rate,
-            self._frames_per_buffer,        # bigger block = less GIL pressure
-            _ctypes.cast(self._c_callback, _ctypes.c_void_p),
-            None,
-        )
+        err = -1
+        chosen_rate = self._sample_rate
+        for rate in candidates:
+            stream_ptr = _ctypes.c_void_p()
+            err = lib.Pa_OpenDefaultStream(
+                _ctypes.byref(stream_ptr),
+                0,                              # no input
+                self._channels,
+                _paFloat32,
+                float(rate),
+                self._frames_per_buffer,        # bigger block = less GIL pressure
+                _ctypes.cast(self._c_callback, _ctypes.c_void_p),
+                None,
+            )
+            if err == 0:
+                chosen_rate = float(rate)
+                if rate != self._sample_rate:
+                    self._log(
+                        f"[speaker_out] WARNING: opened at {rate} Hz instead "
+                        f"of {self._sample_rate} Hz. Audio will pitch by "
+                        f"~{(rate / self._sample_rate - 1.0) * 100:+.2f}%. "
+                        f"Set your default output to {int(self._sample_rate)} Hz "
+                        f"in Audio MIDI Setup to fix."
+                    )
+                break
+            msg = (lib.Pa_GetErrorText(err) or b"unknown").decode(errors="replace")
+            self._log(
+                f"[speaker_out] Pa_OpenDefaultStream@{rate}Hz failed: {msg} "
+                f"(err={err})"
+            )
         if err != 0:
-            msg = lib.Pa_GetErrorText(err) or b"unknown"
-            self._log(f"[speaker_out] Pa_OpenDefaultStream failed: "
-                      f"{msg.decode(errors='replace')}")
+            self._log(
+                "[speaker_out] no usable sample rate. Try: "
+                "open Audio MIDI Setup, select your default output, "
+                "set Format to 'Stereo 48000 Hz, 32-bit Float', then "
+                "pulse Connect again."
+            )
             return False
+
         err = lib.Pa_StartStream(stream_ptr)
         if err != 0:
             msg = lib.Pa_GetErrorText(err) or b"unknown"
@@ -565,6 +649,7 @@ class SpeakerOut:
             return False
         self._stream = stream_ptr.value
         self._stream_ptr = stream_ptr
+        self._sample_rate = chosen_rate
         self._log(f"[speaker_out] started PortAudio default stream "
                   f"sr={self._sample_rate} ch={self._channels} "
                   f"frames_per_buffer={self._frames_per_buffer} "
