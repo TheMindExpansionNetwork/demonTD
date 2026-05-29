@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.6-pa-bufsize-fallback"
+BUILD_MARKER = "v0.2.7-friendly-close"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1210,7 +1210,29 @@ class DemonExt:
                     code, reason = payload
                     self.log(f"[ws_client] closed code={code} reason={reason!r}")
                     self._connected = False
-                    self._set_status(f"Disconnected ({reason or 'closed'})")
+                    friendly = self._friendly_close_reason(reason)
+                    self._set_status(f"Disconnected ({friendly})")
+                    # In hosted mode a handshake failure (502/503/504 from
+                    # the LB in front of the pod) means the session the
+                    # queue handed us is dead. Release it server-side so
+                    # the next Connect doesn't trip over a stale row.
+                    # Done inline rather than via Disconnect() because we
+                    # don't want to fire the WS-close path again or yank
+                    # speaker_out.
+                    sid = self._session_id
+                    mode = (self._read_par("Mode", "direct") or "direct").lower()
+                    if mode == "hosted" and sid:
+                        base = self._read_par(
+                            "Baseurl", "https://music.daydream.live")
+                        try:
+                            queue_mod.QueueClient(
+                                base, api_key=self._api_key or None,
+                            ).leave(sid)
+                        except queue_mod.QueueError:
+                            pass
+                        self._session_id = None
+                        self._write_par("Queueposition", 0)
+                        self._write_par("Expiresin", 0.0)
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
@@ -2288,6 +2310,44 @@ class DemonExt:
     def _set_status(self, msg: str) -> None:
         self._write_par("Status", msg)
         self.log(f"status: {msg}")
+
+    @staticmethod
+    def _friendly_close_reason(reason: Any) -> str:
+        """Boil a websocket-client close-reason down to one line of UI.
+
+        websocket-client's handshake failures stringify the entire HTTP
+        response including headers + body, so a Cloudflare 502 turns
+        into ~30 lines of JSON-y goo in the Status par. Pattern-match
+        the common gateway failures into human text; fall through to a
+        truncated raw for anything we don't recognize.
+        """
+        s = str(reason or "closed")
+        low = s.lower()
+        if "502 bad gateway" in low or "error code: 502" in low:
+            return ("502 from hosted edge — the pod isn't responding. "
+                    "Try Connect again in a few seconds.")
+        if "503 service unavailable" in low or "error code: 503" in low:
+            return "503 from hosted edge — service unavailable. Try again."
+        if "504 gateway timeout" in low or "error code: 504" in low:
+            return "504 from hosted edge — gateway timeout. Try again."
+        if "handshake status 401" in low or "handshake status 403" in low:
+            return "Authentication rejected — re-paste your API key."
+        if "handshake status 429" in low:
+            return "Rate-limited by the queue. Wait a moment and retry."
+        if "name or service not known" in low or "nodename nor servname" in low:
+            return "DNS lookup failed — check your Base URL."
+        if "connection refused" in low:
+            return "Connection refused — check Server URL is reachable."
+        if "timed out" in low or "timeout" in low:
+            return "Connection timed out."
+        if "connection to remote host was lost" in low:
+            return "Connection lost — re-try Connect."
+        # Fall through. Trim aggressively so the Status par doesn't go
+        # multi-line; the full reason is still in textport via the
+        # [ws_client] closed line that fires before this.
+        if len(s) > 120:
+            s = s[:117] + "..."
+        return s
 
     # -------- logging --------------------------------------------------------
 
