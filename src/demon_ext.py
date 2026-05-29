@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.5-paste-only"
+BUILD_MARKER = "v0.2.6-pa-bufsize-fallback"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -320,8 +320,7 @@ class DemonExt:
         # Auth state: load persisted apiKey + deviceId from
         # <prefs>/daydream_auth.json (created lazily on first persist). This
         # populates self._device_id (UUID4) and may pre-fill self._api_key
-        # + Signedinas par when the user already signed in on a previous
-        # TD launch.
+        # when the user already signed in on a previous TD launch.
         try:
             self._load_auth()
         except Exception as e:
@@ -612,10 +611,6 @@ class DemonExt:
         if api_key:
             self._api_key = api_key
             self._write_par("Apikey", api_key)
-            self._write_par(
-                "Signedinas",
-                data.get("displayName") or data.get("email") or "",
-            )
 
         # First-boot: persist the freshly-minted deviceId so the next run
         # sees it. Wrapping in try keeps boot resilient if the fs is
@@ -729,14 +724,16 @@ class DemonExt:
                 pass
             return
 
-        # Accepted — persist + reflect into the UI.
+        # Accepted — persist + reflect into the UI. The Status par echoes
+        # whose key we just accepted; the API Key par itself stays the
+        # source of truth (and is secret=True in params.py so it's not
+        # printed in plaintext on the Session page).
         with self._lock:
             self._api_key = key
         self._persist_auth(key, profile)
         self._write_par("Apikey", key)
         display = (profile.get("email") or profile.get("name")
                    or profile.get("username") or "")
-        self._write_par("Signedinas", display)
         self._set_status(f"Signed in as {display or '(unknown)'}")
 
     def SignOut(self) -> None:
@@ -744,7 +741,6 @@ class DemonExt:
         with self._lock:
             self._api_key = ""
         self._write_par("Apikey", "")
-        self._write_par("Signedinas", "")
         # Re-persist with empty key so the file still carries deviceId
         # for the next sign-in.
         try:
@@ -2227,7 +2223,7 @@ class DemonExt:
     # to grey out the unused set whenever the Mode menu changes.
     _DIRECT_ONLY_PARS = ("Serverurl",)
     _HOSTED_ONLY_PARS = (
-        "Baseurl", "Apikey", "Signedinas",
+        "Baseurl", "Apikey",
         "Pasteapikey", "Signout",
         "Queueposition", "Expiresin", "Denyreason",
         "Stillplaying",

@@ -383,8 +383,10 @@ _paContinue = 0
 _paOutputUnderflow = 4
 _paNoDevice = -1
 _paFormatIsSupported = 0
-_paInvalidSampleRate = -9997   # PaError code from Pa_OpenDefaultStream
-_paUnanticipatedHostError = -9999
+_paFramesPerBufferUnspecified = 0
+_paInternalError = -9986       # PaError: generic Pa internal failure
+_paInvalidSampleRate = -9997   # PaError: rate the device can't deliver
+_paUnanticipatedHostError = -9999  # PaError: host (CoreAudio) bubbled an err
 
 # Mirror of PortAudio's PaDeviceInfo struct so we can read device-config
 # metadata for diagnostic logging when Pa_OpenDefaultStream fails.
@@ -402,6 +404,19 @@ class _PaDeviceInfo(_ctypes.Structure):
         ("defaultHighInputLatency",  _ctypes.c_double),
         ("defaultHighOutputLatency", _ctypes.c_double),
         ("defaultSampleRate",        _ctypes.c_double),
+    ]
+
+
+# Mirror of PortAudio's PaHostErrorInfo. Pa_GetLastHostErrorInfo()
+# returns this with the OS-level error code that wrapped into a generic
+# paUnanticipatedHostError / paInternalError. On macOS that's a
+# CoreAudio OSStatus (a four-char code) — much more diagnosable than
+# the Pa-level "Internal PortAudio error".
+class _PaHostErrorInfo(_ctypes.Structure):
+    _fields_ = [
+        ("hostApiType",  _ctypes.c_int),
+        ("errorCode",    _ctypes.c_long),
+        ("errorText",    _ctypes.c_char_p),
     ]
 
 
@@ -506,6 +521,10 @@ class SpeakerOut:
         lib.Pa_GetDeviceInfo.restype = _ctypes.POINTER(_PaDeviceInfo)
         lib.Pa_GetHostApiInfo.argtypes = [_ctypes.c_int]
         lib.Pa_GetHostApiInfo.restype = _ctypes.c_void_p
+        # Surfaces the OS-level error wrapped inside paUnanticipated /
+        # paInternalError. Read after a failed Pa_OpenDefaultStream to
+        # see the actual CoreAudio OSStatus.
+        lib.Pa_GetLastHostErrorInfo.restype = _ctypes.POINTER(_PaHostErrorInfo)
 
     # ctypes callback type. Kept as class-level to avoid recreating the
     # CFUNCTYPE on every instance (which would trigger libffi closure
@@ -572,16 +591,15 @@ class SpeakerOut:
                           f"{msg.decode(errors='replace')}")
                 return False
             SpeakerOut._lib_initialized = True
-        # Try the requested sample rate first; if PortAudio bounces us
-        # (usually because the user's macOS default output device is set
-        # to e.g. 44100 in Audio MIDI Setup and isn't aggregable for
-        # 48000), retry once at the device's defaultSampleRate so the
-        # user at least gets audio out. We log the fallback loudly so
-        # the user knows their playback rate doesn't match the wire
-        # 48000 — audio will pitch up/down ~8.8% on a 44.1k device.
-        # The proper fix is to either resample in software or have the
-        # user set their device to 48 kHz in Audio MIDI Setup.
-        candidates = [self._sample_rate]
+        # Build the (rate, framesPerBuffer) retry matrix. We try the
+        # requested rate first, then fall back to the device's native
+        # rate. For each rate we try our preferred big block (less GIL
+        # pressure) first, then paFramesPerBufferUnspecified (=0), which
+        # lets PortAudio pick. The unspecified path is the magic that
+        # gets some Core Audio devices to open at all — they reject
+        # 4096-frame requests with paInternalError but accept whatever
+        # natural block PortAudio negotiates.
+        device_rate: float | None = None
         try:
             dev = int(lib.Pa_GetDefaultOutputDevice())
             if dev >= 0:
@@ -589,8 +607,6 @@ class SpeakerOut:
                 if info_ptr:
                     info = info_ptr.contents
                     device_rate = float(info.defaultSampleRate)
-                    if abs(device_rate - self._sample_rate) > 1.0:
-                        candidates.append(device_rate)
                     self._log(
                         f"[speaker_out] default output: "
                         f"dev={dev} name={(info.name or b'?').decode(errors='replace')} "
@@ -600,43 +616,80 @@ class SpeakerOut:
         except Exception as e:
             self._log(f"[speaker_out] device-info probe failed: {e}")
 
+        rates = [self._sample_rate]
+        if device_rate and abs(device_rate - self._sample_rate) > 1.0:
+            rates.append(device_rate)
+        bufsizes = [self._frames_per_buffer, _paFramesPerBufferUnspecified]
+
+        def _host_error_detail() -> str:
+            """Read Pa_GetLastHostErrorInfo for the OS-level reason."""
+            try:
+                hei_ptr = lib.Pa_GetLastHostErrorInfo()
+                if not hei_ptr:
+                    return ""
+                hei = hei_ptr.contents
+                txt = (hei.errorText or b"").decode(errors="replace")
+                return (
+                    f" hostErr code={hei.errorCode} "
+                    f"text={txt!r}"
+                )
+            except Exception:
+                return ""
+
         stream_ptr = _ctypes.c_void_p()
         err = -1
         chosen_rate = self._sample_rate
-        for rate in candidates:
-            stream_ptr = _ctypes.c_void_p()
-            err = lib.Pa_OpenDefaultStream(
-                _ctypes.byref(stream_ptr),
-                0,                              # no input
-                self._channels,
-                _paFloat32,
-                float(rate),
-                self._frames_per_buffer,        # bigger block = less GIL pressure
-                _ctypes.cast(self._c_callback, _ctypes.c_void_p),
-                None,
-            )
+        chosen_buf = self._frames_per_buffer
+        for rate in rates:
+            for bufsz in bufsizes:
+                stream_ptr = _ctypes.c_void_p()
+                err = lib.Pa_OpenDefaultStream(
+                    _ctypes.byref(stream_ptr),
+                    0,                              # no input
+                    self._channels,
+                    _paFloat32,
+                    float(rate),
+                    int(bufsz),
+                    _ctypes.cast(self._c_callback, _ctypes.c_void_p),
+                    None,
+                )
+                if err == 0:
+                    chosen_rate = float(rate)
+                    chosen_buf = int(bufsz)
+                    if rate != self._sample_rate:
+                        self._log(
+                            f"[speaker_out] WARNING: opened at {rate} Hz "
+                            f"instead of {self._sample_rate} Hz. Audio "
+                            f"will pitch by "
+                            f"~{(rate / self._sample_rate - 1.0) * 100:+.2f}%. "
+                            f"Set your default output to "
+                            f"{int(self._sample_rate)} Hz in Audio MIDI "
+                            f"Setup to fix."
+                        )
+                    if bufsz == _paFramesPerBufferUnspecified:
+                        self._log(
+                            f"[speaker_out] using paFramesPerBufferUnspecified "
+                            f"(device negotiated its own block size)"
+                        )
+                    break
+                msg = (lib.Pa_GetErrorText(err) or b"unknown").decode(
+                    errors="replace")
+                bufsz_label = "auto" if bufsz == 0 else str(bufsz)
+                self._log(
+                    f"[speaker_out] Pa_OpenDefaultStream@{rate}Hz "
+                    f"buf={bufsz_label} failed: {msg} (err={err})"
+                    f"{_host_error_detail()}"
+                )
             if err == 0:
-                chosen_rate = float(rate)
-                if rate != self._sample_rate:
-                    self._log(
-                        f"[speaker_out] WARNING: opened at {rate} Hz instead "
-                        f"of {self._sample_rate} Hz. Audio will pitch by "
-                        f"~{(rate / self._sample_rate - 1.0) * 100:+.2f}%. "
-                        f"Set your default output to {int(self._sample_rate)} Hz "
-                        f"in Audio MIDI Setup to fix."
-                    )
                 break
-            msg = (lib.Pa_GetErrorText(err) or b"unknown").decode(errors="replace")
-            self._log(
-                f"[speaker_out] Pa_OpenDefaultStream@{rate}Hz failed: {msg} "
-                f"(err={err})"
-            )
         if err != 0:
             self._log(
-                "[speaker_out] no usable sample rate. Try: "
+                "[speaker_out] no usable sample rate / buffer size. Try: "
                 "open Audio MIDI Setup, select your default output, "
                 "set Format to 'Stereo 48000 Hz, 32-bit Float', then "
-                "pulse Connect again."
+                "pulse Connect again. If that's already set, the bundled "
+                "PortAudio may not be compatible with your macOS — file "
+                "a bug with the [speaker_out] lines above."
             )
             return False
 
@@ -650,10 +703,20 @@ class SpeakerOut:
         self._stream = stream_ptr.value
         self._stream_ptr = stream_ptr
         self._sample_rate = chosen_rate
-        self._log(f"[speaker_out] started PortAudio default stream "
-                  f"sr={self._sample_rate} ch={self._channels} "
-                  f"frames_per_buffer={self._frames_per_buffer} "
-                  f"(latency~{self._frames_per_buffer / self._sample_rate * 1000:.1f}ms)")
+        self._frames_per_buffer = chosen_buf
+        # When we opened with paFramesPerBufferUnspecified, PortAudio
+        # decides per-callback what block size to deliver. Logging "auto"
+        # is more honest than printing 0 as a frames-per-buffer count.
+        buf_label = "auto" if chosen_buf == 0 else str(chosen_buf)
+        latency_label = (
+            "device-negotiated" if chosen_buf == 0
+            else f"~{chosen_buf / self._sample_rate * 1000:.1f}ms"
+        )
+        self._log(
+            f"[speaker_out] started PortAudio default stream "
+            f"sr={self._sample_rate} ch={self._channels} "
+            f"frames_per_buffer={buf_label} (latency {latency_label})"
+        )
         return True
 
     def stop(self) -> None:

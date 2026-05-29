@@ -101,11 +101,8 @@ SESSION_PARAMS: list[Param] = [
     Param("Apikey", None, "Session", "Str", "session", default="",
           order=64, label="API Key", secret=True,
           help="Daydream API key. Sent as Authorization: Bearer <key>. "
-               "Set via the Paste API Key or Sign in via browser pulses; "
-               "stored in <prefs>/daydream_auth.json, not in the .toe."),
-    Param("Signedinas", None, "Session", "Str", "session", default="",
-          order=66, label="Signed in as", readonly=True,
-          help="Daydream account email/username, populated after sign-in."),
+               "Set via the Paste API Key pulse; stored in "
+               "<prefs>/daydream_auth.json, not in the .toe."),
     Param("Pasteapikey", None, "Session", "Pulse", "session", order=68,
           label="Paste API Key",
           help="Opens app.daydream.live/dashboard/api-keys in your browser "
