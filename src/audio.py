@@ -378,6 +378,7 @@ import os as _os
 
 # PortAudio C constants we need
 _paFloat32 = 0x00000001
+_paInt16   = 0x00000008
 _paNoFlag = 0
 _paContinue = 0
 _paOutputUnderflow = 4
@@ -417,6 +418,21 @@ class _PaHostErrorInfo(_ctypes.Structure):
         ("hostApiType",  _ctypes.c_int),
         ("errorCode",    _ctypes.c_long),
         ("errorText",    _ctypes.c_char_p),
+    ]
+
+
+# Mirror of PortAudio's PaStreamParameters. The "right" way to open a
+# stream — Pa_OpenDefaultStream is a wrapper around this that picks
+# a tight default latency. Some macOS devices reject the tight default
+# with kAudioUnitErr_InvalidPropertyValue; passing the device's
+# defaultHighOutputLatency here gives PortAudio room to negotiate.
+class _PaStreamParameters(_ctypes.Structure):
+    _fields_ = [
+        ("device",                    _ctypes.c_int),
+        ("channelCount",              _ctypes.c_int),
+        ("sampleFormat",              _ctypes.c_ulong),
+        ("suggestedLatency",          _ctypes.c_double),
+        ("hostApiSpecificStreamInfo", _ctypes.c_void_p),
     ]
 
 
@@ -525,6 +541,26 @@ class SpeakerOut:
         # paInternalError. Read after a failed Pa_OpenDefaultStream to
         # see the actual CoreAudio OSStatus.
         lib.Pa_GetLastHostErrorInfo.restype = _ctypes.POINTER(_PaHostErrorInfo)
+        # Full Pa_OpenStream — used as the fallback when
+        # Pa_OpenDefaultStream's tight built-in latency is rejected
+        # by Core Audio (kAudioUnitErr_InvalidPropertyValue / -10851).
+        lib.Pa_OpenStream.argtypes = [
+            _ctypes.POINTER(_ctypes.c_void_p),       # PaStream**
+            _ctypes.POINTER(_PaStreamParameters),    # input params (or NULL)
+            _ctypes.POINTER(_PaStreamParameters),    # output params
+            _ctypes.c_double,                        # sampleRate
+            _ctypes.c_ulong,                         # framesPerBuffer
+            _ctypes.c_ulong,                         # streamFlags (paNoFlag)
+            _ctypes.c_void_p,                        # PaStreamCallback*
+            _ctypes.c_void_p,                        # userData
+        ]
+        lib.Pa_OpenStream.restype = _ctypes.c_int
+        lib.Pa_IsFormatSupported.argtypes = [
+            _ctypes.POINTER(_PaStreamParameters),
+            _ctypes.POINTER(_PaStreamParameters),
+            _ctypes.c_double,
+        ]
+        lib.Pa_IsFormatSupported.restype = _ctypes.c_int
 
     # ctypes callback type. Kept as class-level to avoid recreating the
     # CFUNCTYPE on every instance (which would trigger libffi closure
@@ -562,6 +598,11 @@ class SpeakerOut:
         self._stream_ptr = None  # holds the C pointer alive
         self._underrun_count = 0
         self._callback_count = 0
+        # Negotiated by start(). Defaults to paFloat32 (preferred); falls
+        # back to paInt16 when Core Audio refuses float32 on the user's
+        # device. The pa_callback reads this to decide which dtype to
+        # write into PortAudio's output buffer.
+        self._sample_format_pa: int = _paFloat32
         # Keep a strong reference to the bound CFUNCTYPE so it doesn't get
         # garbage-collected while the audio thread is calling into it.
         self._c_callback = self._CB_TYPE(self._pa_callback)
@@ -600,18 +641,25 @@ class SpeakerOut:
         # 4096-frame requests with paInternalError but accept whatever
         # natural block PortAudio negotiates.
         device_rate: float | None = None
+        device_index: int = -1
+        device_high_latency: float = 0.020   # 20 ms — safe default
+        device_max_out: int = self._channels
         try:
             dev = int(lib.Pa_GetDefaultOutputDevice())
             if dev >= 0:
+                device_index = dev
                 info_ptr = lib.Pa_GetDeviceInfo(dev)
                 if info_ptr:
                     info = info_ptr.contents
                     device_rate = float(info.defaultSampleRate)
+                    device_high_latency = float(info.defaultHighOutputLatency)
+                    device_max_out = int(info.maxOutputChannels)
                     self._log(
                         f"[speaker_out] default output: "
                         f"dev={dev} name={(info.name or b'?').decode(errors='replace')} "
-                        f"maxOut={info.maxOutputChannels} "
-                        f"defaultSampleRate={device_rate}"
+                        f"maxOut={device_max_out} "
+                        f"defaultSampleRate={device_rate} "
+                        f"defaultHighOutputLatency={device_high_latency:.4f}s"
                     )
         except Exception as e:
             self._log(f"[speaker_out] device-info probe failed: {e}")
@@ -636,63 +684,168 @@ class SpeakerOut:
             except Exception:
                 return ""
 
-        stream_ptr = _ctypes.c_void_p()
+        def _try_open(sample_format: int, fmt_label: str
+                      ) -> tuple[int, _ctypes.c_void_p, float, int]:
+            """Try every (rate, bufsize, open-API) combination at one
+            sample format. Returns (err, stream_ptr, chosen_rate,
+            chosen_buf). err==0 on success.
+
+            Three open layers:
+              1. Pa_OpenDefaultStream (simple API, tight default latency)
+              2. Pa_OpenStream + PaStreamParameters at the device's
+                 defaultHighOutputLatency (more room for Core Audio to
+                 renegotiate). Skipped if device probe failed.
+
+            Before each Pa_OpenStream attempt, IsFormatSupported probes
+            the format — both as a cleaner failure mode and because some
+            macOS users on the PortAudio mailing list report that calling
+            IsFormatSupported first "primes" the AudioUnit and resolves
+            -10851 (kAudioUnitErr_InvalidPropertyValue) on subsequent
+            opens.
+            """
+            local_stream = _ctypes.c_void_p()
+            local_err = -1
+            local_rate = self._sample_rate
+            local_buf = self._frames_per_buffer
+
+            # Layer 1: Pa_OpenDefaultStream matrix.
+            for rate in rates:
+                for bufsz in bufsizes:
+                    local_stream = _ctypes.c_void_p()
+                    local_err = lib.Pa_OpenDefaultStream(
+                        _ctypes.byref(local_stream),
+                        0,                              # no input
+                        self._channels,
+                        sample_format,
+                        float(rate),
+                        int(bufsz),
+                        _ctypes.cast(self._c_callback, _ctypes.c_void_p),
+                        None,
+                    )
+                    if local_err == 0:
+                        return (local_err, local_stream,
+                                float(rate), int(bufsz))
+                    msg = (lib.Pa_GetErrorText(local_err) or b"unknown"
+                           ).decode(errors="replace")
+                    bufsz_label = "auto" if bufsz == 0 else str(bufsz)
+                    self._log(
+                        f"[speaker_out] {fmt_label} "
+                        f"Pa_OpenDefaultStream@{rate}Hz buf={bufsz_label} "
+                        f"failed: {msg} (err={local_err})"
+                        f"{_host_error_detail()}"
+                    )
+
+            # Layer 2: Pa_OpenStream with explicit PaStreamParameters at
+            # defaultHighOutputLatency. Needs a working device probe.
+            if device_index < 0:
+                return local_err, local_stream, local_rate, local_buf
+            self._log(
+                f"[speaker_out] {fmt_label} falling back to Pa_OpenStream "
+                f"+ defaultHighOutputLatency={device_high_latency:.4f}s"
+            )
+            for rate in rates:
+                out_params = _PaStreamParameters(
+                    device=device_index,
+                    channelCount=self._channels,
+                    sampleFormat=sample_format,
+                    suggestedLatency=device_high_latency,
+                    hostApiSpecificStreamInfo=None,
+                )
+                # IsFormatSupported probe. If it says no, log and skip
+                # the Pa_OpenStream call entirely.
+                supported = lib.Pa_IsFormatSupported(
+                    None, _ctypes.byref(out_params), float(rate))
+                if supported != _paFormatIsSupported:
+                    smsg = (lib.Pa_GetErrorText(supported) or b"unknown"
+                            ).decode(errors="replace")
+                    self._log(
+                        f"[speaker_out] {fmt_label} "
+                        f"Pa_IsFormatSupported@{rate}Hz: {smsg} "
+                        f"(err={supported}) — skipping"
+                    )
+                    continue
+                for bufsz in bufsizes:
+                    local_stream = _ctypes.c_void_p()
+                    local_err = lib.Pa_OpenStream(
+                        _ctypes.byref(local_stream),
+                        None,                       # no input
+                        _ctypes.byref(out_params),
+                        float(rate),
+                        int(bufsz),
+                        _paNoFlag,
+                        _ctypes.cast(self._c_callback, _ctypes.c_void_p),
+                        None,
+                    )
+                    if local_err == 0:
+                        return (local_err, local_stream,
+                                float(rate), int(bufsz))
+                    msg = (lib.Pa_GetErrorText(local_err) or b"unknown"
+                           ).decode(errors="replace")
+                    bufsz_label = "auto" if bufsz == 0 else str(bufsz)
+                    self._log(
+                        f"[speaker_out] {fmt_label} "
+                        f"Pa_OpenStream@{rate}Hz buf={bufsz_label} "
+                        f"failed: {msg} (err={local_err})"
+                        f"{_host_error_detail()}"
+                    )
+            return local_err, local_stream, local_rate, local_buf
+
+        # Outer loop: prefer float32 (lossless), fall back to int16 if
+        # every float32 attempt fails. Some Core Audio devices reject
+        # float32 even though PortAudio's docs say it should auto-convert.
+        # int16 is the workaround; we convert in the pa_callback.
+        formats = [
+            (_paFloat32, "float32"),
+            (_paInt16,   "int16"),
+        ]
         err = -1
+        stream_ptr = _ctypes.c_void_p()
         chosen_rate = self._sample_rate
         chosen_buf = self._frames_per_buffer
-        for rate in rates:
-            for bufsz in bufsizes:
-                stream_ptr = _ctypes.c_void_p()
-                err = lib.Pa_OpenDefaultStream(
-                    _ctypes.byref(stream_ptr),
-                    0,                              # no input
-                    self._channels,
-                    _paFloat32,
-                    float(rate),
-                    int(bufsz),
-                    _ctypes.cast(self._c_callback, _ctypes.c_void_p),
-                    None,
-                )
-                if err == 0:
-                    chosen_rate = float(rate)
-                    chosen_buf = int(bufsz)
-                    if rate != self._sample_rate:
-                        self._log(
-                            f"[speaker_out] WARNING: opened at {rate} Hz "
-                            f"instead of {self._sample_rate} Hz. Audio "
-                            f"will pitch by "
-                            f"~{(rate / self._sample_rate - 1.0) * 100:+.2f}%. "
-                            f"Set your default output to "
-                            f"{int(self._sample_rate)} Hz in Audio MIDI "
-                            f"Setup to fix."
-                        )
-                    if bufsz == _paFramesPerBufferUnspecified:
-                        self._log(
-                            f"[speaker_out] using paFramesPerBufferUnspecified "
-                            f"(device negotiated its own block size)"
-                        )
-                    break
-                msg = (lib.Pa_GetErrorText(err) or b"unknown").decode(
-                    errors="replace")
-                bufsz_label = "auto" if bufsz == 0 else str(bufsz)
-                self._log(
-                    f"[speaker_out] Pa_OpenDefaultStream@{rate}Hz "
-                    f"buf={bufsz_label} failed: {msg} (err={err})"
-                    f"{_host_error_detail()}"
-                )
+        chosen_format = _paFloat32
+        for sample_format, fmt_label in formats:
+            err, stream_ptr, chosen_rate, chosen_buf = _try_open(
+                sample_format, fmt_label)
             if err == 0:
+                chosen_format = sample_format
+                if sample_format == _paInt16:
+                    self._log(
+                        "[speaker_out] WARNING: opened with paInt16 "
+                        "(float32 rejected by Core Audio). Headroom "
+                        "drops ~3 dB; clipping is now hard at \xb11.0."
+                    )
+                if chosen_rate != self._sample_rate:
+                    self._log(
+                        f"[speaker_out] WARNING: opened at {chosen_rate} Hz "
+                        f"instead of {self._sample_rate} Hz. Audio will "
+                        f"pitch by "
+                        f"~{(chosen_rate / self._sample_rate - 1.0) * 100:+.2f}%. "
+                        f"Set your default output to "
+                        f"{int(self._sample_rate)} Hz in Audio MIDI "
+                        f"Setup to fix."
+                    )
+                if chosen_buf == _paFramesPerBufferUnspecified:
+                    self._log(
+                        "[speaker_out] using paFramesPerBufferUnspecified "
+                        "(device negotiated its own block size)"
+                    )
                 break
+
         if err != 0:
             self._log(
-                "[speaker_out] no usable sample rate / buffer size. Try: "
-                "open Audio MIDI Setup, select your default output, "
-                "set Format to 'Stereo 48000 Hz, 32-bit Float', then "
-                "pulse Connect again. If that's already set, the bundled "
-                "PortAudio may not be compatible with your macOS — file "
-                "a bug with the [speaker_out] lines above."
+                "[speaker_out] no usable rate / buffer / format / open-mode "
+                "combination. Workarounds (any of):\n"
+                "  1. System Settings > Sound > Output: switch to MacBook "
+                "Speakers (or another device).\n"
+                "  2. Audio MIDI Setup: set your default output Format to "
+                "'Stereo 48000 Hz, 32-bit Float'.\n"
+                "  3. On the DEMON Session page: toggle 'Python Audio Out' "
+                "OFF and wire `out_chop` to your own Audio Device Out CHOP "
+                "downstream of the COMP."
             )
             return False
 
+        self._sample_format_pa = chosen_format
         err = lib.Pa_StartStream(stream_ptr)
         if err != 0:
             msg = lib.Pa_GetErrorText(err) or b"unknown"
@@ -712,9 +865,11 @@ class SpeakerOut:
             "device-negotiated" if chosen_buf == 0
             else f"~{chosen_buf / self._sample_rate * 1000:.1f}ms"
         )
+        fmt_label = "int16" if chosen_format == _paInt16 else "float32"
         self._log(
             f"[speaker_out] started PortAudio default stream "
             f"sr={self._sample_rate} ch={self._channels} "
+            f"format={fmt_label} "
             f"frames_per_buffer={buf_label} (latency {latency_label})"
         )
         return True
@@ -738,9 +893,13 @@ class SpeakerOut:
                      user_data) -> int:
         """PortAudio callback (audio thread).
 
-        Kept minimal: read N frames from LoopBuffer, transpose to interleaved
-        float32, memmove into PortAudio's output pointer. No allocations
-        beyond what numpy does inside LoopBuffer.read.
+        Kept minimal: read N frames from LoopBuffer, write to PortAudio's
+        output pointer in whatever sample format we managed to open with.
+        No allocations beyond what numpy does inside LoopBuffer.read.
+
+        `self._sample_format_pa` records the format we negotiated (set by
+        `start()` after a successful open). float32 is the preferred path;
+        int16 is the degraded fallback when Core Audio refuses float32.
         """
         self._callback_count += 1
         if status_flags & _paOutputUnderflow:
@@ -755,10 +914,21 @@ class SpeakerOut:
                 except Exception:
                     pass
         n = int(frames)
-        n_bytes = n * self._channels * 4
+        is_int16 = (self._sample_format_pa == _paInt16)
+        bytes_per_sample = 2 if is_int16 else 4
+        n_bytes = n * self._channels * bytes_per_sample
         try:
             pcm = self._loop.read(n)  # (channels, frames) float32
-            interleaved = np.ascontiguousarray(pcm.T, dtype=np.float32)
+            if is_int16:
+                # Soft-clip then scale to int16 range. Clip floor matters —
+                # raw multiply of an out-of-range float by 32767 wraps
+                # negative on overflow, generating loud noise.
+                clipped = np.clip(pcm, -1.0, 1.0)
+                interleaved = np.ascontiguousarray(
+                    (clipped * 32767.0).T.astype(np.int16)
+                )
+            else:
+                interleaved = np.ascontiguousarray(pcm.T, dtype=np.float32)
             _ctypes.memmove(out_buf, interleaved.ctypes.data, n_bytes)
         except Exception:
             # Any failure: write silence so the audio thread doesn't break.

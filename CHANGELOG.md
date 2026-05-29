@@ -2,6 +2,57 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.8] — 2026-05-29
+
+PortAudio compatibility expansion. User report: on macOS Sequoia with
+"External Headphones" as default output, `Pa_OpenDefaultStream` failed
+at every rate × buffer-size combination with `Pa internal err=-9986 /
+hostErr code=-10851 'Audio Unit: Invalid Property Value'`. Core Audio
+was refusing whatever stream format PortAudio's minimal-API path was
+trying to set.
+
+### Added
+
+- **Layer 2: `Pa_OpenStream`** with explicit `PaStreamParameters` at
+  the device's `defaultHighOutputLatency`. The high-latency hint gives
+  PortAudio room to renegotiate the AudioUnit's format, which resolves
+  -10851 on many Sequoia devices.
+- **Layer 3: paInt16 fallback.** Some macOS Core Audio devices reject
+  `paFloat32` even though PortAudio's docs claim auto-conversion. After
+  every float32 attempt fails, we retry the whole matrix with `paInt16`
+  and convert int16↔float32 inside the audio callback. Headroom drops
+  ~3 dB and clipping is now hard at ±1.0, but you get audio out.
+- **`Pa_IsFormatSupported` pre-probe** before each `Pa_OpenStream`
+  attempt. Cleaner failure messages, and there are mailing-list reports
+  that the probe "primes" the AudioUnit and resolves -10851 on some
+  devices.
+- **README "Audio output troubleshooting" section** with the three
+  user-side workarounds (different default device, Audio MIDI Setup
+  format, or toggle `Python Audio Out` off + wire your own
+  `Audio Device Out CHOP`).
+
+### Changed
+
+- `speaker_out.start()` failure no longer kills the WS session. Status
+  shows a clear "Audio output failed — toggle Python Audio Out off
+  and wire your own Audio Device Out CHOP, or fix your default device
+  and pulse Connect again." The hosted session stays alive (your
+  reservation isn't burned) and the user can route audio out via the
+  COMP's `out_chop` port instead.
+- Logging gains a per-format prefix and the surrounding context for
+  each (rate, buffer, open-API) attempt. `Pa_GetLastHostErrorInfo`
+  prints the underlying Core Audio OSStatus + text on every failure.
+
+BUILD_MARKER bumped to v0.2.8-pa-openstream-int16.
+
+### Still failing?
+
+If you see the new "no usable combination" message even after the
+workarounds in the README, the next escalation is a vendored
+PortAudio binary upgrade (the sounddevice-bundled dylib is ~12
+months old and predates several Sequoia AudioUnit fixes). Tracking
+that as a separate follow-up.
+
 ## [0.2.5] — 2026-05-29
 
 Trim hosted-mode sign-in to paste-only. The browser-OAuth flow was

@@ -207,7 +207,7 @@ except NameError:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.7-friendly-close"
+BUILD_MARKER = "v0.2.8-pa-openstream-int16"
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -1861,11 +1861,31 @@ class DemonExt:
                 )
                 # Start Python-side audio playback if the user has it
                 # enabled (default True). Bypasses TD's CHOP audio chain.
+                #
+                # CRITICAL: if speaker_out.start() returns False (PortAudio
+                # rejected the device), we keep the WS alive. The user can
+                # still get audio out via the COMP's out_chop port wired to
+                # an external Audio Device Out CHOP, or fix their device
+                # config and retry. Tearing down the hosted session
+                # (Disconnect) would force a re-queue which is expensive
+                # and doesn't fix the audio problem.
                 try:
                     if bool(self._read_par("Speakerout", True)):
-                        self._speaker_out.start()
+                        ok = self._speaker_out.start()
+                        if not ok:
+                            self._set_status(
+                                "Audio output failed — see textport. "
+                                "Toggle 'Python Audio Out' off and wire "
+                                "your own Audio Device Out CHOP, or fix "
+                                "your default device and pulse Connect "
+                                "again."
+                            )
                 except Exception as e:
                     self.log(f"speaker_out start raised: {e}")
+                    self._set_status(
+                        f"Audio output crashed: {type(e).__name__} — "
+                        f"see textport. Session still active."
+                    )
             except Exception as e:
                 self.log(f"initial buffer decode failed: {e}")
             return

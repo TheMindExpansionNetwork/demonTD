@@ -190,6 +190,32 @@ off on the Session page. The audio still flows into the LoopBuffer, the
 `audio_out` Script CHOP still updates for analysis consumers, but no sound
 plays through speakers.
 
+### Audio output troubleshooting
+
+If you see `[speaker_out] no usable rate / buffer / format / open-mode combination`
+in the textport on Connect, your default output device refused PortAudio's
+open request. The session itself is still alive — you just can't hear it
+through `Python Audio Out`. Three workarounds in increasing order of cost:
+
+1. **Switch the macOS default output to a different device.** System
+   Settings → Sound → Output → MacBook Speakers (or a USB / Bluetooth
+   device that's known to work). PortAudio negotiates the built-in speakers
+   path reliably.
+2. **Fix the device format in Audio MIDI Setup.** Open Audio MIDI Setup
+   (search Spotlight), select the device that's failing, set Format to
+   `Stereo 48000 Hz, 32-bit Float`, then re-pulse Connect.
+3. **Bypass `Python Audio Out`.** Toggle the **Python Audio Out** par OFF
+   on the Session page, then wire the COMP's `out_chop` output port to a
+   TD-native `Audio Device Out CHOP` placed outside the COMP. TD's audio
+   chain has cook-rate quirks across COMP boundaries (documented in
+   `src/audio.py`), but for a single output device with no upstream
+   processing it generally works.
+
+The textport log lines starting with `[speaker_out]` will show what
+PortAudio actually tried (rate × buffer size × float32/int16 × open-mode)
+and the underlying Core Audio error code on each failure — that's enough
+to file a precise bug if none of the workarounds help.
+
 ## Debug toggle
 
 The Session page has a **Debug Logging** toggle (default off). When on:

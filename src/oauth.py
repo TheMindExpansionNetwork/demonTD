@@ -1,4 +1,4 @@
-"""
+﻿"""
 Daydream profile validation for demonTD.
 
 Historically this module also drove a browser-based OAuth flow (Web
