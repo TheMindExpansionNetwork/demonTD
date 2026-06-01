@@ -18,11 +18,17 @@ import audio as audio_mod
 
 def test_loop_buffer_init_and_read_2d():
     """init() with a 2D (channels, frames) array sets up the loop and
-    a subsequent read returns the same data starting at frame 0."""
+    a subsequent read returns the same data starting at frame 0.
+
+    `init()` actually seeks past the wrap-seam region on entry (see
+    test_loop_buffer_init_skips_head_seam below). To keep this test
+    focused on the read mechanics, we explicitly seek(0) after init.
+    """
     lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
     pcm = np.array([[1, 2, 3, 4, 5, 6, 7, 8],
                     [9, 10, 11, 12, 13, 14, 15, 16]], dtype=np.float32)
     lb.init(pcm)
+    lb.seek(0)
     assert lb.frames == 8
     out = lb.read(4)
     np.testing.assert_array_equal(out, pcm[:, :4])
@@ -35,6 +41,7 @@ def test_loop_buffer_init_and_read_interleaved():
     lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
     interleaved = np.array([1, 9, 2, 10, 3, 11, 4, 12], dtype=np.float32)
     lb.init(interleaved)
+    lb.seek(0)
     out = lb.read(4)
     np.testing.assert_array_equal(out, [[1, 2, 3, 4], [9, 10, 11, 12]])
 
@@ -44,9 +51,50 @@ def test_loop_buffer_read_advances_position():
     together without gaps."""
     lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000)
     lb.init(np.arange(20, dtype=np.float32).reshape(1, 20))
+    lb.seek(0)
     np.testing.assert_array_equal(lb.read(5)[0], [0, 1, 2, 3, 4])
     np.testing.assert_array_equal(lb.read(5)[0], [5, 6, 7, 8, 9])
     assert lb.position == 10
+
+
+def test_loop_buffer_init_skips_head_seam():
+    """`init()` seeks the playhead past the head-seam region so the
+    first `seam_frames` of the buffer are only ever heard through the
+    wrap-crossfade fold, never raw. Without this, the very first
+    playthrough exposes the raw head — which DEMON encodes weakly at
+    very low denoise (source bleed at the loop start). Fixes the
+    'brief source flash on first connect' artifact.
+
+    Long-buffer regime: seam = full configured seam_frames.
+    """
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000,
+                              seam_seconds=0.05)  # 2400 frames
+    # 48000 frames = 1 s; way more than 4 * seam.
+    lb.init(np.zeros((1, 48000), dtype=np.float32))
+    assert lb.position == 2400
+
+
+def test_loop_buffer_init_skips_head_seam_short_buffer():
+    """For pathologically short buffers (< 4 * seam_frames), read_into
+    clamps seam to frames//4 to keep the pre-seam region non-empty.
+    init() must mirror that clamp, else the playhead would land in the
+    middle of (or past) the seam region.
+    """
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000,
+                              seam_seconds=0.05)  # 2400 frames
+    # 20-frame buffer: seam clamps to 20//4 = 5.
+    lb.init(np.arange(20, dtype=np.float32).reshape(1, 20))
+    assert lb.position == 5
+
+
+def test_loop_buffer_init_skips_head_seam_zero_seam():
+    """When the buffer is configured with seam_seconds=0, the head-seam
+    skip is a no-op — position starts at 0 as you'd expect.
+    """
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000,
+                              seam_seconds=0.0)
+    lb.init(np.arange(100, dtype=np.float32).reshape(1, 100))
+    assert lb.position == 0
 
 
 def test_loop_buffer_uninitialized_read_returns_silence():
@@ -95,6 +143,10 @@ def test_loop_buffer_wrap_with_seam_crossfade():
         np.arange(frames, dtype=np.float32) * -1.0,
     ])
     lb.init(pcm)
+    # init() now seeks past the head seam; rewind for the crossfade
+    # math reference. This test verifies the WRAP crossfade, not the
+    # init-skip behavior.
+    lb.seek(0)
 
     out = lb.read(1200)
     # Frames 0..899 are pre-seam, identical to source.
@@ -170,6 +222,7 @@ def test_loop_buffer_clear_resets_state():
     Subsequent read returns silence."""
     lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
     lb.init(np.ones((2, 100), dtype=np.float32))
+    lb.seek(0)  # init() seeks past head seam; reset for the read math
     lb.read(10)  # advance the head
     assert lb.position == 10
     lb.clear()
@@ -181,14 +234,23 @@ def test_loop_buffer_clear_resets_state():
 
 def test_loop_buffer_swap_replaces_loop():
     """swap() (used by the server's swap_ready path) replaces the loop
-    contents and resets the play head to 0."""
+    contents and sets the play head to the head-seam offset (so the
+    new buffer's first `seam_frames` aren't heard raw — same logic as
+    init). For very short buffers like this 10-frame one, the seam
+    clamps to frames//4 = 2.
+    """
     lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000)
     lb.init(np.arange(20, dtype=np.float32).reshape(1, 20))
+    lb.seek(0)
     lb.read(15)
     assert lb.position == 15
     lb.swap(np.arange(100, 110, dtype=np.float32).reshape(1, 10))
     assert lb.frames == 10
-    assert lb.position == 0
+    # New buffer has 10 frames, seam clamps to 10//4 = 2.
+    assert lb.position == 2
+    # Re-seek for the data-content check (verifies swap content
+    # arrived correctly).
+    lb.seek(0)
     np.testing.assert_array_equal(lb.read(5)[0], [100, 101, 102, 103, 104])
 
 

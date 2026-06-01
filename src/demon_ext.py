@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.16-source-cap-120"
+BUILD_MARKER = "v0.2.19-auto-extend"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -342,6 +342,19 @@ class DemonExt:
         self._expires_at_ms: int | None = None
         self._extensions_used: int = 0
         self._playback_pos: int = 0  # samples
+
+        # Heartbeat-driver state. v0.2.6 fixed the long-standing bug
+        # where the Timer CHOP callback name was wrong and OnHeartbeat
+        # NEVER fired. To prevent silent regression: (a) bump a counter
+        # on each call so we can log "still alive" periodically, (b)
+        # track wall-clock of the last call so onFrameStart's fallback
+        # driver can no-op when the Timer CHOP is already feeding.
+        self._heartbeat_count: int = 0
+        self._last_heartbeat_t: float = 0.0
+        # Auto-extend gate. Set to a future time.time() when an extend
+        # attempt fails (network blip = 5 s back-off; MAX_EXTENSIONS
+        # reached = effectively-forever back-off). Reset on Connect.
+        self._auto_extend_backoff_until: float = 0.0
 
         # Hosted-mode pod failover state. When a WS opens but never
         # reaches `ready` (1011 keepalive, pod overloaded, VAE encode
@@ -530,6 +543,15 @@ class DemonExt:
             # from a clean slate.
             self._saw_ready = False
             self._failover_attempts = 0
+            # Reset auto-extend backoff. A previous session may have hit
+            # MAX_EXTENSIONS server-side and parked the backoff a day
+            # forward; new session = fresh allowance.
+            self._auto_extend_backoff_until = 0.0
+            # Reset heartbeat counter so the periodic "still alive" log
+            # restarts at #1 each Connect (more useful for diagnosing
+            # session-lifetime issues than a global monotonic counter).
+            self._heartbeat_count = 0
+            self._last_heartbeat_t = 0.0
 
             # --- Direct mode --------------------------------------------------
             if mode == "direct":
@@ -1430,9 +1452,18 @@ class DemonExt:
         state machine — the server can demote us from active to queued
         (lost reservation) or over_budget (paywall) and we surface that
         in the UI even if the WS is still notionally open.
+
+        Server eviction policy (per demon-public-demo/hooks/useQueue.ts):
+        polling /api/queue/status IS the heartbeat. If `lastHeartbeat` is
+        older than QUEUE_HEARTBEAT_TIMEOUT_MS (30 s default), the server
+        evicts the session and closes the WS. So we MUST be calling this
+        every <30 s for the lifetime of the session.
         """
         mode = (self._read_par("Mode", "direct") or "direct").lower()
         if mode != "hosted" or not self._connected or not self._session_id:
+            # Still mark the call so the frame-exec fallback knows
+            # the Timer CHOP is alive — no need to double-fire.
+            self._last_heartbeat_t = time.time()
             return
         base = self._read_par("Baseurl", "https://music.daydream.live")
         try:
@@ -1441,20 +1472,94 @@ class DemonExt:
             )
         except queue_mod.QueueError as e:
             # Transient — keep the WS alive, retry on the next 5 s tick.
+            # Still record the attempt so the fallback driver doesn't
+            # pile on top of a flapping network.
+            self._last_heartbeat_t = time.time()
             self.log(f"Heartbeat poll failed: {e}")
             return
 
+        # Record successful poll — the server's eviction timer is now
+        # reset on its side, and the frame-exec fallback should skip
+        # until the next 5 s window.
+        self._last_heartbeat_t = time.time()
+        self._heartbeat_count += 1
+
+        # Periodic "still alive" log so a future regression where
+        # OnHeartbeat stops firing is visible in textport instead of
+        # silently letting sessions die. Debug-gated and throttled to
+        # 1st + every 30 s (every 6th tick at the 5 s cadence).
+        if self._debug_enabled and (
+            self._heartbeat_count == 1 or self._heartbeat_count % 6 == 0
+        ):
+            try:
+                expires_in = float(self._read_par("Expiresin", 0.0) or 0.0)
+            except Exception:
+                expires_in = 0.0
+            self.log(
+                f"[heartbeat] #{self._heartbeat_count} ok "
+                f"status={resp.status} expires_in={expires_in:.0f}s "
+                f"extensions={self._extensions_used}"
+            )
+
         if resp.status == "active":
+            expires_in_s = 0.0
             if resp.expires_at:
                 self._expires_at_ms = resp.expires_at
                 now_ms = time.time() * 1000
-                self._write_par(
-                    "Expiresin",
-                    max(0.0, (resp.expires_at - now_ms) / 1000),
-                )
+                expires_in_s = max(0.0, (resp.expires_at - now_ms) / 1000)
+                self._write_par("Expiresin", expires_in_s)
             self._extensions_used = (
                 resp.extensions_used or self._extensions_used
             )
+
+            # Auto-extend: when the user has the Auto-extend toggle on,
+            # pre-emptively pulse extend before the lease expires. Threshold
+            # is 60 s — gives the request plenty of time to complete plus
+            # a retry window if it fails. The server's MAX_EXTENSIONS cap
+            # is the natural backstop; once we hit it, `_extend_session`
+            # surfaces the error via Status and we stop trying (the
+            # `_auto_extend_backoff_until` guard below prevents looping
+            # on a denied extend for the rest of the session).
+            try:
+                auto_extend = bool(self._read_par("Autoextend", True))
+            except Exception:
+                auto_extend = True
+            if (
+                auto_extend
+                and expires_in_s > 0.0
+                and expires_in_s < 60.0
+                and time.time() >= getattr(
+                    self, "_auto_extend_backoff_until", 0.0)
+            ):
+                if self._debug_enabled:
+                    self.log(
+                        f"[auto-extend] expires_in={expires_in_s:.0f}s "
+                        f"< 60s — pulsing extend "
+                        f"(extensions_used={self._extensions_used})"
+                    )
+                # Track the pre-extend extensions count; if `extend`
+                # comes back with the same number, the server denied
+                # silently (or hit MAX_EXTENSIONS) and we should back
+                # off to avoid hammering until the session ends.
+                pre_used = self._extensions_used
+                try:
+                    self._extend_session()
+                except Exception as e:
+                    self.log(f"[auto-extend] _extend_session raised: {e}")
+                    # Network blip — try again on the next heartbeat.
+                    self._auto_extend_backoff_until = time.time() + 5.0
+                else:
+                    if self._extensions_used == pre_used:
+                        # Extend didn't bump the counter — server rejected
+                        # (likely MAX_EXTENSIONS). Back off for the rest
+                        # of this session to avoid log spam.
+                        self.log(
+                            "[auto-extend] extend didn't increment "
+                            "extensions_used — backing off until next "
+                            "session"
+                        )
+                        self._auto_extend_backoff_until = (
+                            time.time() + 24 * 3600)
         elif resp.status == "queued":
             # Reservation lost server-side. Surface for awareness; leave
             # the WS alone — the server will close it if it actually
@@ -1470,6 +1575,42 @@ class DemonExt:
         else:
             self.log(f"Heartbeat saw status={resp.status}; disconnecting")
             self.Disconnect()
+
+    def MaybeHeartbeatFromFrame(self) -> None:
+        """Belt-and-suspenders heartbeat driver, called from frame_exec's
+        onFrameStart every TD frame (~16 ms).
+
+        Cheap no-op in the common case: when the Timer CHOP is firing
+        OnHeartbeat normally, `_last_heartbeat_t` is fresh and we return
+        immediately. Only when the Timer CHOP misbehaves (as it did
+        silently through v0.2.5 with the wrong callback name) do we
+        actually poll. Throttled to 5 s to match the Timer CHOP cadence.
+
+        Skipping in direct mode is handled inside OnHeartbeat — we still
+        want it to mark `_last_heartbeat_t` so this driver no-ops.
+        """
+        # No hosted session = nothing to keep alive. Don't even check
+        # the throttle window; spammy no-ops here happen 60×/sec.
+        if not self._connected or not self._session_id:
+            return
+        mode = (self._read_par("Mode", "direct") or "direct").lower()
+        if mode != "hosted":
+            return
+        now = time.time()
+        if now - self._last_heartbeat_t < 5.0:
+            return
+        # Timer CHOP didn't fire for >5 s. Drive the heartbeat manually.
+        # First time this kicks in, surface it so we know the fallback
+        # actually saved us.
+        if self._heartbeat_count == 0 and self._debug_enabled:
+            self.log(
+                "[heartbeat] Timer CHOP appears silent — "
+                "driving from frame_exec fallback"
+            )
+        try:
+            self.OnHeartbeat()
+        except Exception as e:
+            self.log(f"MaybeHeartbeatFromFrame: OnHeartbeat raised: {e}")
 
     def OnReceive(self, dat, rowIndex=None, message=None,
                   contents=None, peer=None) -> None:

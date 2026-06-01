@@ -69,5 +69,5 @@ def test_discrete_pulse_map_targets_real_pars():
 
 def test_param_count_in_expected_ballpark():
     """Sanity check that the schema is roughly the size we claimed."""
-    # 11 session + 11 init + ~6 prompt/lora + 24 synthesis + 10 rcfg/dcw + 5 curves + 10 sources
-    assert 60 <= len(P.PARAMS) <= 100
+    # 12 session + 11 init + ~6 prompt/lora + 24 synthesis + 10 rcfg/dcw + 5 curves + 10 sources
+    assert 60 <= len(P.PARAMS) <= 120

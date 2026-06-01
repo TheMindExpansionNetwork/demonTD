@@ -230,7 +230,27 @@ class LoopBuffer:
             self.channels = ch
             self._buffer = np.ascontiguousarray(buf, dtype=np.float32)
             self._frames = frames
-            self._position = 0
+            # Start playback PAST the seam region so frames 0..seam are
+            # only ever heard through the wrap-crossfade fold, never
+            # raw. Without this, the very first iteration of playback
+            # plays the buffer's head (frames 0..seam) directly — and
+            # if the server's initial encode is weak at the loop start
+            # (low denoise / source leakage / edge artifacts), the user
+            # hears a brief source-y flash on first connect. The
+            # subsequent seam-fold then re-introduces those same head
+            # samples on every wrap, but blended over the tail, which
+            # is the entire point of the crossfade. Starting at `seam`
+            # makes that the ONLY way those frames are ever audible.
+            #
+            # Edge case: buffers shorter than `4 * seam_frames` would
+            # have `seam` clamped down to `frames // 4` in read_into,
+            # so we mirror that clamp here. If seam is 0 (zero-length
+            # seam config) or the buffer is tiny, fall back to 0.
+            seam_start = (
+                min(self._seam_frames, frames // 4)
+                if frames > 0 else 0
+            )
+            self._position = seam_start
             # Re-size the seam blend scratch if channel count changed —
             # the read_into hot path indexes it as
             # `_seam_blend_scratch[:, :take]` and broadcasts a (take,)

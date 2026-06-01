@@ -121,6 +121,15 @@ SESSION_PARAMS: list[Param] = [
     Param("Stillplaying", None, "Session", "Pulse", "session", order=80,
           label="Still playing?",
           help="POST /api/queue/extend — bumps the session by one duration."),
+    Param("Autoextend", None, "Session", "Toggle", "session", default=True,
+          order=82, label="Auto-extend",
+          help="When ON, the 5 s heartbeat auto-pulses Still Playing once "
+               "Expires in (s) drops below 60 s, so the hosted session "
+               "stays alive without user input. Server-side MAX_EXTENSIONS "
+               "still caps total extends — at the cap, the session ends "
+               "naturally. Toggle OFF for unattended performances where "
+               "you want a hard time limit, or to match the web client's "
+               "explicit 'Still playing?' UX exactly."),
 
     Param("Debug", None, "Session", "Toggle", "session", default=False,
           order=999, label="Debug Logging",

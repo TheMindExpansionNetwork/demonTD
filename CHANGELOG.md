@@ -2,6 +2,142 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.6] — 2026-06-01
+
+**Two fixes in one rev.**
+
+### Part 1 — Heartbeat has never fired. Fix the timer callback name.
+
+Follow-up to v0.2.5: user's in-the-wild Windows log (Vinyl Lemonade.mp3,
+66.96 s — well under the new 120 s cap) still showed sessions dying
+~30-90 s after `ready`. Slices were flowing, prompts and LoRAs were
+working, then the WS closed with the server-initiated `closed:
+Connection to remote host was lost`. Failover hit the same wall.
+
+### Root cause
+
+`build/build_tox.py` `CALLBACKS_PY` defined `onTimer(timerOp, segment)`
+for the two Timer CHOPs (`tick8ms`, `heartbeat`) to dispatch from. But
+**`onTimer` is not a TouchDesigner Timer CHOP callback name.** The
+real names are `onTimerStart` / `onTimerPulse` / `onTimerCycle` /
+`onTimerSegment` / `onTimerComplete`. TD silently ignored our hook, so
+both Timer CHOPs have been generating cycles into the void since at
+least v0.2.0 — `OnTick` and `OnHeartbeat` have **never fired** in any
+released build.
+
+Consequences this masked:
+
+1. **No `/api/queue/status` heartbeat.** Per
+   `demon-public-demo/hooks/useQueue.ts:79-82`, polling status IS the
+   heartbeat. The server evicts sessions whose `lastHeartbeat` is older
+   than `QUEUE_HEARTBEAT_TIMEOUT_MS` (30 s default). Without our
+   5 s heartbeat, eviction fires shortly after the last activity that
+   incidentally pinged the server (slice traffic kept things alive ~60-
+   90 s; idle sessions died at the 30 s mark).
+2. **`OnTick`'s params batch flush never ran.** Continuous-param slider
+   moves (Denoise, Hint Strength, Feedback, Shift, channel groups,
+   RCFG / DCW) silently dropped. User didn't notice because prompt
+   and LoRA toggles ride on dedicated WS messages (`encode_prompt`,
+   `encode_enable_lora`) fired directly from `OnParChange`, not the
+   `_dirty` batch.
+3. **Scheduled curves never sampled** (v0.2.2's curve work is gated on
+   `OnTick`).
+4. **Telemetry never logged** — `[speaker_out] cb_latency` and
+   `[coverage]` from v0.2.4 would have surfaced this sooner.
+
+The reason this wasn't obvious: `_drain_inbound`'s `telemetry:` line
+runs from `onFrameStart` (correct TD callback name, verified firing),
+so the textport always had activity, hiding the silent Timer CHOPs.
+
+### Fix
+
+- `build/build_tox.py`: rename `def onTimer(timerOp, segment)` to
+  **`def onTimerPulse(timerOp, segment)`** — canonical "every cycle"
+  hook for `cycle=True` Timer CHOPs. Body unchanged.
+- `src/demon_ext.py` `OnHeartbeat`: Debug-gated "still alive" log
+  every 30 s (`[heartbeat] #N ok status=active expires_in=Xs`). Without
+  this, a future regression of the same shape would be silent again.
+- `src/demon_ext.py` new `MaybeHeartbeatFromFrame` method, called from
+  `onFrameStart`: belt-and-suspenders fallback driver. No-op when the
+  Timer CHOP is firing normally; takes over if it ever stops (cheap to
+  carry, much cheaper than the next "why are sessions dying" debug
+  cycle).
+
+### Part 2 — Loop-wrap source flash on first playthrough.
+
+User report: "I am still hearing a very short cutover to the source
+track right when the loop turns over." Root cause: `LoopBuffer.init()`
+set `_position = 0`, so the very first iteration of playback ran
+through the raw head region (frames 0..seam_frames) before any wrap-
+crossfade had a chance to fold those frames over the tail. DEMON's
+initial encode often produces a weak/source-leaky audio at the very
+start of the loop — that's what the user heard, briefly, at each
+loop turn-over.
+
+(Algorithmically the wrap-crossfade already mixes the head into the
+tail every wrap — but on iteration 1 the head plays raw FIRST, then
+gets folded into iteration 1's tail, then iteration 2 wraps to
+`_seam_frames` and the head is never reached again. So the source
+flash only ever happened on the first wrap, not on every wrap. But
+"first wrap" is when the user hears it on every fresh connect.)
+
+Fix: `init()` now seeks `_position` to `min(seam_frames, frames // 4)`
+on entry, mirroring the same clamp `read_into` uses for short
+buffers. The head region (frames 0..seam) is now ONLY ever audible
+through the wrap-crossfade fold — never raw. `swap()` (called for
+server `swap_ready` events) inherits the same behavior since it
+delegates to `init()`.
+
+Trade-off: technically diverges from `demon-public-demo`'s
+AudioWorklet, which does set position=0 on swap. But the web client
+runs a separate `fading` crossfade between old and new buffers on
+swap (5 s crossfade), which we don't implement — so our wrap behavior
+is already different from theirs. The seam-skip is strictly an
+improvement for our path.
+
+### Part 3 — Auto-extend lease (opt-out via Session toggle).
+
+New Session-page param `Auto-extend` (Toggle, default ON). When on,
+the 5 s heartbeat watches `Expires in (s)` and pre-emptively pulses
+`POST /api/queue/extend` once it drops below 60 s. Sessions stay alive
+indefinitely without user input until the server's MAX_EXTENSIONS cap
+is hit, at which point we back off for the remainder of the session
+(no log spam) and the lease ends naturally.
+
+Backoff policy:
+- Network failure on extend: 5 s back-off, retry on next heartbeat.
+- Server rejected extend (extensions_used didn't increment): assume
+  MAX_EXTENSIONS; back off until the end of the session. Reset on
+  the next Connect.
+
+Toggle OFF reverts to manual-only extends via the `Still Playing?`
+pulse button (the previous v0.2.5 behavior). Useful for:
+- Unattended performances where you want a hard time limit
+- Matching the web client's explicit-extend UX exactly
+- Cost control during testing
+
+Programmatic alternative also still works — any TD op can
+`op('demon').par.Stillplaying.pulse()` whenever it wants.
+
+BUILD_MARKER bumped to v0.2.19-auto-extend.
+
+### Verification
+
+- Within 5 s of hosted Connect, textport shows `[heartbeat] #1 ok
+  status=active expires_in=600s`.
+- Every 30 s after, `[heartbeat] #6 ok ...`, `#12`, etc.
+- Within 65 s, `OnTick: timer is running (first tick)` (the canary
+  log that should have caught this in v0.2.0).
+- Sessions survive the full 10-minute lease without user input
+  (Auto-extend ON by default). At ~9 min, textport shows
+  `[auto-extend] expires_in=59s < 60s — pulsing extend ...` and the
+  session continues. Toggle `Auto-extend` OFF to revert to manual.
+- Continuous-param sliders (Denoise etc.) now propagate during
+  hosted sessions.
+- First loop wrap on a fresh Connect no longer has a brief source-y
+  flash — the head-seam region is now only ever heard through the
+  wrap crossfade, never raw.
+
 ## [0.2.5] — 2026-06-01
 
 **Stop the post-`ready` disconnects.** Windows in-the-wild testing:

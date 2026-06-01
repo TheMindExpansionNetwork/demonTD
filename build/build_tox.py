@@ -680,6 +680,20 @@ def onFrameStart(frame):
         pass
     except Exception as e:
         print(f"[frame_exec] drain failed: {e}")
+    # Belt-and-suspenders heartbeat fallback. frame_exec is the most
+    # reliable TD hook we've got (callback name is correct + verified
+    # firing). If the Timer CHOP ever stops dispatching again (as it
+    # did silently through v0.2.5 because of the wrong callback name),
+    # this keeps `/api/queue/status` heartbeats flowing so the server
+    # doesn't evict our session. Cheap no-op when the Timer CHOP is
+    # already feeding (the call internally throttles to 5 s and bails
+    # if a recent OnHeartbeat already ran).
+    try:
+        parent().ext.DemonExt.MaybeHeartbeatFromFrame()
+    except AttributeError:
+        pass
+    except Exception as e:
+        print(f"[frame_exec] heartbeat-fallback failed: {e}")
     # Audio playback runs in SpeakerOut's PortAudio thread reading the
     # LoopBuffer directly — it doesn't need audio_out to cook. If the
     # user wires an external Audio Device Out / Analyze CHOP / FFT etc.
@@ -729,7 +743,14 @@ def onValueChange(par, prev):
 def onPulse(par):
     _ext().OnParChange(par)
 
-def onTimer(timerOp, segment):
+# NOTE: TD Timer CHOP callbacks are:
+#   onTimerStart / onTimerPulse / onTimerCycle / onTimerSegment /
+#   onTimerComplete
+# Up through v0.2.5 this DAT defined `onTimer`, which TD silently
+# ignored — so OnTick + OnHeartbeat never fired. That broke heartbeat-
+# driven session keep-alive and the params batch flush. Use
+# `onTimerPulse` (canonical "every cycle" hook for cycle=True timers).
+def onTimerPulse(timerOp, segment):
     name = timerOp.name
     ext = _ext()
     if name == "tick8ms":
