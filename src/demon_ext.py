@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.15-lora-toggle"
+BUILD_MARKER = "v0.2.16-source-cap-120"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -295,8 +295,23 @@ MAX_FAILOVER_ATTEMPTS = 3
 # demon-public-demo's `isManualOverrideActive` 500 ms.
 CURVE_OVERRIDE_SECONDS = 0.5
 
-# Hard upper bound on source-audio duration. DEMON rejects longer.
-MAX_SOURCE_SECONDS = 240
+# Hard upper bound on source-audio duration. Matches the web client's
+# `engine.max_source_duration_s = 120` cap from
+# `demon-public-demo/vendor/demon-ui/lib/config.ts`. Anything longer is
+# cropped to the first 120 s on load. The pod's VAE encoder times out
+# on longer sources; the WS closes once encode blows its deadline,
+# manifesting as a server-side "server sent close" or "Connection to
+# remote host was lost" right after `ready`. (Pre-v0.2.5 demonTD
+# capped at 240 s — the old, looser server limit.)
+MAX_SOURCE_SECONDS = 120
+
+# Server's VAE latent-pool size in frames. Source buffers MUST be a
+# multiple of this so the VAE encode pass aligns to its tile boundary.
+# Mirrors `SAMPLE_POOL` in
+# `demon-public-demo/vendor/demon-ui/lib/audio/trimAudioBuffer.ts`.
+# 9600 frames @ 48 kHz = 0.2 s — every cap-aligned source ends on a
+# clean multiple.
+SAMPLE_POOL_FRAMES = 9600
 
 # Debug-only: where to dump WAV snapshots of decoded audio for offline
 # inspection. Used by BUILD=diag-dump-* builds to isolate which side of
@@ -1891,14 +1906,49 @@ class DemonExt:
             if src_rate != wire.SAMPLE_RATE:
                 pcm = audio_mod.linear_resample(pcm, src_rate, wire.SAMPLE_RATE)
             pcm = audio_mod.to_stereo(pcm)
-            # Cap to DEMON's max in case the snapshot is huge.
-            max_samples = MAX_SOURCE_SECONDS * wire.SAMPLE_RATE
-            if pcm.shape[1] > max_samples:
-                pcm = pcm[:, :max_samples]
+            pcm = self._crop_to_max_duration(pcm)
             return pcm.astype(np.float32, copy=False)
         except Exception as e:
             self.log(f"_snapshot_input_chop failed: {e}")
             return None
+
+    def _crop_to_max_duration(self, pcm: np.ndarray) -> np.ndarray:
+        """Crop a (channels, frames) PCM array to the first
+        `MAX_SOURCE_SECONDS`, aligned to `SAMPLE_POOL_FRAMES`.
+
+        Logs + updates Status when the crop actually trims something.
+        Idempotent on already-short input.
+
+        Matches the web client's `engine.max_source_duration_s = 120`
+        cap + `SAMPLE_POOL = 9600` pool alignment from
+        `demon-public-demo/vendor/demon-ui/lib/audio/trimAudioBuffer.ts`.
+        Sources longer than the cap caused "server sent close" right
+        after `ready` — the pod's VAE encoder times out on longer
+        inputs.
+        """
+        max_samples = MAX_SOURCE_SECONDS * wire.SAMPLE_RATE
+        # Floor-align to pool boundary so the VAE encode constraint
+        # holds. 120 s × 48000 = 5_760_000 is already a multiple of
+        # 9600, but keep the floor-align in case MAX_SOURCE_SECONDS
+        # ever changes to a non-pool-aligned value.
+        max_samples = (max_samples // SAMPLE_POOL_FRAMES) * SAMPLE_POOL_FRAMES
+        if pcm.shape[1] <= max_samples:
+            return pcm
+        orig_s = pcm.shape[1] / wire.SAMPLE_RATE
+        cropped = pcm[:, :max_samples]
+        new_s = cropped.shape[1] / wire.SAMPLE_RATE
+        self.log(
+            f"source is {orig_s:.1f}s — cropping to {new_s:.1f}s "
+            f"(MAX_SOURCE_SECONDS={MAX_SOURCE_SECONDS}, "
+            f"pool-aligned to {SAMPLE_POOL_FRAMES} frames). "
+            f"Trim your file manually for a different window."
+        )
+        try:
+            self._set_status(
+                f"Source cropped to {new_s:.0f}s (max for hosted)")
+        except Exception:
+            pass
+        return cropped
 
     def _load_source_wav(self, path: str) -> "np.ndarray | None":
         """Load an audio file off disk → (2, samples) float32 at 48 kHz.
@@ -1994,14 +2044,10 @@ class DemonExt:
         # Force stereo (mono → duplicated L→R; >2 channels → first two)
         pcm = audio_mod.to_stereo(pcm)
 
-        # Cap to DEMON's max source duration (240 s). Server rejects longer.
-        max_samples = MAX_SOURCE_SECONDS * wire.SAMPLE_RATE
-        if pcm.shape[1] > max_samples:
-            self.log(
-                f"WARNING: source is {pcm.shape[1] / wire.SAMPLE_RATE:.1f}s; "
-                f"trimming to {MAX_SOURCE_SECONDS}s (DEMON max)."
-            )
-            pcm = pcm[:, :max_samples]
+        # Cap to MAX_SOURCE_SECONDS (120 s, web-client parity) with
+        # pool alignment. See `_crop_to_max_duration` for the full
+        # rationale.
+        pcm = self._crop_to_max_duration(pcm)
 
         return pcm.astype(np.float32, copy=False)
 

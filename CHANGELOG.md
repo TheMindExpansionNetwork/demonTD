@@ -2,6 +2,52 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.5] — 2026-06-01
+
+**Stop the post-`ready` disconnects.** Windows in-the-wild testing:
+every hosted Connect ran through queue → `ready` → initial-buffer →
+then the WS closed ("server sent close" / "Connection to remote host
+was lost"). Failover retries hit the same wall. Coverage telemetry
+never got data because no slices ever arrived.
+
+### Root cause
+
+Source uploads longer than 120 s. The pod's VAE encoder times out on
+longer inputs, the WS closes once the encode pass blows its deadline.
+The web client's `engine.max_source_duration_s = 120` (in
+`demon-public-demo/vendor/demon-ui/lib/config.ts:312`) enforces this
+upstream via the `WaveformTrimDialog` so nothing longer than 120 s
+ever reaches the engine. demonTD's cap was **240 s** — predating the
+web client's tightening — so a 151.6 s file (Amsterdam_44100.mp3 in
+the user's test) passed through unchanged and crashed the pod.
+
+### Fix
+
+- `MAX_SOURCE_SECONDS = 240` → **120**.
+- New `SAMPLE_POOL_FRAMES = 9600` constant — matches
+  `demon-public-demo/vendor/demon-ui/lib/audio/trimAudioBuffer.ts`'s
+  `SAMPLE_POOL`. The VAE encode constraint requires source length to
+  be a multiple of this; 120 × 48000 = 5_760_000 is already pool-
+  aligned but the helper enforces it for any future cap value.
+- New `_crop_to_max_duration(pcm)` helper, called from both source
+  load paths (`_load_source_wav` and `_snapshot_input_chop`). When
+  the source exceeds the cap, the Status par shows
+  `"Source cropped to 120s (max for hosted)"` and textport explains
+  the cropping with a `"Trim your file manually for a different
+  window"` hint.
+
+### What this does NOT change
+
+- Hosted-mode flow is unchanged for sources < 120 s (idempotent path
+  short-circuits before the log line).
+- No new TD parameter. Cap is hardcoded to match the web client; a
+  per-track "Trim Start (s)" knob would be useful for picking
+  WHICH 120 s of a long file, but that's deferred to v0.3 polish.
+  For now: pre-trim your file in any DAW, or roll with the first
+  120 s.
+
+BUILD_MARKER bumped to v0.2.16-source-cap-120.
+
 ## [0.2.4] — 2026-05-29
 
 LoRA toggle propagation finally works, and slice-coverage telemetry
