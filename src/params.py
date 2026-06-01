@@ -337,25 +337,101 @@ RCFG_DCW_PARAMS: list[Param] = [
 
 
 # -----------------------------------------------------------------------------
-# Page 6: Curves (advanced; accept JSON spec strings)
+# Page 6: Curves (client-side scheduled curves)
 # -----------------------------------------------------------------------------
+# v0.2.2 rewrite. The previous Curves page sent JSON specs to wire keys
+# `sde_denoise_curve`, `ode_noise_curve`, etc. that the DEMON server
+# stopped applying — they were a static whole-buffer schedule the pod
+# wasn't honoring. The web client moved to CLIENT-SIDE evaluation:
+# every frame, sample each enabled curve at the loop playhead and
+# write the SCALAR result into the regular continuous-param wire keys
+# (`denoise`, `hint_strength`, `feedback`, `shift`). Matches
+# demon-public-demo/vendor/demon-ui/hooks/useScheduledCurves.ts.
+#
+# Schedulable params come from demon-public-demo/types/curves.ts:
+#   SCHEDULEABLE_PARAMS = ["denoise", "hint_strength", "feedback", "shift"]
+#
+# Per-LoRA strength curves (`lora_str_<id>`) are deferred — they need
+# dynamic-param plumbing similar to the existing Lorastr<id> rows.
+#
+# All curve params are `session`-category (local-only). The SAMPLED
+# values from `_sample_curves()` in demon_ext.py flow through the
+# existing `denoise`/`hint_strength`/`feedback`/`shift` continuous-
+# param wire keys, not through any new wire surface.
 CURVE_PARAMS: list[Param] = [
-    Param("Sdedenoisecurve", "sde_denoise_curve", "Curves", "Str", "continuous",
-          default='{"type":"constant","value":0.7}', order=10,
-          label="SDE Denoise Curve", multiline=True,
-          help='JSON curve spec, e.g. {"type":"constant","value":0.7} or '
-               '{"type":"raw","values":[...]}'),
-    Param("Odenoisecurve", "ode_noise_curve", "Curves", "Str", "continuous",
-          default='{"type":"constant","value":0.0}', order=20,
-          label="ODE Noise Curve", multiline=True),
-    Param("X0targetcurve", "x0_target_curve", "Curves", "Str", "continuous",
-          default='', order=30, label="x0 Target Curve", multiline=True,
-          help="Empty disables. JSON curve spec for x0 target guidance."),
-    Param("Velocityscalecurve", "velocity_scale_curve", "Curves", "Str", "continuous",
-          default='', order=40, label="Velocity Scale Curve", multiline=True),
-    Param("Initialnoisecurve", "initial_noise_curve", "Curves", "Str", "continuous",
-          default='', order=50, label="Initial Noise Curve", multiline=True),
+    # Master enable. Off by default and intentionally NOT remembered
+    # across sessions (the web client documents the rationale: a
+    # persisted-on schedule silently re-applied stored curves to
+    # `denoise`/`shift`/etc. on every fresh session, surprising users).
+    Param("Schedulecurves", None, "Curves", "Toggle", "session",
+          default=False, order=5, label="Schedule Curves",
+          help="Master enable for client-side scheduled curves. When "
+               "on, each enabled curve below is sampled at the loop "
+               "playhead every tick and the value writes into the "
+               "matching continuous param (Denoise / Hint Strength / "
+               "Feedback / Shift). Off = no curve drives any param. "
+               "Manual slider movements override the curve for 500 ms."),
+
+    # Per-param triple: header, enable, JSON spec. Default JSON is a
+    # constant 0.5 ramp so toggling Enable does something visible.
+    # The (Param-name, wire-name, label, slider-min, slider-max,
+    # default-mid) tuples mirror what's already on Synthesis.
+
+    Param("Denoisecurveheader", None, "Curves", "Header", "session",
+          order=10, section_header=True, label="Denoise"),
+    Param("Denoisecurveenable", None, "Curves", "Toggle", "session",
+          default=False, order=11, label="Enable",
+          help="Enable curve scheduling for Denoise."),
+    Param("Denoisecurve", None, "Curves", "Str", "session",
+          default='{"points": [[0, 0.5], [1, 0.5]]}',
+          order=12, multiline=True, label="Curve JSON",
+          help='Linear-interp curve as {"points": [[x, y], ...]} with '
+               'x and y in [0, 1]. First x=0, last x=1; sampled at t = '
+               'playhead/duration each tick. Writes into the Denoise '
+               'slider when enabled.'),
+
+    Param("Hintstrengthcurveheader", None, "Curves", "Header", "session",
+          order=20, section_header=True, label="Hint Strength"),
+    Param("Hintstrengthcurveenable", None, "Curves", "Toggle", "session",
+          default=False, order=21, label="Enable",
+          help="Enable curve scheduling for Hint Strength."),
+    Param("Hintstrengthcurve", None, "Curves", "Str", "session",
+          default='{"points": [[0, 0.5], [1, 0.5]]}',
+          order=22, multiline=True, label="Curve JSON",
+          help="Same format as Denoise Curve JSON. y is normalized [0, 1]; "
+               "mapped to the param's [min, max] range at sample time."),
+
+    Param("Feedbackcurveheader", None, "Curves", "Header", "session",
+          order=30, section_header=True, label="Feedback"),
+    Param("Feedbackcurveenable", None, "Curves", "Toggle", "session",
+          default=False, order=31, label="Enable",
+          help="Enable curve scheduling for Feedback."),
+    Param("Feedbackcurve", None, "Curves", "Str", "session",
+          default='{"points": [[0, 0.0], [1, 0.0]]}',
+          order=32, multiline=True, label="Curve JSON",
+          help="Same format as Denoise Curve JSON."),
+
+    Param("Shiftcurveheader", None, "Curves", "Header", "session",
+          order=40, section_header=True, label="Shift"),
+    Param("Shiftcurveenable", None, "Curves", "Toggle", "session",
+          default=False, order=41, label="Enable",
+          help="Enable curve scheduling for Shift."),
+    Param("Shiftcurve", None, "Curves", "Str", "session",
+          default='{"points": [[0, 0.5], [1, 0.5]]}',
+          order=42, multiline=True, label="Curve JSON",
+          help="Same format as Denoise Curve JSON."),
 ]
+
+
+# Map of curve-param-name -> (base-param-name, enable-param-name)
+# used by demon_ext._sample_curves() to find which slider to write into
+# when each curve fires. Keyed by the JSON-spec param's TD name.
+CURVE_PARAM_BINDINGS: dict[str, tuple[str, str]] = {
+    "Denoisecurve":         ("Denoise",       "Denoisecurveenable"),
+    "Hintstrengthcurve":    ("Hintstrength",  "Hintstrengthcurveenable"),
+    "Feedbackcurve":        ("Feedback",      "Feedbackcurveenable"),
+    "Shiftcurve":           ("Shift",         "Shiftcurveenable"),
+}
 
 
 # -----------------------------------------------------------------------------

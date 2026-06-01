@@ -2,6 +2,75 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] — 2026-05-29
+
+Two features pulled from the latest `rtmg-vst` PR (commit `b2e1953`):
+**pod failover** and **scheduled curves**. Both are pure client-side
+— no new wire surface, no new queue endpoints.
+
+### Pod failover
+
+When a hosted WS opens but never reaches the server `ready` handshake
+(1011 keepalive, overloaded pod, VAE encode hang behind a Cloudflare
+502, etc.), demonTD now releases the dead session and re-queues for
+a different pod, up to 3 attempts. Reset on a successful `ready` so
+mid-session drops are still treated as terminal disconnects.
+
+- Behavior matches rtmg-vst's `RTMGSession::applyResult` failover
+  branch: leave + re-join without pod_id pin.
+- 1.5 s backoff between attempts so we don't hammer the queue.
+- After 3 failed attempts the Status par reads "Pod failover
+  exhausted (3 tries). Try Connect again later or switch to Direct
+  mode."
+- `_pending_audio` now lives across the WS cycle until the `ready`
+  handler clears it, so failover re-sends the source on the next WS
+  open without re-resolving PCM (which would be slow on a 24 s WAV).
+
+### Scheduled curves
+
+Replaces the old Curves page wholesale. The previous 5 `*_curve`
+JSON-spec params (sde_denoise_curve, ode_noise_curve, x0_target_curve,
+velocity_scale_curve, initial_noise_curve) sent keys the server
+stopped applying — they were a static whole-buffer schedule the pod
+ignored. The web client moved to **client-side per-frame sampling**
+and writing the resulting scalar into the regular continuous-param
+stream. This commit mirrors that behavior.
+
+- **Schedulable params**: `Denoise`, `Hintstrength`, `Feedback`,
+  `Shift` — matches `demon-public-demo/types/curves.ts`'s
+  `SCHEDULEABLE_PARAMS`.
+- **Master toggle**: `Schedulecurves` (off by default, NOT persisted
+  on across sessions for the same reason the web client documents —
+  a stale persisted-on schedule silently driving denoise on every
+  reload was a footgun).
+- **Per-param controls**: `<Name>curveenable` toggle + `<Name>curve`
+  multiline Str holding a piecewise-linear JSON spec like
+  `{"points": [[0, 0.5], [0.5, 1.0], [1, 0.3]]}`.
+- **Sampler in `OnTick`**: t = `(ring.position / ring.frames) % 1.0`,
+  evaluate piecewise-linear, map y∈[0,1] to the base param's
+  [min, max], write into both `_dirty` (for the next wire flush)
+  and the TD par's `.val` (so the user sees the slider move).
+- **Manual override window**: 500 ms after the user moves a
+  curve-bound slider directly, the curve yields for that param.
+  Matches the web client's `isManualOverrideActive`.
+- **Cache**: parsed control points are cached by spec STRING so
+  editing the JSON invalidates the cache on next tick without
+  re-parsing every tick. Capped at 64 entries.
+- **`tests/test_curves.py`** — 7 unit tests covering the parser
+  (valid input, endpoint clamping, x-sort, invalid → None) and
+  evaluator (exact at control points, linear interp between, t
+  clamping).
+
+### Deferred to v0.3+
+
+- Per-LoRA strength curves (web client supports `lora_str_<id>` keys).
+  Needs dynamic-param plumbing.
+- Catmull-Rom interpolation. Linear gets ~90% of the visual range.
+- An in-TD curve editor. TD has no native curve-editor primitive;
+  JSON spec is the pragmatic v0.2 UI.
+
+BUILD_MARKER bumped to v0.2.13-failover-curves.
+
 ## [0.2.12] — 2026-05-29
 
 **Audio stutter fix.** User reported a longstanding intermittent

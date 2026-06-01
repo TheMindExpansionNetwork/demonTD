@@ -205,9 +205,95 @@ except NameError:
     import ws_client as ws_client_mod  # type: ignore
 
 
+# Scheduled-curve helpers. Module-level so they're testable without TD
+# globals (tests/test_curves.py imports them). The DemonExt class wraps
+# these with the per-curve enable + cache + manual-override logic.
+
+def parse_curve_spec(spec: str) -> list[tuple[float, float]] | None:
+    """Parse a curve-spec JSON string into a list of (x, y) control
+    points suitable for `eval_curve_linear`.
+
+    Accepts strings of the form `{"points": [[x, y], [x, y], ...]}`
+    where x and y are floats. Returns None on any parse / validation
+    failure — the sampler then treats this curve as disabled.
+
+    Behavior on parse:
+      * x and y are coerced to float; non-numeric entries reject the
+        whole curve.
+      * Points are sorted by x (ascending).
+      * First point's x is clamped to 0.0 and last to 1.0 so the
+        [0, 1] sample domain is always covered regardless of what the
+        user typed.
+      * At least 2 points required (one isn't a curve, it's a
+        constant — but we keep `eval_curve_linear`'s behavior simple
+        and reject the single-point case explicitly here).
+    """
+    if not spec:
+        return None
+    try:
+        data = json.loads(spec)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_points = data.get("points")
+    if not isinstance(raw_points, list) or len(raw_points) < 2:
+        return None
+    pts: list[tuple[float, float]] = []
+    for p in raw_points:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            return None
+        try:
+            pts.append((float(p[0]), float(p[1])))
+        except (TypeError, ValueError):
+            return None
+    pts.sort(key=lambda xy: xy[0])
+    # Clamp endpoints to cover [0, 1] exactly.
+    pts[0] = (0.0, pts[0][1])
+    pts[-1] = (1.0, pts[-1][1])
+    return pts
+
+
+def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
+    """Sample a piecewise-linear curve `pts` at position `t`.
+
+    `pts` must be a list of >= 2 (x, y) tuples with monotonic non-
+    decreasing x, x[0] == 0.0, x[-1] == 1.0 (as produced by
+    `parse_curve_spec`). `t` outside [0, 1] is clamped — we don't
+    extrapolate.
+    """
+    if t <= 0.0:
+        return pts[0][1]
+    if t >= 1.0:
+        return pts[-1][1]
+    # Bisect (small N — usually 2-10 points — linear scan is fine).
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if t <= x1:
+            if x1 == x0:
+                return y0
+            u = (t - x0) / (x1 - x0)
+            return y0 + (y1 - y0) * u
+    # Fall-through (shouldn't reach here given t < 1.0 check above).
+    return pts[-1][1]
+
+
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.12-no-audio-alloc"
+BUILD_MARKER = "v0.2.13-failover-curves"
+
+# Hosted-mode pod failover cap. When a hosted WS opens but never reaches
+# `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
+# session and re-queue for a DIFFERENT pod. 3 matches the rtmg-vst PR #4
+# value. Reset to 0 on successful `ready` or on Connect.
+MAX_FAILOVER_ATTEMPTS = 3
+
+# Manual-override grace window after the user moves a curve-bound param
+# by hand (in seconds). The curve yields for this long so the operator's
+# adjustment isn't immediately stomped on the next tick. Mirrors
+# demon-public-demo's `isManualOverrideActive` 500 ms.
+CURVE_OVERRIDE_SECONDS = 0.5
 
 # Hard upper bound on source-audio duration. DEMON rejects longer.
 MAX_SOURCE_SECONDS = 240
@@ -242,6 +328,14 @@ class DemonExt:
         self._extensions_used: int = 0
         self._playback_pos: int = 0  # samples
 
+        # Hosted-mode pod failover state. When a WS opens but never
+        # reaches `ready` (1011 keepalive, pod overloaded, VAE encode
+        # hang), we leave the dead session and re-queue for a different
+        # pod, up to MAX_FAILOVER_ATTEMPTS. Reset on Connect() and on
+        # the `ready` server message. Matches rtmg-vst PR #4 b2e1953.
+        self._saw_ready: bool = False
+        self._failover_attempts: int = 0
+
         # Auth
         self._api_key: str = ""
         self._device_id: str = ""        # populated by _load_auth (UUID4)
@@ -249,6 +343,24 @@ class DemonExt:
         # Param fanout
         self._dirty: dict[str, Any] = {}
         self._last_init_values: dict[str, Any] = {}
+
+        # Scheduled-curve state. Each entry tracks the parsed control
+        # points for a curve param (so we don't re-parse JSON every
+        # tick) keyed by the spec STRING — when the user edits the JSON,
+        # the cache key changes and we re-parse on next sample. Set in
+        # _sample_curves.
+        self._curve_cache: dict[str, list[tuple[float, float]] | None] = {}
+        # Per-wire-name "manual override active until" timestamp.
+        # When the user moves Denoise (or another schedulable param)
+        # directly, the curve yields for 500 ms so the user's
+        # adjustment isn't immediately stomped. Mirrors the web client's
+        # `isManualOverrideActive` window.
+        self._manual_override_until: dict[str, float] = {}
+        # Last value the curve sampler wrote into each wire param.
+        # OnParChange compares against this to distinguish a user-
+        # initiated change (manual override) from a curve-initiated
+        # change (no override).
+        self._last_curve_write: dict[str, float] = {}
 
         # LoRA catalog (mirrors the Table DAT)
         self._lora_ids: list[str] = []
@@ -399,6 +511,11 @@ class DemonExt:
                     pass
                 return False
 
+            # Reset failover + ready state so the new attempt starts
+            # from a clean slate.
+            self._saw_ready = False
+            self._failover_attempts = 0
+
             # --- Direct mode --------------------------------------------------
             if mode == "direct":
                 ws_url = self._http_to_ws(direct_url)
@@ -414,70 +531,178 @@ class DemonExt:
                 return True
 
             # --- Hosted mode --------------------------------------------------
-            self._write_par("Denyreason", "")
-            self._set_status("Joining queue...")
-            client = queue_mod.QueueClient(hosted_base, api_key=api_key)
+            return self._hosted_join_and_open(
+                base=hosted_base, api_key=api_key, is_retry=False)
+
+    def _handle_ws_close(self, reason: Any) -> None:
+        """Branching on WS close: friendly status + queue/leave for the
+        terminal case; failover dispatch for the pre-`ready` hosted
+        case.
+
+        Pre-`ready` close in hosted mode is the failover-eligible
+        signal — the pod opened a socket but never made it to the
+        application handshake, which is exactly the 1011-keepalive /
+        VAE-encode-hang / pod-overloaded scenario the VST handles. We
+        leave the dead session, increment the failover counter, and
+        ask `_drain_inbound` (via a `failover-tick` event marshalled
+        from a worker thread) to re-call `_hosted_join_and_open` on
+        the main thread.
+        """
+        mode = (self._read_par("Mode", "direct") or "direct").lower()
+        prev_sid = self._session_id
+
+        # Always release the dead queue session in hosted mode. (Cheap;
+        # fire-and-forget. The leave call itself is HTTP and fine to
+        # run on the main thread.)
+        base = self._read_par("Baseurl", "https://music.daydream.live")
+        api_key = self._api_key or None
+        if mode == "hosted" and prev_sid:
             try:
-                resp = client.join(device_id=self._device_id)
-            except queue_mod.QueueError as e:
-                self._set_status(f"Join failed: {e}")
-                self.log(f"Connect/join error: {e}")
-                return False
-
-            self._session_id = resp.session_id
-
-            poll_start = time.time()
-            while resp.status == "queued":
-                self._set_status(f"Queued (position {resp.position or '?'})")
-                self._write_par("Queueposition", resp.position or 0)
-                if time.time() - poll_start > 300:
-                    self._set_status("Queue timeout")
-                    return False
-                time.sleep(1.5)
-                try:
-                    resp = client.status(self._session_id or "")
-                except queue_mod.QueueError as e:
-                    self._set_status(f"Status poll failed: {e}")
-                    return False
-
-            if resp.status == "over_budget":
-                deny = resp.deny_reason or "(no reason)"
-                self._set_status(f"Paywall: {deny}")
-                self._write_par("Denyreason", deny)
-                return False
-
-            if resp.status != "active":
-                self._set_status(f"Unexpected status: {resp.status}")
-                return False
-
-            self._ws_url = resp.ws_url
-            self._expires_at_ms = resp.expires_at
-            self._extensions_used = resp.extensions_used or 0
+                queue_mod.QueueClient(
+                    base, api_key=api_key,
+                ).leave(prev_sid)
+            except queue_mod.QueueError:
+                pass
+            self._session_id = None
             self._write_par("Queueposition", 0)
-            if resp.expires_at:
-                now_ms = time.time() * 1000.0
-                self._write_par(
-                    "Expiresin",
-                    max(0.0, (resp.expires_at - now_ms) / 1000.0),
-                )
+            self._write_par("Expiresin", 0.0)
 
-            if not self._ws_url:
-                self._set_status("No wsUrl from server")
-                return False
+        # Failover decision: hosted + close-before-ready + room to retry.
+        if (mode == "hosted"
+                and not self._saw_ready
+                and self._failover_attempts < MAX_FAILOVER_ATTEMPTS):
+            self._failover_attempts += 1
+            self.log(
+                f"[failover] pod {self._failover_attempts}/"
+                f"{MAX_FAILOVER_ATTEMPTS} closed before ready "
+                f"({reason!r}); requeueing"
+            )
+            self._set_status(
+                f"Pod failover {self._failover_attempts}/"
+                f"{MAX_FAILOVER_ATTEMPTS} — closed before ready; "
+                f"will rejoin queue in 1.5s..."
+            )
 
-            # Fire-and-forget claim in parallel with WS open. Cancels the
-            # server-side reservation eviction so we don't race the WS
-            # handshake against it.
-            sid = self._session_id or ""
+            # 1.5 s backoff in a worker so we don't hammer the queue.
+            # The worker just sleeps and then marshals a
+            # `failover-tick` event back to the main thread; the
+            # actual queue/join + WS open runs on the main thread
+            # in `_drain_inbound`.
+            def _failover_worker(b=base, k=api_key):
+                try:
+                    time.sleep(1.5)
+                    self._inbound.put(("failover-tick", (b, k)))
+                except Exception as e:
+                    self.log(f"[failover] worker raised: {e}")
+
             threading.Thread(
-                target=lambda: client.claim(sid),
-                name=f"queue-claim-{sid[:8]}",
+                target=_failover_worker,
+                name=f"failover-{self._failover_attempts}",
                 daemon=True,
             ).start()
+            return
 
-            self._set_status(f"Connecting to hosted pod...")
-            self._open_ws(self._ws_url)
-            return True
+        # Terminal close: friendly status + (already-done) queue/leave.
+        friendly = self._friendly_close_reason(reason)
+        if (mode == "hosted"
+                and not self._saw_ready
+                and self._failover_attempts >= MAX_FAILOVER_ATTEMPTS):
+            # Failover budget exhausted — surface that explicitly.
+            self._set_status(
+                f"Pod failover exhausted ({MAX_FAILOVER_ATTEMPTS} tries). "
+                f"Try Connect again later or switch to Direct mode."
+            )
+        else:
+            self._set_status(f"Disconnected ({friendly})")
+
+    def _hosted_join_and_open(self, *, base: str, api_key: str | None,
+                              is_retry: bool) -> bool:
+        """Run the hosted-mode `/api/queue/join` → poll → open-WS flow.
+
+        Extracted from `Connect()` so the pod-failover path can call it
+        again on its own after a close-before-ready (without re-running
+        Connect's pre-flight or duplicating the queue/WS plumbing).
+
+        `is_retry=True` means we're being called by the failover path;
+        we keep the existing `_pending_audio` (so the second WS sends
+        the source on open without re-resolving PCM) and we don't reset
+        `_failover_attempts` (the close handler already incremented).
+
+        Returns True on successful WS-open dispatch (caller can rely on
+        the WS thread to fire on_open → flush → ready). False on any
+        queue-side failure (join refused, queued-timeout, paywall,
+        missing wsUrl). The caller updates Status; this method handles
+        only the queue plumbing.
+        """
+        self._write_par("Denyreason", "")
+        if is_retry:
+            self._set_status(
+                f"Pod failover {self._failover_attempts}/{MAX_FAILOVER_ATTEMPTS} — "
+                f"rejoining queue...")
+        else:
+            self._set_status("Joining queue...")
+        client = queue_mod.QueueClient(base, api_key=api_key)
+        try:
+            resp = client.join(device_id=self._device_id)
+        except queue_mod.QueueError as e:
+            self._set_status(f"Join failed: {e}")
+            self.log(f"_hosted_join_and_open: {e}")
+            return False
+
+        self._session_id = resp.session_id
+
+        poll_start = time.time()
+        while resp.status == "queued":
+            self._set_status(f"Queued (position {resp.position or '?'})")
+            self._write_par("Queueposition", resp.position or 0)
+            if time.time() - poll_start > 300:
+                self._set_status("Queue timeout")
+                return False
+            time.sleep(1.5)
+            try:
+                resp = client.status(self._session_id or "")
+            except queue_mod.QueueError as e:
+                self._set_status(f"Status poll failed: {e}")
+                return False
+
+        if resp.status == "over_budget":
+            deny = resp.deny_reason or "(no reason)"
+            self._set_status(f"Paywall: {deny}")
+            self._write_par("Denyreason", deny)
+            return False
+
+        if resp.status != "active":
+            self._set_status(f"Unexpected status: {resp.status}")
+            return False
+
+        self._ws_url = resp.ws_url
+        self._expires_at_ms = resp.expires_at
+        self._extensions_used = resp.extensions_used or 0
+        self._write_par("Queueposition", 0)
+        if resp.expires_at:
+            now_ms = time.time() * 1000.0
+            self._write_par(
+                "Expiresin",
+                max(0.0, (resp.expires_at - now_ms) / 1000.0),
+            )
+
+        if not self._ws_url:
+            self._set_status("No wsUrl from server")
+            return False
+
+        # Fire-and-forget claim in parallel with WS open. Cancels the
+        # server-side reservation eviction so we don't race the WS
+        # handshake against it.
+        sid = self._session_id or ""
+        threading.Thread(
+            target=lambda: client.claim(sid),
+            name=f"queue-claim-{sid[:8]}",
+            daemon=True,
+        ).start()
+
+        self._set_status("Connecting to hosted pod...")
+        self._open_ws(self._ws_url)
+        return True
 
     @staticmethod
     def _http_to_ws(url: str) -> str:
@@ -943,8 +1168,22 @@ class DemonExt:
         # 3. Continuous param -> batch
         if name in P.CONTINUOUS_PARAM_NAMES and schema.wire_name:
             value = self._coerce_par_value(par, schema)
+            # If this param is bound to a scheduled curve AND the new
+            # value differs from what the curve sampler just wrote, the
+            # user touched the slider manually. Trip the manual-override
+            # window so the curve yields for CURVE_OVERRIDE_SECONDS
+            # before stomping the user's adjustment.
+            wire_name = schema.wire_name
+            curve_value = self._last_curve_write.get(wire_name)
+            if curve_value is not None:
+                # If the values match (within float epsilon) it's a
+                # curve-initiated write echoing back through OnParChange
+                # — leave the override window alone.
+                if abs(value - curve_value) > 1e-6:
+                    self._manual_override_until[wire_name] = (
+                        time.monotonic() + CURVE_OVERRIDE_SECONDS)
             with self._lock:
-                self._dirty[schema.wire_name] = value
+                self._dirty[wire_name] = value
 
     def OnTick(self) -> None:
         """Called by tick8ms Timer CHOP every ~50ms (MAIN THREAD).
@@ -963,6 +1202,21 @@ class DemonExt:
         # 1. Drain inbound from WS thread FIRST so connect/open/text events
         #    process before any param sends try to use the connection.
         self._drain_inbound()
+
+        # 1a. Sample scheduled curves into _dirty so the params flush
+        #     below picks up the new values alongside any user-edited
+        #     params. Cheap (returns immediately if no curves enabled).
+        if self._connected:
+            try:
+                self._sample_curves()
+            except Exception as e:
+                # Curve sampling must never break the cook tick. Log
+                # once, then suppress.
+                if not getattr(self, "_curve_err_logged", False):
+                    self._curve_err_logged = True
+                    self.log(
+                        f"_sample_curves raised (suppressing further "
+                        f"logs): {type(e).__name__}: {e}")
 
         # Periodic ring-buffer telemetry (~2 s cadence). Gated behind Debug;
         # operationally not useful once we know the chain works.
@@ -1225,29 +1479,23 @@ class DemonExt:
                     code, reason = payload
                     self.log(f"[ws_client] closed code={code} reason={reason!r}")
                     self._connected = False
-                    friendly = self._friendly_close_reason(reason)
-                    self._set_status(f"Disconnected ({friendly})")
-                    # In hosted mode a handshake failure (502/503/504 from
-                    # the LB in front of the pod) means the session the
-                    # queue handed us is dead. Release it server-side so
-                    # the next Connect doesn't trip over a stale row.
-                    # Done inline rather than via Disconnect() because we
-                    # don't want to fire the WS-close path again or yank
-                    # speaker_out.
-                    sid = self._session_id
-                    mode = (self._read_par("Mode", "direct") or "direct").lower()
-                    if mode == "hosted" and sid:
-                        base = self._read_par(
-                            "Baseurl", "https://music.daydream.live")
-                        try:
-                            queue_mod.QueueClient(
-                                base, api_key=self._api_key or None,
-                            ).leave(sid)
-                        except queue_mod.QueueError:
-                            pass
-                        self._session_id = None
-                        self._write_par("Queueposition", 0)
-                        self._write_par("Expiresin", 0.0)
+                    self._handle_ws_close(reason)
+                elif kind == "failover-tick":
+                    # Failover worker (spawned by _handle_ws_close) is
+                    # back on the main thread asking us to re-call the
+                    # hosted-join flow with the same base + apiKey it
+                    # captured. payload is (base, api_key).
+                    base, api_key = payload
+                    ok = self._hosted_join_and_open(
+                        base=base, api_key=api_key, is_retry=True)
+                    if not ok:
+                        # Join refused / paywall / etc. — give up
+                        # rather than retry-stormulously. Status is
+                        # already set by _hosted_join_and_open.
+                        self.log(
+                            f"[failover] _hosted_join_and_open returned "
+                            f"False on retry {self._failover_attempts}; "
+                            f"stopping.")
             except Exception as e:
                 self.log(f"_drain_inbound({kind}) error: {type(e).__name__}: {e}")
 
@@ -1335,9 +1583,14 @@ class DemonExt:
             f"({self._pending_audio_samples / wire.SAMPLE_RATE:.2f}s) "
             f"from {self._pending_source_label}"
         )
-        # One-shot — clear so we don't double-send on reconnects.
+        # `_pending_config` is one-shot (server only takes one config
+        # per WS lifetime). `_pending_audio` is NOT cleared here — the
+        # pod-failover path may need to re-send the same source on the
+        # next WS open without re-resolving PCM. The `ready` handler
+        # clears `_pending_audio` once the server has acknowledged the
+        # session, which is the actual "we don't need this anymore"
+        # signal.
         self._pending_config = None
-        self._pending_audio = None
 
     def _convert_to_wav(self, src_path: str) -> str | None:
         """Convert any audio file to a 16-bit 48 kHz stereo WAV in a temp file.
@@ -1732,6 +1985,18 @@ class DemonExt:
             cat = data.get("lora_catalog") or []
             self._apply_lora_catalog(cat)
             self._seed_dirty_from_current_pars()
+            # Pod made it past handshake — failover path is no longer
+            # eligible. Reset the failover counters so a future
+            # close-after-ready is treated as a genuine disconnect
+            # (not "let's try another pod"), and drop _pending_audio
+            # since the server has it now. (We hold it across the WS
+            # cycle so failover retries can re-send without resolving
+            # PCM again — but once we've successfully reached `ready`
+            # there's no reason to keep it around.)
+            self._saw_ready = True
+            self._failover_attempts = 0
+            self._pending_audio = None
+            self._pending_audio_samples = 0
         elif kind == "lora_catalog":
             self._apply_lora_catalog(data.get("catalog") or [])
         elif kind == "params_update":
@@ -2241,6 +2506,93 @@ class DemonExt:
             if p.category == "init":
                 out[p.name] = self._read_par(p.name, p.default)
         return out
+
+    def _sample_curves(self) -> None:
+        """Sample every enabled scheduled curve at the loop playhead
+        and write the result into `_dirty`.
+
+        Cheap fast path: if the master `Schedulecurves` toggle is off
+        OR every per-curve enable is off, return without touching the
+        cache or the lock. Most ticks should hit this fast path.
+
+        For each enabled curve, the JSON spec is parsed lazily and
+        cached in `self._curve_cache` keyed by the SPEC STRING — so
+        editing the JSON invalidates the cache automatically (next
+        tick sees a different key, re-parses). Bad JSON is cached as
+        None so we don't spam errors every tick.
+
+        Sample position: `t = (ring.position / ring.frames) % 1.0`,
+        the same playhead we already report to the server in
+        `playback_pos`. Pre-`ready`, ring.frames == 0; we skip those
+        ticks because there's no buffer to wrap around yet.
+
+        Manual override: if the user moved a curve-bound base param
+        within the last `CURVE_OVERRIDE_SECONDS`, the curve yields for
+        that param — we don't overwrite their adjustment. Reset when
+        the override window elapses.
+        """
+        if not bool(self._read_par("Schedulecurves", False)):
+            return
+        # Need a live loop buffer for the playhead position.
+        frames = self._ring.frames
+        if frames <= 0:
+            return
+        pos = self._ring.position
+        t = (pos % frames) / frames if frames > 0 else 0.0
+        now = time.monotonic()
+
+        # Iterate the static binding map (4 curves; cheap).
+        for curve_par_name, (base_par_name, enable_par_name) in (
+                P.CURVE_PARAM_BINDINGS.items()):
+            if not bool(self._read_par(enable_par_name, False)):
+                continue
+            base_schema = P.PARAM_BY_NAME.get(base_par_name)
+            if base_schema is None or not base_schema.wire_name:
+                continue
+            wire_name = base_schema.wire_name
+
+            # Manual override gate.
+            override_until = self._manual_override_until.get(wire_name, 0.0)
+            if now < override_until:
+                continue
+
+            spec = self._read_par(curve_par_name, "") or ""
+            # Cache hit by spec STRING — if the user edits the JSON,
+            # the key changes and we re-parse next tick.
+            cached_key = f"{curve_par_name}::{spec}"
+            if cached_key not in self._curve_cache:
+                self._curve_cache[cached_key] = parse_curve_spec(spec)
+                # Cap cache growth (e.g., user scrubs the JSON a lot).
+                if len(self._curve_cache) > 64:
+                    # Drop the oldest entry (dicts preserve insert order).
+                    self._curve_cache.pop(next(iter(self._curve_cache)))
+            pts = self._curve_cache[cached_key]
+            if pts is None:
+                continue
+
+            # Sample → map [0,1] to base param's [min, max].
+            y_norm = eval_curve_linear(pts, t)
+            lo = float(base_schema.min if base_schema.min is not None else 0.0)
+            hi = float(base_schema.max if base_schema.max is not None else 1.0)
+            value = lo + y_norm * (hi - lo)
+
+            # Write into _dirty for the next params flush AND into
+            # the underlying TD par so the user sees the slider move.
+            # The TD par write fires OnParChange, which would normally
+            # trigger the manual-override window; we set
+            # `_last_curve_write[wire_name] = value` first so
+            # OnParChange recognizes the echo and skips the override.
+            self._last_curve_write[wire_name] = value
+            with self._lock:
+                self._dirty[wire_name] = value
+            try:
+                par = self._par_by_name(base_par_name)
+                if par is not None:
+                    par.val = value
+            except Exception:
+                # par write failure isn't fatal — the wire value is
+                # already in _dirty.
+                pass
 
     def _seed_dirty_from_current_pars(self) -> None:
         """Populate self._dirty with EVERY continuous-param's current value.
