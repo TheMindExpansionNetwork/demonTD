@@ -2,6 +2,69 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.3] — 2026-05-29
+
+**Stop the disconnects.** User report from in-the-wild testing:
+demonTD disconnects a lot, especially when messing with prompts and
+LoRAs. Hot-path audit against the web client's `useParamSync.ts`
+revealed three continuous-param wire keys whose engine handler is
+NOT the generic `params` route — sending them inside a `params` raw
+dict gets the WS closed by the server.
+
+### Bugs fixed
+
+1. **`prompt_blend` / `timbre_strength` / `lora_blend` were sent in
+   `params` raw dict.** The web client explicitly deletes all three
+   before calling `sendParams()`:
+   - `prompt_blend` rides on `set_prompt_blend` (its own WS message).
+   - `timbre_strength` rides on `set_timbre_strength`.
+   - `lora_blend` is UI-only — the engine doesn't recognize it
+     (web client uses it to fan out into per-LoRA strengths).
+
+   demonTD sent all three on every params flush, which the server
+   either rejected outright or closed the WS on. This was the
+   "disconnects when messing with prompts / LoRAs" cause.
+
+2. **`lora_str_<id>` was sent for non-enabled LoRAs.** Web client's
+   `useParamSync.ts` only includes strengths for LoRAs in
+   `lora.enabled` (line 61). demonTD was sending strengths for every
+   LoRA with a UI slider, including disabled ones. Server-side
+   strength application for unloaded LoRAs is undefined behavior,
+   sometimes a close.
+
+3. **`SessionConfig.lora_strengths` included disabled LoRAs.** Same
+   mismatch with `useStartSession.ts` `buildConfig()` — that loop
+   only emits strengths for enabled LoRAs.
+
+### Changes
+
+* New `_PARAMS_NOT_FOR_WIRE = {prompt_blend, timbre_strength,
+  lora_blend}` set + `_filter_params_for_wire(raw)` helper that
+  strips those three keys AND drops `lora_str_<id>` for non-enabled
+  LoRAs. Applied at every `encode_params` call site (OnTick flush,
+  frame_exec flush, `SetParam`, `SetParams`).
+* `OnParChange` for the three special params now routes to the
+  dedicated WS message instead of `_dirty`. Moving the Prompt Blend
+  slider sends `set_prompt_blend` directly; moving Timbre Strength
+  sends `set_timbre_strength` directly. `Lorablend` logs a one-shot
+  warning that it's UI-only.
+* `_seed_dirty_from_current_pars` (runs on `ready`) special-cases
+  the same three: sends `set_prompt_blend` / `set_timbre_strength`
+  via dedicated messages so the server has the initial values
+  immediately, AND skips them from the `_dirty` seed.
+* `_lora_strengths()` (used by `_build_session_config`) now filters
+  to enabled LoRAs only, matching the web client.
+
+### Tests
+
+Full pytest sweep: 65 passed, 1 skipped (zstd round-trip needs the
+zstandard package). No new tests needed — the bugs are wire-level
+behavior whose fix is "stop including these keys"; pytest can't
+exercise the live server response, only the encoders themselves
+(which are unchanged and still tested in `test_wire.py`).
+
+BUILD_MARKER bumped to v0.2.14-params-filter.
+
 ## [0.2.2] — 2026-05-29
 
 Two features pulled from the latest `rtmg-vst` PR (commit `b2e1953`):

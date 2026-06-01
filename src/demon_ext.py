@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.13-failover-curves"
+BUILD_MARKER = "v0.2.14-params-filter"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -968,13 +968,23 @@ class DemonExt:
         8ms batch. Use for events you want immediate response on.
 
         name : either a TD par name (e.g. 'Denoise') or a wire name (e.g. 'denoise')
+
+        Note: callers should NOT use this for `prompt_blend` / `timbre_strength`
+        / `lora_blend` (the server's params handler rejects them). Use
+        SetPromptBlend / SetTimbreStrength / etc. for those.
         """
         wire_name = self._resolve_wire_name(name)
         if not wire_name:
             self.log(f"SetParam: unknown param {name}")
             return
+        raw = self._filter_params_for_wire({wire_name: value})
+        if not raw:
+            self.log(
+                f"SetParam: {wire_name!r} is server-rejected on params; "
+                f"use the dedicated message instead.")
+            return
         playback_sec = self._playback_pos / wire.SAMPLE_RATE
-        self._send_text(wire.encode_params({wire_name: value}, playback_sec))
+        self._send_text(wire.encode_params(raw, playback_sec))
 
     def SetParams(self, d: dict[str, Any]) -> None:
         """Batch send a dict of param values (mixed TD-names and wire-names)."""
@@ -983,6 +993,7 @@ class DemonExt:
             wn = self._resolve_wire_name(k)
             if wn:
                 raw[wn] = v
+        raw = self._filter_params_for_wire(raw)
         if raw:
             playback_sec = self._playback_pos / wire.SAMPLE_RATE
             self._send_text(wire.encode_params(raw, playback_sec))
@@ -1168,12 +1179,50 @@ class DemonExt:
         # 3. Continuous param -> batch
         if name in P.CONTINUOUS_PARAM_NAMES and schema.wire_name:
             value = self._coerce_par_value(par, schema)
+            wire_name = schema.wire_name
+
+            # Special-case the three params whose engine handler isn't
+            # the generic `params` route — each has a dedicated WS
+            # message. Sending them inside a `params` raw dict gets the
+            # WS closed (the empirical "disconnects when messing with
+            # prompts and LoRAs" failure mode). Source: web client's
+            # useParamSync.ts deletes the same three from `raw` before
+            # sending.
+            if wire_name == "prompt_blend":
+                if self._connected:
+                    try:
+                        self._send_text(
+                            wire.encode_set_prompt_blend(float(value)))
+                    except Exception as e:
+                        self.log(f"set_prompt_blend send failed: {e}")
+                return
+            if wire_name == "timbre_strength":
+                if self._connected:
+                    try:
+                        self._send_text(
+                            wire.encode_set_timbre_strength(float(value)))
+                    except Exception as e:
+                        self.log(f"set_timbre_strength send failed: {e}")
+                return
+            if wire_name == "lora_blend":
+                # UI-only knob in the web client too — it fans out into
+                # per-LoRA strengths via useEdgeLoraBinding. We haven't
+                # implemented that fan-out yet; the slider exists but
+                # does nothing on the wire until we do. Log once so
+                # users aren't confused, then suppress.
+                if not getattr(self, "_lora_blend_warned", False):
+                    self._lora_blend_warned = True
+                    self.log(
+                        "Lorablend slider is UI-only — engine doesn't "
+                        "accept `lora_blend` as a params key. Move the "
+                        "per-LoRA strength sliders directly instead.")
+                return
+
             # If this param is bound to a scheduled curve AND the new
             # value differs from what the curve sampler just wrote, the
             # user touched the slider manually. Trip the manual-override
             # window so the curve yields for CURVE_OVERRIDE_SECONDS
             # before stomping the user's adjustment.
-            wire_name = schema.wire_name
             curve_value = self._last_curve_write.get(wire_name)
             if curve_value is not None:
                 # If the values match (within float epsilon) it's a
@@ -1268,6 +1317,14 @@ class DemonExt:
                 return
             raw = dict(self._dirty)
             self._dirty.clear()
+
+        # Strip wire keys the server's params handler rejects + drop
+        # lora_str_<id> for non-enabled LoRAs. Skips the send entirely
+        # if everything left is filtered out (cheaper than a no-op
+        # params message).
+        raw = self._filter_params_for_wire(raw)
+        if not raw:
+            return
 
         # Use the loop buffer's actual read position (in seconds) as
         # playback_pos. Mirrors demon-public-demo's session.player.positionSec.
@@ -1511,6 +1568,10 @@ class DemonExt:
             last_send = getattr(self, "_last_params_send", 0.0)
             elapsed = now - last_send
             if elapsed > 0.008 or raw:
+                # Strip server-rejected keys (prompt_blend, timbre_strength,
+                # lora_blend — each has a dedicated WS message) + drop
+                # lora_str_<id> for non-enabled LoRAs.
+                raw = self._filter_params_for_wire(raw)
                 # playback_sec mirrors demon-public-demo's positionSec:
                 # the loop buffer's current read head, in seconds.
                 playback_sec = self._ring.position / wire.SAMPLE_RATE
@@ -1957,12 +2018,62 @@ class DemonExt:
         return out
 
     def _lora_strengths(self) -> dict[str, float]:
+        """Read LoRA strengths to send in the SessionConfig handshake.
+
+        Only includes ENABLED LoRAs — matches demon-public-demo's
+        useStartSession.ts `buildConfig()`:
+            for (const id of enabledLoras) {
+                const v = lora.strengths[id];
+                if (typeof v === "number") loraStrengths[id] = v;
+            }
+        Sending strengths for LoRAs the server hasn't loaded was causing
+        disconnects (server-side state mismatch on `params` apply).
+        """
         out: dict[str, float] = {}
+        enabled = set(self._enabled_loras())
         for lora_id in self._lora_ids:
+            if lora_id not in enabled:
+                continue
             safe = self._lora_par_safe(lora_id)
             par = self._par_by_name(f"Lorastr{safe}")
             if par:
                 out[lora_id] = float(par.eval())
+        return out
+
+    # Continuous-param wire keys the server's `params` handler does NOT
+    # accept. Each has a dedicated WS message instead:
+    #   prompt_blend     -> set_prompt_blend
+    #   timbre_strength  -> set_timbre_strength
+    #   lora_blend       -> UI-only (fans out into lora_str_<id>; the
+    #                       engine itself doesn't know `lora_blend`).
+    # Sending any of these in a `params` raw dict caused the server to
+    # close the WS — empirically the cause of the "disconnects when
+    # messing with prompts and LoRAs" reports.
+    # Source: demon-public-demo/vendor/demon-ui/hooks/useParamSync.ts
+    # lines 42–53.
+    _PARAMS_NOT_FOR_WIRE = frozenset({
+        "prompt_blend", "timbre_strength", "lora_blend",
+    })
+
+    def _filter_params_for_wire(
+            self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Strip wire keys the server's `params` handler rejects, and
+        drop `lora_str_<id>` entries for non-enabled LoRAs.
+
+        Returns a NEW dict — callers may pass a snapshot of `_dirty`
+        without worrying about mutation. Allocates only one dict + one
+        set; not in the audio hot path so the cost is negligible.
+        """
+        enabled = set(self._enabled_loras())
+        out: dict[str, Any] = {}
+        for k, v in raw.items():
+            if k in self._PARAMS_NOT_FOR_WIRE:
+                continue
+            if k.startswith("lora_str_"):
+                lora_id = k[len("lora_str_"):]
+                if lora_id not in enabled:
+                    continue
+            out[k] = v
         return out
 
     # -------- WS message handlers --------------------------------------------
@@ -2603,8 +2714,18 @@ class DemonExt:
         touched denoise". After this call, the next OnTick sends a full
         params message containing the user's current UI values, and the
         server starts generating immediately.
+
+        Three continuous wire keys are special-cased OUT of the
+        _dirty path:
+          * prompt_blend     -> sent via encode_set_prompt_blend
+          * timbre_strength  -> sent via encode_set_timbre_strength
+          * lora_blend       -> UI-only (no engine equivalent)
+        Putting these into the `params` raw dict gets the WS closed by
+        the server, which was the empirical cause of disconnects users
+        hit when fiddling with prompts / LoRAs.
         """
         seeded = 0
+        dedicated_sends: list[tuple[str, float]] = []
         with self._lock:
             for p in P.PARAMS:
                 if p.category != "continuous" or not p.wire_name:
@@ -2616,9 +2737,27 @@ class DemonExt:
                     value = self._coerce_par_value(par, p)
                 except Exception:
                     continue
-                self._dirty[p.wire_name] = value
+                wn = p.wire_name
+                if wn in self._PARAMS_NOT_FOR_WIRE:
+                    if wn in ("prompt_blend", "timbre_strength"):
+                        dedicated_sends.append((wn, float(value)))
+                    # lora_blend: UI-only, no engine route, skip.
+                    continue
+                self._dirty[wn] = value
                 seeded += 1
-        self.log(f"seeded {seeded} continuous params into _dirty for first tick")
+        # Fire the dedicated messages outside the lock so we don't hold
+        # it during _send_text.
+        for wn, value in dedicated_sends:
+            try:
+                if wn == "prompt_blend":
+                    self._send_text(wire.encode_set_prompt_blend(value))
+                elif wn == "timbre_strength":
+                    self._send_text(wire.encode_set_timbre_strength(value))
+            except Exception as e:
+                self.log(f"seed {wn} send failed: {e}")
+        self.log(
+            f"seeded {seeded} continuous params into _dirty for first tick"
+            f" (+{len(dedicated_sends)} dedicated)")
 
     # -------- TD plumbing ----------------------------------------------------
 
