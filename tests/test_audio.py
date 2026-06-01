@@ -192,6 +192,45 @@ def test_loop_buffer_swap_replaces_loop():
     np.testing.assert_array_equal(lb.read(5)[0], [100, 101, 102, 103, 104])
 
 
+# ---- slice-coverage tracking -----------------------------------------------
+
+def test_loop_buffer_coverage_fraction_init_zero():
+    """A fresh init() means no slices have been patched yet, so
+    coverage is 0%. After mark_patched covers the whole loop, it's
+    100%."""
+    lb = audio_mod.LoopBuffer(channels=2, sample_rate=48000)
+    lb.init(np.zeros((2, 48000 * 3), dtype=np.float32))  # 3 s loop
+    assert lb.coverage_fraction() == 0.0
+    # Mark every frame patched.
+    lb.mark_patched(0, lb.frames)
+    assert lb.coverage_fraction() == 1.0
+
+
+def test_loop_buffer_mark_patched_basic():
+    """Marking a sub-range should flip the chunks overlapped by that
+    range, and is_patched_at reflects per-frame lookup."""
+    lb = audio_mod.LoopBuffer(channels=1, sample_rate=48000)
+    # 5 s loop → 5 coverage chunks of 48000 frames each.
+    lb.init(np.zeros((1, 48000 * 5), dtype=np.float32))
+    assert lb.coverage_fraction() == 0.0
+    # Patch frames inside chunk 2 only.
+    lb.mark_patched(48000 * 2 + 100, 50)
+    assert lb.is_patched_at(48000 * 2 + 100) is True
+    assert lb.is_patched_at(48000 * 1) is False
+    assert lb.is_patched_at(48000 * 3) is False
+    # 1 of 5 chunks patched.
+    assert abs(lb.coverage_fraction() - 0.2) < 1e-6
+    # Patch across chunks 3 + 4 with a wrap-around range (start near the
+    # end, length crosses the loop boundary).
+    lb.mark_patched(48000 * 4 + 1000, 48000)  # spans last bit of c4 + into wrap
+    # Now chunk 4 + chunk 0 should be marked.
+    assert lb.is_patched_at(48000 * 4 + 1000) is True
+    assert lb.is_patched_at(100) is True
+    # Chunks 1 and 3 still un-patched.
+    assert lb.is_patched_at(48000 * 1) is False
+    assert lb.is_patched_at(48000 * 3) is False
+
+
 def test_linear_resample_passthrough_when_equal_rate():
     pcm = np.array([[1, 2, 3, 4]], dtype=np.float32)
     out = audio_mod.linear_resample(pcm, 48000, 48000)

@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.14-params-filter"
+BUILD_MARKER = "v0.2.15-lora-toggle"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -1128,6 +1128,50 @@ class DemonExt:
           - session/local par -> ignored
         """
         name = par.name
+
+        # Dynamic LoRA pars (created in _apply_lora_catalog, not in
+        # PARAMS) — handle them BEFORE the schema lookup since they'd
+        # otherwise fall into the `if not schema: return` early-out and
+        # the user's toggle would never reach the wire. Pattern-match
+        # by name prefix and look up the original LoRA id in the
+        # _lora_par_to_id reverse map that _apply_lora_catalog
+        # maintains.
+        lora_par_map = getattr(self, "_lora_par_to_id", None) or {}
+        if name in lora_par_map:
+            lora_id = lora_par_map[name]
+            try:
+                if name.startswith("Loraenable"):
+                    on = bool(par.eval())
+                    if on:
+                        # Read the matching strength so the server
+                        # loads the LoRA at the user's chosen weight,
+                        # not the default 1.0.
+                        safe = self._lora_par_safe(lora_id)
+                        sp = self._par_by_name(f"Lorastr{safe}")
+                        strength = float(sp.eval()) if sp is not None else 1.0
+                        if self._connected:
+                            self._send_text(wire.encode_enable_lora(
+                                lora_id, strength=strength))
+                            self.log(
+                                f"enable_lora({lora_id!r}, strength={strength})")
+                    else:
+                        if self._connected:
+                            self._send_text(wire.encode_disable_lora(lora_id))
+                            self.log(f"disable_lora({lora_id!r})")
+                elif name.startswith("Lorastr"):
+                    # Strength change. Only forward if the LoRA is
+                    # currently enabled; otherwise the filter would
+                    # strip it from the params message anyway and the
+                    # server would have no LoRA to apply it to.
+                    enabled_set = set(self._enabled_loras())
+                    if lora_id in enabled_set:
+                        value = float(par.eval())
+                        with self._lock:
+                            self._dirty[f"lora_str_{lora_id}"] = value
+            except Exception as e:
+                self.log(f"OnParChange({name}) lora-route raised: {e}")
+            return
+
         schema = P.PARAM_BY_NAME.get(name)
         if not schema:
             return
@@ -1305,6 +1349,34 @@ class DemonExt:
                         f"max={stats['max_ms']:.2f}ms "
                         f"underruns_total={stats['underruns_total']}{warn}"
                     )
+
+        # Slice-coverage telemetry. Diagnostic for the "random source
+        # flashes during playback" reports. If coverage stays below
+        # 100% for long stretches AND the playhead is reading from
+        # un-patched chunks at the moment the user hears a flash, the
+        # server simply isn't keeping every region of the loop fresh —
+        # that's a server-side scheduler concern, but we'll know.
+        if self._debug_enabled and self._connected:
+            now = time.time()
+            last_cov = getattr(self, "_last_cov_log", 0.0)
+            if now - last_cov > 1.0:
+                self._last_cov_log = now
+                try:
+                    pct = self._ring.coverage_fraction() * 100.0
+                    pos = self._ring.position
+                    in_patched = self._ring.is_patched_at(pos)
+                    pos_s = pos / wire.SAMPLE_RATE
+                    n_slices = getattr(self, "_n_binary_frames", 0)
+                    self.log(
+                        f"[coverage] {pct:.1f}% patched "
+                        f"(slices_recv={n_slices}) "
+                        f"playhead@{pos_s:.1f}s "
+                        f"in_patched={in_patched}"
+                    )
+                except Exception as e:
+                    if not getattr(self, "_cov_log_err_done", False):
+                        self._cov_log_err_done = True
+                        self.log(f"coverage telemetry raised: {e}")
 
         if not self._connected:
             return
@@ -1628,7 +1700,10 @@ class DemonExt:
         self._playback_pos = 0
         self._n_binary_frames = 0
         self._n_cook_recv = 0
-        self._auto_enable_done = False
+        # `_auto_enable_done` was the gate for the v0.1.x bach
+        # auto-enable. v0.2.4 removed that — user LoRA toggles are now
+        # the source of truth via SessionConfig.enabled_loras. No reset
+        # needed.
         self._lora_catalog_sig = None
         self.log("_flush_pending: sending config + audio")
         try:
@@ -2352,6 +2427,13 @@ class DemonExt:
         else:
             self._ring.patch(slice_.start_sample, slice_.pcm[: n * ch])
 
+        # Slice-coverage telemetry: flag every loop chunk this slice
+        # touched as patched-at-least-once. The OnTick Debug telemetry
+        # block surfaces the running coverage % and whether the
+        # playhead is currently inside an un-patched chunk — diagnostic
+        # for "random source flashes during playback" reports.
+        self._ring.mark_patched(slice_.start_sample, n)
+
     # -------- LoRA catalog ---------------------------------------------------
 
     def _apply_lora_catalog(self, catalog: list[dict]) -> None:
@@ -2391,7 +2473,22 @@ class DemonExt:
         #
         # NOTE: appendToggle/appendFloat return a ParGroup whose truthiness
         # is unsupported in TD — must check `is not None` not `if tp:`.
-        DEFAULT_ON = {"bach"}  # LoRAs to enable by default
+        #
+        # No DEFAULT_ON / auto-enable in v0.2.4+. The user's saved
+        # `Loraenable<id>` toggle values (TD persists custom pars in the
+        # .toe) are the source of truth — they flow into
+        # SessionConfig.enabled_loras via _enabled_loras() at Connect
+        # time, and the server loads exactly those LoRAs. Separately
+        # firing enable_lora during catalog refresh was overriding the
+        # user's choice every connect (the "still getting bach-sounding
+        # stuff even though jazz is on" bug).
+
+        # Reverse map for OnParChange: par-name -> original LoRA id.
+        # Both the Loraenable<safe> toggle and the Lorastr<safe>
+        # strength fader resolve to the same id. Rebuilt fresh every
+        # catalog refresh so stale entries from a removed LoRA can't
+        # haunt us.
+        self._lora_par_to_id = {}
 
         try:
             page = self._page_by_name("Prompt+LoRA")
@@ -2407,7 +2504,11 @@ class DemonExt:
                 safe = self._lora_par_safe(lid)
                 toggle_name = f"Loraenable{safe}"
                 strength_name = f"Lorastr{safe}"
-                default_on = lid in DEFAULT_ON
+                # Wire both forms of the par name back to the original
+                # LoRA id so OnParChange can route by name prefix
+                # without having to re-sanitize.
+                self._lora_par_to_id[toggle_name] = lid
+                self._lora_par_to_id[strength_name] = lid
 
                 if toggle_name not in existing:
                     try:
@@ -2417,8 +2518,12 @@ class DemonExt:
                         )
                         if tp is not None:
                             try:
-                                tp[0].default = default_on
-                                tp[0].val = default_on
+                                # All new toggles default to OFF. User
+                                # opts-in per LoRA; this is the only way
+                                # to consistently respect user choice
+                                # across sessions.
+                                tp[0].default = False
+                                tp[0].val = False
                             except Exception:
                                 pass
                         n_added += 1
@@ -2438,15 +2543,13 @@ class DemonExt:
                                 sp[0].normMax = 1.8
                                 sp[0].clampMin = True
                                 sp[0].clampMax = True
-                                # Default strength: 1.0 for any DEFAULT_ON LoRA
-                                # (the server occasionally reports strength=0
-                                # before the LoRA is loaded, which would
-                                # otherwise leave the par at 0). For other
-                                # LoRAs, honor the server's reported default.
-                                if default_on:
-                                    default_strength = 1.0
-                                else:
-                                    default_strength = float(entry.get("strength", 1.0))
+                                # Honor the catalog's reported strength,
+                                # falling back to 1.0. The server's
+                                # "strength 0 before loaded" quirk no
+                                # longer matters since we send strength
+                                # explicitly with each enable_lora.
+                                default_strength = float(
+                                    entry.get("strength", 1.0))
                                 sp[0].default = default_strength
                                 sp[0].val = default_strength
                             except Exception:
@@ -2457,24 +2560,6 @@ class DemonExt:
                                  f"{type(e).__name__}: {e}")
             self.log(f"LoRA page: added {n_added} pars for "
                      f"{len(catalog)} LoRAs")
-
-            # Auto-enable default-on LoRAs ONCE per session. The server
-            # echoes a new lora_catalog every time we send enable_lora,
-            # which re-triggers this handler — so a naive re-enable loops
-            # forever, blocking the recv thread and starving audio slices.
-            if not getattr(self, "_auto_enable_done", False):
-                self._auto_enable_done = True
-                for entry in catalog:
-                    lid = entry.get("id", "")
-                    if lid in DEFAULT_ON:
-                        # Server-reported strength may be 0 before the LoRA
-                        # is loaded — always send 1.0 for default-on LoRAs.
-                        strength = 1.0
-                        try:
-                            self._send_text(wire.encode_enable_lora(lid, strength))
-                            self.log(f"auto-enabled LoRA {lid} (strength {strength})")
-                        except Exception as e:
-                            self.log(f"auto-enable {lid} failed: {e}")
         except Exception as e:
             self.log(f"LoRA page update failed: {type(e).__name__}: {e}")
 

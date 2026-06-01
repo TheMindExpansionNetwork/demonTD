@@ -2,6 +2,84 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.4] — 2026-05-29
+
+LoRA toggle propagation finally works, and slice-coverage telemetry
+lands as a diagnostic for the "random source flashes during playback"
+reports.
+
+### LoRA bug
+
+User report: "I changed loras, I'm still getting bach-sounding stuff
+even though jazz lora is on". Three concrete defects:
+
+1. **`Loraenable<id>` toggles fired no wire message.** Dynamic pars
+   added by `_apply_lora_catalog` aren't in `P.PARAMS`, so
+   `OnParChange` hit `if not schema: return` and the user's toggle
+   never reached the server.
+2. **Hardcoded `DEFAULT_ON = {"bach"}` auto-enable** ran on every
+   fresh `_apply_lora_catalog` call (i.e. every Connect), force-
+   enabling bach regardless of the user's `Loraenablebach` par.
+3. **`Lorastr<id>` strength changes silently dropped** for LoRAs the
+   server hadn't loaded (filtered out by v0.2.3's
+   `_filter_params_for_wire`), and #1 meant the toggle could never
+   actually enable the LoRA in the first place.
+
+### Fix
+
+* **`OnParChange` routes dynamic LoRA pars BEFORE the schema lookup**
+  via a `_lora_par_to_id` reverse map (built in `_apply_lora_catalog`).
+  Flipping `Loraenable<safe>` on → sends `enable_lora(id, current_strength)`.
+  Flipping it off → sends `disable_lora(id)`. Moving `Lorastr<safe>`
+  while the LoRA is enabled → drops `lora_str_<id>` into `_dirty` for
+  the next params flush.
+* **Removed the `DEFAULT_ON = {"bach"}` auto-enable entirely.** The
+  user's saved `Loraenable<id>` toggles already flow through
+  `SessionConfig.enabled_loras` at handshake time — that's the server's
+  source of truth. Forcing a separate `enable_lora` post-catalog was
+  just overriding the user's choice. New LoRA toggles default to OFF;
+  user opts in per-LoRA.
+* Removed the now-dead `_auto_enable_done = False` reset in
+  `_flush_pending`.
+
+### Slice-coverage telemetry
+
+Bug #1 from the same report: "once-in-a-while cutovers to original
+song during playback", random cadence. Suggests slice arrival jitter
+— the server doesn't keep every region of the loop patched at all
+times, and the playhead occasionally enters un-patched regions
+(which contain the original source audio until a slice replaces
+them).
+
+To diagnose, `LoopBuffer` gains a slice-coverage bitmap:
+
+* `_patched_chunks` — one `bool` per ~1 s chunk of the loop. Flipped
+  to True the first time a slice patches that chunk. Cheap (< 100 B
+  for typical loops), allocation-free in steady state.
+* New methods: `mark_patched(start, n)`, `coverage_fraction()`,
+  `is_patched_at(frame)`.
+* `_on_binary` slice path calls `mark_patched()` after each
+  `patch` / `add_delta`.
+* `OnTick` (Debug-gated) emits one line per second:
+  ```
+  [coverage] 87.5% patched (slices_recv=341) playhead@5.3s in_patched=True
+  ```
+
+If a flash correlates with `in_patched=False` or persistent < 100%
+coverage, we have actionable evidence to either silence un-patched
+regions or surface the issue upstream. No behavior change yet — this
+commit just instruments.
+
+### Tests
+
+* `tests/test_audio.py`: 2 new tests for the coverage bitmap
+  (`test_loop_buffer_coverage_fraction_init_zero`,
+  `test_loop_buffer_mark_patched_basic`). 67/67 audio + curve + wire +
+  queue tests pass.
+* Drift script: exit 0 against `demon-public-demo @ f2be73b`.
+
+BUILD_MARKER bumped to v0.2.15-lora-toggle.
+
 ## [0.2.3] — 2026-05-29
 
 **Stop the disconnects.** User report from in-the-wild testing:

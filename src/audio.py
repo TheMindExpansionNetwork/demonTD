@@ -56,6 +56,16 @@ class LoopBuffer:
         self._frames: int = 0
         self._position: int = 0  # next read frame
         self._lock = threading.Lock()
+        # Slice-coverage tracking (diagnostic for the "random source
+        # flashes during playback" reports). One bool per ~1s chunk of
+        # the loop; flipped to True the first time a slice patches that
+        # chunk. Cheap (< 100 bytes for typical loops) and allocation-
+        # free in steady state. demon_ext.py reads
+        # `coverage_fraction()` + `is_patched_at()` from the OnTick
+        # telemetry block (Debug-gated) to surface whether the
+        # playhead is ever reading an un-patched region.
+        self._coverage_chunk_frames: int = int(self._sample_rate)  # 1 s
+        self._patched_chunks: np.ndarray | None = None
         # Pre-allocated scratch for the seam crossfade weights. Each seam
         # span needs a (1.0 - t_vals) and t_vals coefficient array. Both
         # are derived from a single ramp [0, 1/seam, 2/seam, ..., (seam-1)/seam]
@@ -121,6 +131,73 @@ class LoopBuffer:
             self._buffer = None
             self._frames = 0
             self._position = 0
+            # Coverage bitmap is sized to the loop; once the loop is
+            # gone there's nothing to track. The next `init()` recreates
+            # it at the new size.
+            self._patched_chunks = None
+
+    # -------- slice-coverage tracking ----------------------------------------
+
+    def mark_patched(self, start_frame: int, num_frames: int) -> None:
+        """Flag every coverage chunk overlapped by [start_frame,
+        start_frame + num_frames) as patched-at-least-once.
+
+        Called by demon_ext._on_binary right after `patch` / `add_delta`.
+        Wraps across the end of the loop the same way patch() does so
+        a slice that straddles the wrap correctly marks both halves.
+        """
+        if num_frames <= 0:
+            return
+        # Read these without the lock — they're set atomically by
+        # init() and never partially written. We snapshot to locals
+        # so even if init() races, we use a consistent view.
+        chunks = self._patched_chunks
+        if chunks is None:
+            return
+        frames = self._frames
+        if frames <= 0:
+            return
+        cs = self._coverage_chunk_frames
+        start = start_frame % frames
+        end = start + num_frames
+        # First-chunk to last-chunk indices (inclusive). The bitmap is
+        # small enough that assignment is essentially free.
+        if end <= frames:
+            i0 = start // cs
+            i1 = (end - 1) // cs
+            chunks[i0:i1 + 1] = True
+        else:
+            # Wraps. Mark [start..frames) then [0..end-frames).
+            i0 = start // cs
+            i1 = (frames - 1) // cs
+            chunks[i0:i1 + 1] = True
+            rem = end - frames
+            j0 = 0
+            j1 = (rem - 1) // cs
+            chunks[j0:j1 + 1] = True
+
+    def coverage_fraction(self) -> float:
+        """Fraction of the loop that has been patched at least once.
+        Returns 0.0 on an uninitialized buffer."""
+        chunks = self._patched_chunks
+        if chunks is None or chunks.size == 0:
+            return 0.0
+        return float(chunks.sum()) / float(chunks.size)
+
+    def is_patched_at(self, frame: int) -> bool:
+        """True iff `frame`'s coverage chunk has been patched at least
+        once. False for an uninitialized buffer or an out-of-range
+        frame."""
+        chunks = self._patched_chunks
+        if chunks is None or chunks.size == 0:
+            return False
+        frames = self._frames
+        if frames <= 0:
+            return False
+        idx = (frame % frames) // self._coverage_chunk_frames
+        if idx >= chunks.size:
+            return False
+        return bool(chunks[idx])
 
     def init(self, pcm: np.ndarray, channels: int | None = None) -> None:
         """Initialize the loop with the server's initial buffer.
@@ -162,6 +239,10 @@ class LoopBuffer:
             if channels_changed and self._seam_frames > 0:
                 self._seam_blend_scratch = np.zeros(
                     (ch, self._seam_frames), dtype=np.float32)
+            # Reset slice-coverage bitmap for the new loop size. One
+            # bool per chunk; +1 so the last partial chunk is tracked.
+            n_chunks = (frames + self._coverage_chunk_frames - 1) // self._coverage_chunk_frames
+            self._patched_chunks = np.zeros(max(1, n_chunks), dtype=bool)
 
     def swap(self, pcm: np.ndarray, channels: int | None = None) -> None:
         """Replace the entire loop buffer (server `swap_ready` path).
