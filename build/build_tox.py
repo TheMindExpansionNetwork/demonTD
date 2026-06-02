@@ -610,15 +610,24 @@ def wire_callbacks(demon):
     fexec = demon.op("frame_exec")
     if fexec is not None:
         fexec.text = FRAME_EXEC_PY
-        # Configure to fire on every frame start.
-        for pname, val in (("framestart", True), ("active", True)):
+        # Configure which callbacks fire. The Execute DAT has a separate
+        # toggle par per callback, ALL OFF by default — defining the
+        # function in the DAT text without enabling its toggle is a
+        # silent no-op. We need:
+        #   - framestart: per-frame drain of the inbound WS queue.
+        #   - playstatechange: TD timeline pause/resume → pause audio.
+        for pname, val in (
+            ("framestart", True),
+            ("playstatechange", True),
+            ("active", True),
+        ):
             try:
                 setattr(fexec.par, pname, val)
             except Exception:
                 pass
         try:
             print("[build_tox]   frame_exec pars:")
-            for pn in ("framestart", "active", "framerate"):
+            for pn in ("framestart", "playstatechange", "active", "framerate"):
                 par = getattr(fexec.par, pn, None)
                 if par is not None:
                     try:
@@ -708,7 +717,18 @@ def onFrameStart(frame):
     # samples = static).
 
 def onFrameEnd(frame): pass
-def onPlayStateChange(state): pass
+
+def onPlayStateChange(state):
+    # TD timeline paused/resumed — pause SpeakerOut so the audio thread
+    # emits silence + the LoopBuffer playhead freezes. WS stays open so
+    # heartbeats keep the hosted session alive while paused.
+    try:
+        parent().ext.DemonExt.OnPlayStateChange(state)
+    except AttributeError:
+        pass
+    except Exception as e:
+        print(f"[frame_exec onPlayStateChange] failed: {e}")
+
 def onDeviceChange(): pass
 def onProjectPreSave(): pass
 def onProjectPostSave(): pass

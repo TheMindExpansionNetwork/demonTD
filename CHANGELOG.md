@@ -2,6 +2,48 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.7] — 2026-06-01
+
+**Pause fix only.** Reapplied incrementally on top of the confirmed-
+working v0.2.6, after an earlier bundled v0.2.7 attempt regressed pod
+connection. This increment is deliberately scoped to ONE change that
+is orthogonal to source resolution and the WS path, so it cannot
+affect whether Connect succeeds. (The Source Audio File par removal and
+the Audio Analyze audio-rate work are deferred to later increments,
+each verified on its own.)
+
+### TD timeline pause now actually pauses audio
+
+User report: "It doesn't seem to pause if you pause your touch
+designer." The real bug: the Execute DAT (`frame_exec`) has a separate
+toggle par per callback, all OFF by default. Defining
+`onPlayStateChange(state)` in the DAT text without enabling the
+`playstatechange` toggle is a silent no-op — so the handler never fired.
+
+Fix:
+- `build/build_tox.py`: enable the `playstatechange` toggle on
+  `frame_exec` (alongside the existing `framestart` + `active`), and
+  dispatch `onPlayStateChange(state)` → `DemonExt.OnPlayStateChange`.
+- `src/demon_ext.py`: new `OnPlayStateChange(state)` sets a `_paused`
+  flag on SpeakerOut.
+- `src/audio.py`: `set_paused()` + `_paused` + a pause fast-path in
+  `_pa_callback` — when paused it emits silence and does NOT advance
+  the LoopBuffer playhead, so un-pause resumes from the same sample.
+  One bool read per PortAudio callback, GIL-atomic, no lock.
+
+The WS + queue heartbeats keep running through the pause (a "stop
+hearing audio" gesture, not a teardown — that's Disconnect).
+
+BUILD_MARKER bumped to v0.2.7-pause-only.
+
+### Verification
+
+- Connect STILL works exactly as v0.2.6 (this change touches no
+  source/WS code).
+- Hit Space / timeline pause during a session: audio cuts within one
+  PortAudio callback (~85 ms); un-pause resumes from the same sample.
+  With Debug ON: `OnPlayStateChange: state=False → PAUSE`.
+
 ## [0.2.6] — 2026-06-01
 
 **Two fixes in one rev.**

@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.19-auto-extend"
+BUILD_MARKER = "v0.2.7-pause-only"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -1611,6 +1611,32 @@ class DemonExt:
             self.OnHeartbeat()
         except Exception as e:
             self.log(f"MaybeHeartbeatFromFrame: OnHeartbeat raised: {e}")
+
+    def OnPlayStateChange(self, state) -> None:
+        """TD timeline play-state change. Routed from frame_exec's
+        `onPlayStateChange(state)` callback.
+
+        When the user pauses TD's timeline, pause SpeakerOut so the
+        audio thread emits silence and the LoopBuffer playhead freezes;
+        on un-pause, audio resumes from the same sample. The WS + queue
+        heartbeats keep running throughout — pausing the timeline is a
+        "stop hearing audio" gesture, not a session teardown (that's
+        Disconnect).
+
+        Does NOT touch source resolution or the WS connection path, so
+        it cannot affect whether Connect succeeds.
+
+        `state` is truthy when playing, falsy when paused; coerced
+        defensively because the exact type has varied across TD builds.
+        """
+        playing = bool(state)
+        if self._debug_enabled:
+            self.log(f"OnPlayStateChange: state={state!r} → "
+                     f"{'PLAY' if playing else 'PAUSE'}")
+        try:
+            self._speaker_out.set_paused(not playing)
+        except Exception as e:
+            self.log(f"OnPlayStateChange: set_paused failed: {e}")
 
     def OnReceive(self, dat, rowIndex=None, message=None,
                   contents=None, peer=None) -> None:

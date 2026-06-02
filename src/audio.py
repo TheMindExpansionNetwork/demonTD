@@ -833,6 +833,14 @@ class SpeakerOut:
         # next telemetry report.
         self._cb_over_max_block: bool = False
 
+        # Pause flag, driven from the main thread by DemonExt's
+        # OnPlayStateChange when TD's timeline is paused. Audio thread
+        # reads this every callback; when True we emit silence and do
+        # NOT advance the LoopBuffer playhead, so audio resumes from
+        # the same sample on un-pause. Single bool = GIL-atomic, no
+        # lock needed.
+        self._paused: bool = False
+
         # Keep a strong reference to the bound CFUNCTYPE so it doesn't get
         # garbage-collected while the audio thread is calling into it.
         self._c_callback = self._CB_TYPE(self._pa_callback)
@@ -1171,6 +1179,21 @@ class SpeakerOut:
             self._log(f"[speaker_out] stop failed: {e}")
         self._stream_ptr = None
 
+    def set_paused(self, paused: bool) -> None:
+        """Mark the stream as paused/resumed without touching PortAudio.
+
+        When True, `_pa_callback` emits silence into the output buffer
+        and does NOT advance the LoopBuffer playhead — so when un-
+        paused, audio resumes exactly where it left off. Cheaper +
+        cleaner than calling Pa_StopStream/StartStream (which can click
+        on resume on some macOS Core Audio paths).
+
+        Driven by `DemonExt.OnPlayStateChange` whenever TD's timeline
+        play state changes. Safe to call from the main thread — the
+        flag read in `_pa_callback` is a single bool, GIL-atomic.
+        """
+        self._paused = bool(paused)
+
     def _pa_callback(self, in_buf, out_buf, frames, time_info, status_flags,
                      user_data) -> int:
         """PortAudio callback (audio thread).
@@ -1218,6 +1241,21 @@ class SpeakerOut:
         is_int16 = (self._sample_format_pa == _paInt16)
         bytes_per_sample = 2 if is_int16 else 4
         n_bytes = n * self._channels * bytes_per_sample
+
+        # TD-pause fast path: emit silence + skip the LoopBuffer read so
+        # the playhead doesn't advance. When the user un-pauses, audio
+        # resumes from the same sample. Cheaper than Pa_StopStream and
+        # avoids the click some Core Audio paths produce on stop/start.
+        if self._paused:
+            try:
+                _ctypes.memset(out_buf, 0, n_bytes)
+            except Exception:
+                pass
+            elapsed_ns = time.perf_counter_ns() - t0
+            self._cb_latency_sum_ns += elapsed_ns
+            if elapsed_ns > self._cb_latency_max_ns:
+                self._cb_latency_max_ns = elapsed_ns
+            return _paContinue
 
         try:
             if n > self._max_block_frames:
