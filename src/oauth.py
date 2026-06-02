@@ -19,6 +19,17 @@ import json
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+# Single-source User-Agent (see src/version.py). TD loads siblings via the
+# `mod()` global; tests import from src/ on sys.path. Same shim as
+# queue_client / demon_ext, with a literal fallback so it never raises.
+try:
+    USER_AGENT = mod('version').USER_AGENT  # type: ignore[name-defined]  # noqa: F821
+except Exception:
+    try:
+        from version import USER_AGENT  # type: ignore
+    except Exception:
+        USER_AGENT = "DaydreamDEMON-TD/unknown"
+
 DAYDREAM_API_BASE = "https://api.daydream.live"
 
 
@@ -32,7 +43,8 @@ def _get_json(url: str, headers: dict, timeout: float = 15.0) -> dict:
     req = urlrequest.Request(
         url,
         method="GET",
-        headers={**headers, "Accept": "application/json"},
+        headers={**headers, "Accept": "application/json",
+                 "User-Agent": USER_AGENT},
     )
     try:
         with urlrequest.urlopen(req, timeout=timeout) as resp:

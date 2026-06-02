@@ -170,3 +170,17 @@ def test_http_error_raises_queue_error(mock_urlopen):
     with pytest.raises(queue_mod.QueueError) as exc:
         c.join()
     assert "429" in str(exc.value)
+
+
+@patch("queue_client.urlrequest.urlopen")
+def test_user_agent_header_sent(mock_urlopen):
+    """Every cloud REST call advertises the client via User-Agent so the
+    orchestrator can tag the session as TouchDesigner (mirrors rtmg-vst#7's
+    DaydreamDEMON-VST/<ver>). urllib capitalizes header keys, so it reads
+    back as 'User-agent'."""
+    mock_urlopen.return_value = FakeResponse({"status": "active", "sessionId": "x"})
+    queue_mod.QueueClient("http://h").join()
+    req = mock_urlopen.call_args.args[0]
+    ua = req.get_header("User-agent")
+    assert ua == queue_mod.USER_AGENT
+    assert ua.startswith("DaydreamDEMON-TD/")

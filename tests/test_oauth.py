@@ -60,6 +60,12 @@ def test_fetch_profile_success(mock_urlopen):
     assert req.method == "GET"
     assert req.full_url == "https://api.daydream.live/users/profile"
     assert req.get_header("Authorization") == "Bearer sk-test"
+    # User-Agent advertises the client to the cloud orchestrator
+    # (DaydreamDEMON-TD/<ver>, mirrors rtmg-vst#7). urllib stores header
+    # keys capitalized, so it reads back as "User-agent".
+    ua = req.get_header("User-agent")
+    assert ua == oauth.USER_AGENT
+    assert ua.startswith("DaydreamDEMON-TD/")
 
 
 @patch("oauth.urlrequest.urlopen")

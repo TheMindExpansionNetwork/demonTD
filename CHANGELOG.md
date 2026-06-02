@@ -2,6 +2,34 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.9] — 2026-06-02
+
+### Send a `DaydreamDEMON-TD` User-Agent on cloud REST calls
+
+Mirrors [rtmg-vst#7](https://github.com/daydreamlive/rtmg-vst/pull/7).
+Every cloud REST call now sends `User-Agent: DaydreamDEMON-TD/<ver>`
+(e.g. `DaydreamDEMON-TD/0.2.9`). This lets the cloud orchestrator
+(demon-public-demo) tag each session by client — VST vs web vs
+TouchDesigner — from the User-Agent, replacing the brittle "no Origin
+header" heuristic. Convention shared across clients:
+`DaydreamDEMON-<CLIENT>/<ver>` (the VST sends `DaydreamDEMON-VST/b<build>`).
+
+- New `src/version.py` — single source of truth for `DEMON_TD_VERSION`
+  and the derived `USER_AGENT`. Pure module (no TD / third-party deps),
+  importable by the HTTP modules in both the TD runtime (via `mod()`)
+  and unit tests (via `import`), with a literal fallback so a missing
+  module can never break a request.
+- `queue_client.py`: User-Agent added to `_headers()` — rides every
+  `/api/queue/{join,status,claim,extend,leave}` call.
+- `oauth.py`: User-Agent added to the `/users/profile` validation call.
+- Tests assert the header is present on both clients.
+
+Scope matches the VST: REST calls only. The WebSocket connects to a
+pre-signed URL and the session is tagged at queue/join time, so the UA
+on the REST layer is sufficient.
+
+BUILD_MARKER bumped to v0.2.9-user-agent.
+
 ## [0.2.8] — 2026-06-02
 
 Two changes: hide the confusing Source Audio File picker, and a

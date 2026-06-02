@@ -20,6 +20,19 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
+# Single-source User-Agent (see src/version.py). In TD, sibling modules
+# load via the `mod()` global; in unit tests they're importable from src/
+# on sys.path. Mirrors demon_ext.py's sibling-import shim. Falls back to a
+# literal so a missing module can never break a request — the UA header is
+# advisory (it only lets the orchestrator tag the session as TouchDesigner).
+try:
+    USER_AGENT = mod('version').USER_AGENT  # type: ignore[name-defined]  # noqa: F821
+except Exception:
+    try:
+        from version import USER_AGENT  # type: ignore
+    except Exception:
+        USER_AGENT = "DaydreamDEMON-TD/unknown"
+
 
 @dataclass
 class QueueResponse:
@@ -83,7 +96,7 @@ class QueueClient:
     # ----- helpers ------------------------------------------------------------
 
     def _headers(self, json_body: bool = False) -> dict[str, str]:
-        h = {"Accept": "application/json"}
+        h = {"Accept": "application/json", "User-Agent": USER_AGENT}
         if json_body:
             h["Content-Type"] = "application/json"
         if self.api_key:
