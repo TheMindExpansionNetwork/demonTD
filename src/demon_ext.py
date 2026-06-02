@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.7-pause-only"
+BUILD_MARKER = "v0.2.8-hide-sourcefile-forcecook-wave-clock"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -3213,17 +3213,57 @@ class DemonExt:
                          f"{scriptOp.numSamples} loop_frames={self._ring.frames}")
             except Exception:
                 pass
+        # Cook-rate diagnostic (Debug-gated, throttled). THE signal for
+        # whether Audio Analyze will work: numSamples >= 64 → audio-rate
+        # (the waveCHOP carrier is doing its job, Analyze populates);
+        # numSamples < 64 → frame-rate (carrier not propagating, Analyze
+        # sees nothing). Logged every ~600 cooks so it's visible without
+        # spamming.
+        if self._debug_enabled and self._n_cook_recv % 600 == 0:
+            try:
+                _ns = int(scriptOp.numSamples)
+            except Exception:
+                _ns = -1
+            try:
+                _nin = int(scriptOp.inputs[0].numSamples) if scriptOp.inputs else -1
+            except Exception:
+                _nin = -1
+            _best = max(_ns, _nin)
+            _rate = "AUDIO-rate ✓" if _best >= 64 else "FRAME-rate ✗"
+            try:
+                self.log(
+                    f"OnCookRecv: cook #{self._n_cook_recv} "
+                    f"out.numSamples={_ns} carrier.numSamples={_nin} → {_rate}"
+                )
+            except Exception:
+                pass
 
-        # Honor TD's cook context: if an audio-rate consumer set
-        # numSamples, use that. Otherwise emit one frame's worth.
-        n_td = 0
+        # Determine the audio-rate block size for this cook.
+        #
+        # Preference order:
+        #   1. The audio_clock WAVE CHOP carrier wired as input 0. It's
+        #      Time Slice + 48 kHz, so its numSamples IS the audio-rate
+        #      block for this frame's time slice (~800 at 48k/60fps).
+        #      This is the deterministic signal — read it directly.
+        #   2. scriptOp.numSamples, if TD pre-set an audio-rate count.
+        #   3. Fall back to one frame's worth (frame-rate) — useless for
+        #      Audio Analyze, but never zero.
+        n = 0
         try:
-            n_td = int(scriptOp.numSamples)
+            if scriptOp.inputs:
+                n_in = int(scriptOp.inputs[0].numSamples)
+                if n_in >= 64:
+                    n = n_in
         except Exception:
-            n_td = 0
-        if n_td >= 64:
-            n = n_td
-        else:
+            n = 0
+        if n < 64:
+            try:
+                n_td = int(scriptOp.numSamples)
+            except Exception:
+                n_td = 0
+            if n_td >= 64:
+                n = n_td
+        if n < 64:
             try:
                 fps = project.cookRate  # type: ignore[name-defined]  # noqa: F821
                 if fps <= 0:

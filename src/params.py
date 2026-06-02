@@ -51,6 +51,11 @@ class Param:
     readonly: bool = False
     enable: bool = True             # False = par appears greyed-out / non-editable
     section_header: bool = False    # this is a Header par
+    ui_hidden: bool = False         # True = kept in schema (so _read_par + lookups
+                                    # still resolve) but NOT rendered as a visible
+                                    # custom par. TD can't programmatically hide a
+                                    # custom par (Par.hidden is read-only), so the
+                                    # build just skips creating it.
     order: int = 0
 
 
@@ -68,10 +73,16 @@ SESSION_PARAMS: list[Param] = [
                "port used by DEMON's demos.realtime_motion_graph_web; for a "
                "Vast.ai-hosted pod use the Direct WS line printed by "
                "scripts/vast/launch.sh (e.g. ws://1.2.3.4:44105/)."),
+    # Sourcefile is NOT shown in the op UI (ui_hidden) — it confused users
+    # who expected the file picker to be the audio input, when the actual
+    # source comes from the CHOP wired into the COMP. Kept in the schema so
+    # _read_par("Sourcefile") and _has_source_audio still resolve safely
+    # (returns its default ""); removing it outright regressed Connect.
     Param("Sourcefile", None, "Session", "File", "session",
-          default="", order=40, label="Source Audio File",
-          help="WAV file to send as the source/reference audio on Connect. "
-               "DEMON conditions its generation on this input. REQUIRED."),
+          default="", order=40, label="Source Audio File", ui_hidden=True,
+          help="(hidden) Legacy source-file path. The real source is the "
+               "CHOP wired into the COMP's input; this is retained only for "
+               "backward compatibility and is not shown in the UI."),
     Param("Status", None, "Session", "Str", "session", default="Idle",
           order=50, readonly=True,
           help="Current connection status."),

@@ -2,6 +2,70 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.8] — 2026-06-02
+
+Two changes: hide the confusing Source Audio File picker, and a
+**candidate** fix for Audio Analyze (verify before trusting — see below).
+
+### 1. Source Audio File picker hidden from the op UI
+
+Users expected the `Source Audio File` picker to be the audio input, but
+the real source is the CHOP wired into the COMP's input — the picker was
+dead UI. TD can't programmatically hide a custom par (`Par.hidden` is
+read-only), so the build now simply **doesn't create it**.
+
+New `ui_hidden` flag on the `Param` schema: the entry stays in
+`params.py` (so `_read_par("Sourcefile")` and `_has_source_audio()`
+resolve exactly as before — returning its `""` default), but the build
+skips rendering it. Connection behavior is byte-identical: the build
+already reset `Sourcefile` to `""` on every rebuild, so the pre-flight
+was already passing via `_wired_chop_file_path()` detecting the wired
+Audio File In — not via this par. Removing it from view changes nothing
+at runtime.
+
+### 2. Audio Analyze cook-rate — force-cook + Wave CHOP carrier (NEEDS VERIFICATION)
+
+User report: "audio analyze chop isn't getting anything." Diagnosed in
+two stages from live logs:
+
+Stage 1 — why it's silent. Python Audio Out plays the generated audio by
+reading the LoopBuffer directly via PortAudio, so nothing in TD pulls
+`audio_out`. And even with an Audio Analyze CHOP wired to the COMP's
+`out`, telemetry showed `audio_out_cooks=0` — the downstream pull does
+NOT propagate across the Base COMP boundary to `audio_out`. So
+`audio_out` wasn't cooking at all, at any rate.
+
+Stage 2 — the candidate fix, two pieces:
+1. Force-cook `audio_out` every frame from `frame_exec`'s `onFrameStart`
+   (`audio_out.cook(force=True)`). Guarantees it cooks despite the broken
+   cross-COMP pull.
+2. `audio_clock` Wave CHOP carrier. The earlier (reverted) force-cook
+   cooked at FRAME rate (numSamples=1) because `audio_out` had no audio-
+   rate input. Now its input is a Wave CHOP (Time Slice, 48 kHz), so each
+   forced cook spans one frame of AUDIO samples (~800 at 48k/60fps).
+   `OnCookRecv` reads the carrier's `numSamples` (input 0) as the
+   authoritative block size, ignores its values, and fills that many
+   samples from the LoopBuffer — an audio-rate stream for Analyze.
+
+Independent of `audio_in`, so the source snapshot + Connect path are
+untouched.
+
+Explicitly a hypothesis to verify, not a confirmed fix. Debug-gated
+diagnostic in `OnCookRecv` logs every ~600 cooks:
+`out.numSamples=… carrier.numSamples=… → AUDIO-rate / FRAME-rate`.
+
+BUILD_MARKER bumped to v0.2.8-hide-sourcefile-forcecook-wave-clock.
+
+### Verification
+
+- Source Audio File picker is gone from the Session page; Connect still
+  works exactly as v0.2.7.
+- Build log: `audio_out inputs=1 (waveCHOP audio-rate carrier)`.
+- Telemetry `audio_out_cooks=` is now > 0 (force-cook working).
+- With Debug ON, read `OnCookRecv: cook #600 out.numSamples=…
+  carrier.numSamples=… → AUDIO-rate / FRAME-rate`. If AUDIO-rate, the
+  wired Audio Analyze CHOP should show moving loudness/spectrum.
+
 ## [0.2.7] — 2026-06-01
 
 **Pause fix only.** Reapplied incrementally on top of the confirmed-
