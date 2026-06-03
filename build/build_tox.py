@@ -821,8 +821,15 @@ def onDisconnect(dat):
 # Script CHOP cook hook. TD calls onCook(scriptOp) on the configured DAT.
 # We dispatch by the calling op's name.
 def onCook(scriptOp):
+    # When the .tox is first dropped, TD starts cook chains BEFORE it
+    # instantiates the extension object — audio_out cooks once in that
+    # window and ext.DemonExt isn't there yet. Same guard frame_exec uses;
+    # the next cook resolves cleanly.
+    try:
+        ext = _ext()
+    except AttributeError:
+        return
     name = scriptOp.name
-    ext = _ext()
     if name == "script_send":
         ext.OnCookSend(scriptOp)
     elif name == "audio_out":
