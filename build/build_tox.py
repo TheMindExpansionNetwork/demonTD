@@ -713,6 +713,16 @@ def onFrameStart(frame):
         pass
     except Exception as e:
         print(f"[frame_exec] heartbeat-fallback failed: {e}")
+    # OnTick fallback — drives the continuous-params stream when the
+    # Timer CHOP is silent (which it has been). After `ready`, that
+    # param stream is the ONLY thing keeping the pod's WS alive; without
+    # it the pod idle-times-out and closes before streaming slices.
+    try:
+        parent().ext.DemonExt.MaybeTickFromFrame()
+    except AttributeError:
+        pass
+    except Exception as e:
+        print(f"[frame_exec] tick-fallback failed: {e}")
     # Force-cook audio_out every frame.
     #
     # WHY: Python Audio Out plays from the LoopBuffer via PortAudio, so

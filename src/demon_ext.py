@@ -281,7 +281,7 @@ def eval_curve_linear(pts: list[tuple[float, float]], t: float) -> float:
 
 # Bump this on every meaningful change so the user can confirm at boot
 # which build is actually loaded. Visible on the "DemonExt initialized" line.
-BUILD_MARKER = "v0.2.10-oncook-load-race"
+BUILD_MARKER = "v0.2.11-params-keepalive"
 
 # Hosted-mode pod failover cap. When a hosted WS opens but never reaches
 # `ready` (1011 keepalive / overloaded pod / etc.), we leave the dead
@@ -371,6 +371,22 @@ class DemonExt:
         # Param fanout
         self._dirty: dict[str, Any] = {}
         self._last_init_values: dict[str, Any] = {}
+        # Running snapshot of all continuous params ever set. The web
+        # client sends the FULL current param state every ~8 ms after
+        # `ready` (not just deltas) — that continuous traffic is the only
+        # thing keeping the pod's WS alive (no separate keepalive). We
+        # accumulate dirty changes here and re-send the snapshot every
+        # tick so the pod never idle-times-out. See OnTick.
+        self._params_snapshot: dict[str, Any] = {}
+        # Wall-clock of the last OnTick run. The frame_exec fallback
+        # (MaybeTickFromFrame) uses it to avoid double-driving when the
+        # Timer CHOP is actually firing.
+        self._last_tick_t: float = 0.0
+        # Consecutive WS send failures. After a few in a row the
+        # connection is dead (e.g. SSL stream corrupted by a timed-out
+        # binary write); we tear down ONCE instead of retrying every
+        # frame forever (which floods the textport + pegs CPU).
+        self._send_fail_streak: int = 0
 
         # Scheduled-curve state. Each entry tracks the parsed control
         # points for a curve param (so we don't re-parse JSON every
@@ -552,6 +568,10 @@ class DemonExt:
             # session-lifetime issues than a global monotonic counter).
             self._heartbeat_count = 0
             self._last_heartbeat_t = 0.0
+            # Reset the param-stream keepalive state for the new session.
+            self._params_snapshot = {}
+            self._last_tick_t = 0.0
+            self._send_fail_streak = 0
 
             # --- Direct mode --------------------------------------------------
             if mode == "direct":
@@ -1329,6 +1349,10 @@ class DemonExt:
         if self._debug_enabled and not getattr(self, "_ticked_once", False):
             self._ticked_once = True
             self.log("OnTick: timer is running (first tick)")
+        # Mark that OnTick ran THIS instant so MaybeTickFromFrame (the
+        # frame_exec fallback) can tell whether the Timer CHOP is alive
+        # and avoid double-driving.
+        self._last_tick_t = time.time()
         # 1. Drain inbound from WS thread FIRST so connect/open/text events
         #    process before any param sends try to use the connection.
         self._drain_inbound()
@@ -1418,20 +1442,27 @@ class DemonExt:
         if not self._connected:
             return
 
+        # Fold any dirty param changes into the running snapshot.
         with self._lock:
-            if not self._dirty:
-                # No dirty params — nothing to send. Playback position is
-                # tracked by OnCookRecv from the loop buffer's read head,
-                # not dead-reckoned in OnTick.
-                return
-            raw = dict(self._dirty)
-            self._dirty.clear()
+            if self._dirty:
+                self._params_snapshot.update(self._dirty)
+                self._dirty.clear()
+
+        # CRITICAL keepalive: only send AFTER `ready` (mirrors the web
+        # client, which starts its param loop on status=="ready"), but
+        # once ready, send a params message EVERY tick — not just on
+        # change. The pod has no separate keepalive: the continuous
+        # params stream (web client: every 8 ms) is the ONLY thing
+        # keeping its WS alive. demonTD used to send only on dirty-change
+        # then go silent, so the pod idle-timed-out and closed before
+        # streaming a single generation slice. Re-sending the current
+        # snapshot every tick with an advancing playback_pos fixes that.
+        if not self._saw_ready:
+            return
 
         # Strip wire keys the server's params handler rejects + drop
-        # lora_str_<id> for non-enabled LoRAs. Skips the send entirely
-        # if everything left is filtered out (cheaper than a no-op
-        # params message).
-        raw = self._filter_params_for_wire(raw)
+        # lora_str_<id> for non-enabled LoRAs.
+        raw = self._filter_params_for_wire(dict(self._params_snapshot))
         if not raw:
             return
 
@@ -1573,8 +1604,17 @@ class DemonExt:
             self._write_par("Denyreason", deny)
             self._set_status(f"Paywall: {deny}")
         else:
-            self.log(f"Heartbeat saw status={resp.status}; disconnecting")
-            self.Disconnect()
+            # Unexpected / unparseable status — most often a transient or
+            # slightly-malformed status-poll response that QueueResponse
+            # defaults to "unknown". Do NOT tear down on this alone: the
+            # authoritative "session ended" signal is the WS closing,
+            # which we handle in the close callback. A single odd poll
+            # was killing otherwise-healthy live sessions, so treat it as
+            # transient and keep the WS — the next poll usually recovers.
+            self.log(
+                f"Heartbeat saw status={resp.status!r}; ignoring (transient — "
+                f"WS close is the terminal signal, not a status poll)"
+            )
 
     def MaybeHeartbeatFromFrame(self) -> None:
         """Belt-and-suspenders heartbeat driver, called from frame_exec's
@@ -1611,6 +1651,43 @@ class DemonExt:
             self.OnHeartbeat()
         except Exception as e:
             self.log(f"MaybeHeartbeatFromFrame: OnHeartbeat raised: {e}")
+
+    def MaybeTickFromFrame(self) -> None:
+        """Drive OnTick from frame_exec's onFrameStart when the Timer CHOP
+        is silent.
+
+        WHY THIS IS CRITICAL: OnTick flushes the continuous-param stream.
+        After `ready`, that stream is the ONLY traffic keeping the pod's
+        WS alive (the pod has no separate keepalive — confirmed against
+        demon-public-demo's useParamSync, which sends params every 8 ms).
+        The tick8ms Timer CHOP has been non-firing in practice (same
+        TD-callback gremlin that kept OnHeartbeat silent), so OnTick never
+        ran → demonTD went dead-quiet after `ready` → the pod idle-timed-
+        out and closed before streaming a single generation slice. That's
+        the "connects, gets the loop, then drops, no Daydream output" bug.
+
+        frame_exec is the reliable driver (verified firing). We run OnTick
+        from it on a ~33 ms floor (≈2 frames @ 60 fps → ~30 params/s,
+        plenty to keep the pod alive and stay responsive). No-op if the
+        Timer CHOP is actually feeding (gate on `_last_tick_t`) or if the
+        WS isn't up yet.
+        """
+        if not self._connected:
+            return
+        now = time.time()
+        # If OnTick ran very recently (live Timer CHOP, or already this
+        # frame), skip — don't double-drive the param stream.
+        if now - self._last_tick_t < 0.033:
+            return
+        if self._last_tick_t == 0.0 and self._debug_enabled:
+            self.log(
+                "[tick] Timer CHOP appears silent — "
+                "driving OnTick from frame_exec fallback"
+            )
+        try:
+            self.OnTick()
+        except Exception as e:
+            self.log(f"MaybeTickFromFrame: OnTick raised: {e}")
 
     def OnPlayStateChange(self, state) -> None:
         """TD timeline play-state change. Routed from frame_exec's
@@ -2836,29 +2913,62 @@ class DemonExt:
 
     # -------- helpers --------------------------------------------------------
 
+    # Number of consecutive WS send failures after which we declare the
+    # connection dead and tear down. A single failure can be a transient
+    # blip; a run of them means the socket is gone (e.g. the SSL stream
+    # got corrupted by a timed-out binary write → every subsequent send
+    # raises SSL: BAD_LENGTH). Without this, a per-frame sender retries
+    # forever, flooding the textport with thousands of errors + pegging
+    # the CPU, and never triggers failover.
+    _SEND_FAIL_LIMIT = 3
+
+    def _note_send_result(self, ok: bool) -> None:
+        """Track consecutive send failures and tear down once the
+        connection is provably dead. Called by _send_text / _send_bytes."""
+        if ok:
+            self._send_fail_streak = 0
+            return
+        self._send_fail_streak += 1
+        if self._send_fail_streak >= self._SEND_FAIL_LIMIT and self._connected:
+            self.log(
+                f"_send: {self._send_fail_streak} consecutive failures — "
+                f"connection is dead; tearing down (stops the retry flood)"
+            )
+            # Flip _connected first so any in-flight per-frame senders
+            # (OnTick / OnParChange) short-circuit immediately, then do a
+            # clean close. Guarded by _connected inside Disconnect so this
+            # only runs once.
+            self._connected = False
+            try:
+                self.Disconnect()
+            except Exception as e:
+                self.log(f"_note_send_result: Disconnect raised: {e}")
+            self._set_status(
+                "Connection lost (send failed) — re-try Connect.")
+
     def _send_text(self, payload: str) -> None:
         """Send a text frame via the Python WS client."""
         wsc = self._wsc
         if wsc is None:
-            self.log("_send_text: no WS client")
             return
         ok = wsc.send_text(payload)
         # Only log on failure. The sampled-every-600 success log was just
         # confirmation during debugging and adds nothing operationally.
         if not ok:
             self.log(f"_send_text: {len(payload)} chars FAILED")
+        self._note_send_result(ok)
 
     def _send_bytes(self, payload: bytes) -> None:
         """Send a binary frame via the Python WS client."""
         wsc = self._wsc
         if wsc is None:
-            self.log("_send_bytes: no WS client")
             return
         ok = wsc.send_binary(payload)
         if not ok:
             self.log(f"_send_bytes: {len(payload)} B FAILED")
         elif self._debug_enabled:
             self.log(f"_send_bytes: {len(payload)} B ok")
+        self._note_send_result(ok)
 
     def _snapshot_audio(self, chop) -> np.ndarray | None:
         """Grab the current samples from a CHOP (param-reference, op-path, or

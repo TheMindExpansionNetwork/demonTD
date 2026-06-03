@@ -2,6 +2,68 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.11] — 2026-06-02
+
+**The big one: sessions died right after `ready` with zero generation
+slices.** In-the-wild report: "it's audio reactive but I can't access
+the Daydream side… looks like it tries three times and then stops."
+
+### Root cause (found by comparing against demon-public-demo)
+
+The session connected, uploaded the source, received `ready` + the
+initial buffer + `stem_assets` — then the pod closed the WS before
+streaming a single generation slice (`binary_frames_recv` never exceeded
+1, across every pod). Looked server-side; it wasn't.
+
+The web client's `useParamSync` sends a `{type:"params"}` message **every
+8 ms after `ready`**, and that continuous stream is the **only** thing
+keeping the pod's WS alive — there is no separate keepalive. If the pod
+receives nothing after `ready`, it idle-times-out and closes.
+
+demonTD's param flush lives in `OnTick`, driven by the `tick8ms` Timer
+CHOP — which has been **silent in practice** (same TD callback gremlin
+that kept `OnHeartbeat` silent; the v0.2.6 `onTimerPulse` rename did not
+fix it). So after `ready`, demonTD went **completely silent** → the pod
+idle-timed-out → dropped → no slices. Heartbeat survived only because
+v0.2.6 added a frame_exec fallback for it; `OnTick` had no such fallback.
+
+### Fixes
+
+1. **`MaybeTickFromFrame` — drive `OnTick` from `frame_exec`** (the
+   reliable, verified-firing hook) on a ~33 ms floor when the Timer CHOP
+   is silent. No-op if the Timer CHOP is actually feeding. This restores
+   the post-`ready` param stream that keeps the session alive.
+2. **`OnTick` now sends params every tick, not just on change.** It
+   accumulates changes into a running `_params_snapshot` and re-sends it
+   (with an advancing `playback_pos`) every tick after `ready` — matching
+   the web client. The old send-only-on-dirty behavior went silent the
+   moment the user stopped touching params, re-triggering the idle
+   timeout even when the timer worked.
+3. **Send-failure teardown.** After 3 consecutive WS send failures the
+   connection is declared dead and torn down once. Previously a corrupted
+   SSL stream (from a timed-out binary write) caused every per-frame send
+   to fail with `SSL: BAD_LENGTH` and retry **forever** — ~1,500 errors
+   in the user's log, pegging CPU and blocking failover.
+4. **Heartbeat tolerates `status=unknown`.** A transient / unparseable
+   status poll no longer disconnects a live session — the authoritative
+   "ended" signal is the WS closing, not a status poll. (One bad poll was
+   killing healthy sessions.)
+
+### Not changed (deliberately)
+- Source upload stays float32 (int16 halving deferred — the keepalive
+  fix addresses the actual disconnect; the 46 MB timeout was a secondary
+  effect on a slow link).
+
+BUILD_MARKER bumped to v0.2.11-params-keepalive; UA → DaydreamDEMON-TD/0.2.11.
+
+### Verification
+- After `ready`, `binary_frames_recv` climbs past 1 (generation slices
+  now stream) and the session stays up for the full lease.
+- Debug ON: `[tick] Timer CHOP appears silent — driving OnTick from
+  frame_exec fallback` appears once; params flow continuously after.
+- A dropped connection tears down cleanly (one teardown line) instead of
+  flooding `SSL: BAD_LENGTH`.
+
 ## [0.2.10] — 2026-06-02
 
 ### Silence the harmless `'td.Ext' object has no attribute 'DemonExt'` console error on tox drop
