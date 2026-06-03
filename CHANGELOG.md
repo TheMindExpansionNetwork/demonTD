@@ -2,6 +2,23 @@
 
 All notable changes to demonTD. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.10] — 2026-06-02
+
+### Silence the harmless `'td.Ext' object has no attribute 'DemonExt'` console error on tox drop
+
+When the .tox is first dropped into a project, TD starts cook chains
+*before* it instantiates the COMP's extension object. The `audio_out`
+Script CHOP cooks once in that window, the callbacks DAT's `onCook`
+calls `parent().ext.DemonExt`, and TD raises `tdAttributeError` to the
+textport. One frame later the extension is alive and everything works
+normally — the error is purely cosmetic — but it looks alarming and got
+flagged by a user.
+
+`frame_exec` already guarded against this exact race ([build/build_tox.py:697](build/build_tox.py:697));
+this just applies the same `except AttributeError: return` pattern to
+the callbacks DAT's `onCook`. No behavior change beyond the suppressed
+first-frame traceback.
+
 ## [0.2.9] — 2026-06-02
 
 ### Send a `DaydreamDEMON-TD` User-Agent on cloud REST calls
